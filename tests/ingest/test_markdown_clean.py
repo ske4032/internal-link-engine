@@ -1,0 +1,258 @@
+"""Markdown cleaning: every noise kind found in the scraped corpus, plus links.
+
+The patterns covered are the ones measured in the real crawl (setext headings,
+linked SVG images, breadcrumbs, escaped registry paths, tables), not a guessed
+list.
+"""
+
+import pytest
+
+from linking_engine.ingest.markdown_clean import (
+    clean_page,
+    find_boilerplate,
+    is_navigation,
+    line_shares,
+)
+
+PAGE = "https://www.example.com/blog/post/"
+
+
+def clean(markdown: str, **kwargs):
+    return clean_page(markdown, PAGE, **kwargs)
+
+
+def removed(page) -> dict[str, int]:
+    return dict(page.removed)
+
+
+# ── structure ────────────────────────────────────────────────────────────────
+
+
+def test_setext_underlines_are_dropped_and_the_equals_heading_becomes_h1() -> None:
+    page = clean("Survey Report\n=============\n\nWhat is inside\n--------------\n\nBody.")
+    assert page.body_text == "Survey Report\n\nWhat is inside\n\nBody."
+    assert page.h1 == "Survey Report"
+    assert removed(page)["rule_or_underline"] == 2
+
+
+@pytest.mark.parametrize("rule", ["---", "***", "* * *", "___", "=========="])
+def test_horizontal_rules_are_dropped(rule: str) -> None:
+    assert clean(f"Before.\n\n{rule}\n\nAfter.").body_text == "Before.\n\nAfter."
+
+
+def test_atx_heading_markers_are_dropped_and_the_first_h1_is_kept() -> None:
+    page = clean("# Main Title\n\n### Sub section ###\n\ntext")
+    assert page.body_text == "Main Title\n\nSub section\n\ntext"
+    assert page.h1 == "Main Title"
+
+
+def test_nested_list_and_blockquote_markers_are_stripped() -> None:
+    page = clean("*   *   What do sysadmins read\n> “Quoted line”\n1. First\n- second")
+    assert page.body_text == "What do sysadmins read\n“Quoted line”\nFirst\nsecond"
+
+
+def test_table_rows_are_flattened_and_rules_and_empty_rows_dropped() -> None:
+    page = clean("|     |     |\n| --- | --- |\n| Windows | Patch |\n| macOS | Update |")
+    assert page.body_text == "Windows; Patch\nmacOS; Update"
+
+
+def test_paragraphs_keep_one_blank_line() -> None:
+    assert clean("one\n\n\n\ntwo\nthree\n\n").body_text == "one\n\ntwo\nthree"
+
+
+# ── inline noise ─────────────────────────────────────────────────────────────
+
+
+def test_images_including_linked_svg_data_images_are_removed() -> None:
+    svg = "data:image/svg+xml,%3Csvg%20viewBox='0%200%20150%20150'%3E%3C/svg%3E"
+    page = clean(
+        f"Intro ![Report cover](https://cdn.example.com/a.png) text.\n"
+        f"[![install icon]({svg})](https://www.example.com/install/)"
+    )
+    assert page.body_text == "Intro text."
+    assert page.links == ()
+    assert removed(page)["image"] == 1
+    assert removed(page)["linked_image"] == 1
+
+
+def test_bare_and_angle_bracket_urls_are_removed() -> None:
+    page = clean("See https://www.example.com/x?y=1 or <https://example.org> or www.foo.com today.")
+    assert page.body_text == "See or or today."
+
+
+def test_emphasis_code_html_entities_and_escapes_are_cleaned() -> None:
+    page = clean(
+        "**Explore**: the *key* __parts__ and _notes_, run `%windir%\\System32\\x.exe`"
+        "<br>Set &amp; Forget in HKEY\\_LOCAL\\_MACHINE"
+    )
+    assert page.body_text == (
+        "Explore: the key parts and notes, run %windir%\\System32\\x.exe "
+        "Set & Forget in HKEY_LOCAL_MACHINE"
+    )
+
+
+def test_underscores_inside_words_survive() -> None:
+    assert clean("the snake_case_name stays").body_text == "the snake_case_name stays"
+
+
+def test_zero_width_characters_are_removed() -> None:
+    assert clean("pat\u200bch\ufeff now").body_text == "patch now"
+
+
+# ── links ────────────────────────────────────────────────────────────────────
+
+
+def test_link_keeps_its_anchor_in_the_body_and_is_extracted() -> None:
+    page = clean("Read our [patch guide](/guides/patching/#step-2) before you start. Then relax.")
+    assert page.body_text == "Read our patch guide before you start. Then relax."
+    (link,) = page.links
+    assert str(link.target_url) == "https://www.example.com/guides/patching/"
+    assert link.anchor_text == "patch guide"
+    assert link.surrounding_text == "Read our patch guide before you start."
+    assert link.is_internal is True
+
+
+def test_external_links_are_marked_external() -> None:
+    (link,) = clean("See [the NVD entry](https://nvd.nist.gov/vuln/detail/CVE-1).").links
+    assert link.is_internal is False
+
+
+def test_www_and_bare_host_count_as_the_same_site() -> None:
+    (link,) = clean("[home](https://example.com/)").links
+    assert link.is_internal is True
+
+
+def test_anchor_markup_is_cleaned_before_extraction() -> None:
+    (link,) = clean("[**Bold** anchor](/x/)").links
+    assert link.anchor_text == "Bold anchor"
+
+
+def test_a_url_used_as_its_own_anchor_is_extracted_but_not_kept_in_the_body() -> None:
+    page = clean("Source: [https://example.com/r/](https://example.com/r/) end")
+    assert page.body_text == "Source: end"
+    assert page.links[0].anchor_text == "https://example.com/r/"
+
+
+@pytest.mark.parametrize("dest", ["mailto:a@example.com", "tel:+123", "javascript:void(0)"])
+def test_non_web_links_keep_their_text_but_are_not_extracted(dest: str) -> None:
+    page = clean(f"Contact [our team]({dest}) now")
+    assert page.body_text == "Contact our team now"
+    assert page.links == ()
+
+
+def test_same_page_fragment_links_are_not_extracted() -> None:
+    page = clean("Jump to [the summary](#summary).")
+    assert page.body_text == "Jump to the summary."
+    assert page.links == ()
+
+
+def test_link_with_parentheses_and_title_in_destination() -> None:
+    (link,) = clean('[term](https://en.wikipedia.org/wiki/Patch_(computing) "Wiki")').links
+    assert str(link.target_url) == "https://en.wikipedia.org/wiki/Patch_(computing)"
+
+
+# ── boilerplate ──────────────────────────────────────────────────────────────
+
+
+def test_boilerplate_and_breadcrumb_lines_are_removed_with_their_links() -> None:
+    banner = "**Patch this CVE on all your endpoints in under 5 minutes.** First 200 free"
+    page = clean(
+        f"[Example](https://www.example.com/)\n\u203a [Blog](/blog/)\n{banner}\n\nReal [content](/c/).",
+        boilerplate=frozenset({"[Example](https://www.example.com/)", banner}),
+    )
+    assert page.body_text == "Real content."
+    assert [link.anchor_text for link in page.links] == ["content"]
+    assert removed(page)["boilerplate_line"] == 2
+    assert removed(page)["breadcrumb_line"] == 1
+
+
+def test_find_boilerplate_returns_lines_at_or_above_the_share() -> None:
+    template = "Shared footer line that repeats everywhere"
+    docs = [f"{template}\nunique content number {i} here" for i in range(9)] + ["only this one"]
+    assert find_boilerplate(docs, min_share=0.9) == frozenset({template})
+    assert find_boilerplate(docs, min_share=0.95) == frozenset()
+
+
+def test_line_shares_ignores_short_lines_and_counts_each_document_once() -> None:
+    shares = dict(line_shares(["long enough line here!!\nlong enough line here!!\nshort", "x"]))
+    assert shares == {"long enough line here!!": 0.5}
+
+
+@pytest.mark.parametrize("share", [0, -0.1, 1.5])
+def test_find_boilerplate_rejects_an_invalid_share(share: float) -> None:
+    with pytest.raises(ValueError, match="min_share"):
+        find_boilerplate(["a"], min_share=share)
+
+
+# ── page level ───────────────────────────────────────────────────────────────
+
+
+def test_cleaning_is_idempotent_on_its_own_output() -> None:
+    once = clean("# T\n\n**A** [b](/b/) ![i](/i.png) https://x.com\n\n| c | d |").body_text
+    assert clean(once).body_text == once
+
+
+def test_title_is_stripped_and_blank_title_becomes_none() -> None:
+    assert clean("x", title="  A title ").title == "A title"
+    assert clean("x", title="   ").title is None
+
+
+def test_page_url_is_normalised_and_must_be_absolute() -> None:
+    assert (
+        str(clean_page("x", "HTTPS://WWW.Example.com/a/#frag").url) == "https://www.example.com/a/"
+    )
+    with pytest.raises(ValueError, match="absolute"):
+        clean_page("x", "/relative/")
+
+
+# ── refinements measured on the real crawl ───────────────────────────────────
+
+
+def test_link_text_wrapped_across_lines_is_joined_and_extracted() -> None:
+    page = clean("Not a trial. [Start\npatching](/signup/) today.")
+    assert page.body_text == "Not a trial. Start patching today."
+    assert page.links[0].anchor_text == "Start patching"
+
+
+def test_orphan_markup_is_removed() -> None:
+    page = clean("**Learn more about security and compliance\nstray tail]( ) here")
+    assert page.body_text == "Learn more about security and compliance\nstray tail here"
+
+
+def test_a_line_starting_with_an_angle_separator_is_a_breadcrumb() -> None:
+    assert clean("\u203a CVE-2026-16861\n\nBody.").body_text == "Body."
+
+
+def test_glyph_continuation_is_dropped_only_after_a_breadcrumb_or_template_line() -> None:
+    root = "[Homepage](https://www.example.com/)"
+    page = clean(
+        f"{root}\n 5 [Blog](/blog/)\n 5 2024 AI Impact Report\n\n5 steps to patch faster.",
+        boilerplate=frozenset({root}),
+    )
+    assert page.body_text == "5 steps to patch faster."
+    assert page.links == ()
+
+
+def test_navigation_lines_need_only_the_lower_share_but_sentences_need_the_higher() -> None:
+    nav = "*   [Alerts](https://www.example.com/documentation/alerts/)"
+    sentence = "IBM i 7.3 through 7.6 are affected by a broad set of flaws."
+    docs = [f"{nav}\n{sentence}\nunique body {i}" for i in range(5)]
+    docs += [f"other page number {i} with its own text" for i in range(95)]
+    found = find_boilerplate(docs, min_share=0.2, nav_min_share=0.02)
+    assert nav in found
+    assert sentence not in found
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("*   [Alerts](https://x.com/a/)", True),
+        ("5 [Blog](https://x.com/blog/)", True),
+        ("### By Peter Barnett", True),
+        ("- Security Concerns", True),
+        ("A sentence with a [link](https://x.com/) inside it.", False),
+        ("Plain repeated sentence of content.", False),
+    ],
+)
+def test_is_navigation(line: str, expected: bool) -> None:
+    assert is_navigation(line) is expected
