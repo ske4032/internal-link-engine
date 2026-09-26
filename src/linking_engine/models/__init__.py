@@ -11,6 +11,7 @@ not fetch it, compute it, or log it.
 """
 
 from linking_engine.models.audit import LinkAuditResult
+from linking_engine.models.corpus import CleanedPage, ExtractedLink
 from linking_engine.models.enums import (
     ActionType,
     AnchorType,
@@ -31,7 +32,9 @@ __all__ = [
     "AnchorCandidate",
     "AnchorType",
     "AnchorTypeProfile",
+    "CleanedPage",
     "ContentGapFinding",
+    "ExtractedLink",
     "IssueFlag",
     "Keyword",
     "KeywordSource",
