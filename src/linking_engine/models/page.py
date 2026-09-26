@@ -15,7 +15,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
-from linking_engine.models.enums import AnchorType, LifecycleStage, PageType
+from linking_engine.models.enums import ActionType, AnchorType, IssueFlag, LifecycleStage, PageType
 
 # Vectors are ``tuple[float, ...]`` rather than ``list[float]``: these models are
 # frozen and therefore hashable, and a list field would raise on hash. The tuple
@@ -116,6 +116,9 @@ class Link(BaseModel):
     surrounding_text: str
     surrounding_embedding: tuple[float, ...] | None = None
     target_status_code: int | None = Field(default=None, ge=100, le=599)
+    issue_flags: frozenset[IssueFlag] = frozenset()
+    # FIX whenever the target answers 3xx, 4xx or 5xx.
+    verdict: ActionType | None = None
 
 
 class TenantGraphCounts(BaseModel):
@@ -124,3 +127,6 @@ class TenantGraphCounts(BaseModel):
     pages: int = Field(ge=0)
     placeholders: int = Field(ge=0)
     links: int = Field(ge=0)
+    redirected_pages: int = Field(default=0, ge=0)
+    broken_pages: int = Field(default=0, ge=0)
+    fix_links: int = Field(default=0, ge=0)
