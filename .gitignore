@@ -1,7 +1,13 @@
 # macOS
 .DS_Store
 
-# Python
+# ── Working material ────────────────────────────────────────────────────────
+# Everything under files/ is local scratch, except the tracked docs export.
+# Order matters: exclude the contents, then re-include the one directory.
+files/*
+!files/linking-engine-docs/
+
+# ── Python (evaluation framework) ───────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -21,3 +27,4 @@ venv/
 # Local data / runs
 mlruns/
 *.log
+.cache/
