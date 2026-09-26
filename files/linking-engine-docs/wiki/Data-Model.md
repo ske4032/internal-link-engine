@@ -99,7 +99,7 @@ queries. See Measurement Backlog.
 
 | Collection | Contents |
 |---|---|
-| `pages` | title, h1, meta, bodyText, crawledAt, language, hreflangMap, publishedAt |
+| `pages` | metaTitle, metaDescription, h1, headings, bodyText, scrapedAt, language, hreflangMap, publishedAt |
 | `gsc_metrics` | impressions_28d, avg_position, ctr, ctr_gap, trend, query_count |
 | `gsc_queries` | query, impressions, clicks, position, date_bucket, url |
 | `strategic_keywords` | url, keyword, priority, isPrimary, language, searchVolume |

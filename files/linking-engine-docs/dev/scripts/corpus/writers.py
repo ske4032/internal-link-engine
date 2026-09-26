@@ -74,10 +74,10 @@ def write_mongo(uri: str, pages: list[Page], queries: list[dict]) -> None:
         db[c].delete_many({"tenantId": "demo"})
 
     db.pages.insert_many([{
-        "tenantId": "demo", "url": p.url, "title": p.title, "h1": p.h1,
+        "tenantId": "demo", "url": p.url, "metaTitle": p.title, "h1": p.h1,
         "html": p.html, "bodyText": p.body_text, "wordCount": p.word_count,
         "language": "en", "contentHash": p.content_hash,
-        "crawledAt": datetime.utcnow(),
+        "scrapedAt": datetime.utcnow(),
         "_topic": p.topic, "_subtopic": p.subtopic,
         "_includeHeadTerm": p.include_head_term, "_planted": p.planted,
     } for p in pages])
