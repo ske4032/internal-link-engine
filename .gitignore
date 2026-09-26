@@ -29,8 +29,8 @@ mlruns/
 *.log
 .cache/
 
-# Claude Code personal overrides (project settings.json is shared)
-.claude/settings.local.json
+# Claude Code agent stack stays local, never in the repo
+.claude/
 
 # cxpak index
 .cxpak/
