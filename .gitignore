@@ -55,3 +55,6 @@ dist/
 
 # Prefect local state (SQLite backend when running `prefect server start`)
 .prefect/
+
+# zvec-grep (zg) local search index
+.zvec-grep/
