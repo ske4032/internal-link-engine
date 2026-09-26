@@ -20,6 +20,7 @@ and writing the result belongs to the caller.
 
 from __future__ import annotations
 
+import hashlib
 import html
 import re
 from collections import Counter
@@ -282,6 +283,11 @@ def clean_page(
         links=tuple(links),
         removed=tuple(sorted(removed.items())),
     )
+
+
+def body_hash(text: str) -> str:
+    """sha256 hex of the exact body text sent to the embedder."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _strip_block_markers(line: str, removed: Counter[str]) -> str:

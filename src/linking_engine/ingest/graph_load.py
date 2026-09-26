@@ -65,6 +65,7 @@ async def load_tenant_graph(
                     status_code=summary.status_code,
                     word_count=summary.word_count,
                     content_hash=summary.content_hash,
+                    body_hash=summary.body_hash,
                 )
                 for summary in summaries
             ],

@@ -83,6 +83,7 @@ PAGE_KWARGS: dict[str, object] = {
     "status_code": 200,
     "is_placeholder": False,
     "content_hash": "ab" * 32,
+    "body_hash": "cd" * 32,
     "word_count": 1450,
     "crawl_depth": 2,
     "language": "en",
@@ -97,7 +98,9 @@ PAGE_KWARGS: dict[str, object] = {
     "is_chunked": False,
     "embedding_model": "voyage-4-large",
     "embedding_dimensions": 2048,
-    "embedded_content_hash": "9f" * 32,
+    # Differs from body_hash so a swapped mapping cannot round-trip.
+    "embedded_body_hash": "9f" * 32,
+    "embedded_at": TIMESTAMP,
     "content_embedding": VECTOR,
     "gnn_embedding": VECTOR,
 }

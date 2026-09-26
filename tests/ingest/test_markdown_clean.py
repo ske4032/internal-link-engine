@@ -8,6 +8,7 @@ list.
 import pytest
 
 from linking_engine.ingest.markdown_clean import (
+    body_hash,
     clean_meta,
     clean_page,
     find_boilerplate,
@@ -325,3 +326,39 @@ def test_a_leading_dot_word_is_not_a_continuation() -> None:
     assert clean("Patched in the test environment.\n.NET Framework fix").body_text == (
         "Patched in the test environment.\n.NET Framework fix"
     )
+
+
+# ── body hash ────────────────────────────────────────────────────────────────
+
+# Expected digests come from `shasum -a 256` over the UTF-8 bytes, not from hashlib.
+MIXED_SCRIPT = "Caf\u00e9 na\u00efve \u65e5\u672c\u8a9e \U0001f680"
+MIXED_SCRIPT_SHA256 = "a7d1bfbd648a86abefea7aaebdb9662662231c44e8bdd8780427363ce75552a2"
+EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+COMPOSED_SHA256 = "73473dcc12b763085904a5279d048c4d5b3b008c46f1f32443b99de04aa83a14"
+DECOMPOSED_SHA256 = "c42cc7a1ca08364b6fd859fa50d2454730a8236290a423373cc630da77c6d711"
+
+
+def test_body_hash_is_sha256_of_utf8_for_non_ascii_text() -> None:
+    assert body_hash(MIXED_SCRIPT) == MIXED_SCRIPT_SHA256
+
+
+def test_body_hash_of_empty_text_is_the_empty_sha256() -> None:
+    assert body_hash("") == EMPTY_SHA256
+
+
+def test_body_hash_changes_when_one_character_changes() -> None:
+    edited = MIXED_SCRIPT.replace("na\u00efve", "naive")
+    assert len(edited) == len(MIXED_SCRIPT)
+    assert body_hash(edited) != body_hash(MIXED_SCRIPT)
+    assert body_hash("Body text.") != body_hash("Body text!")
+
+
+def test_body_hash_is_over_exact_code_points_not_a_normal_form() -> None:
+    assert body_hash("Caf\u00e9") == COMPOSED_SHA256
+    assert body_hash("Cafe\u0301") == DECOMPOSED_SHA256
+
+
+def test_body_hash_is_lowercase_hex_of_64_chars() -> None:
+    digest = body_hash(MIXED_SCRIPT)
+    assert len(digest) == 64
+    assert set(digest) <= set("0123456789abcdef"), digest

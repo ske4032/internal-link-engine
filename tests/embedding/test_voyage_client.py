@@ -8,12 +8,14 @@ import pytest
 from structlog.testing import capture_logs
 from voyage_fakes import (
     API_TOKEN_DRIFT,
+    BASE,
     DIMENSION,
     MODEL,
     RAW_COMPONENT,
     FakeVoyage,
     client,
     page,
+    page_index,
     settings,
     word_tokenizer,
     words,
@@ -40,7 +42,7 @@ from linking_engine.errors import (
     EmbeddingResponseError,
     EmbeddingUnavailableError,
 )
-from linking_engine.models import PageEmbedding, PageText
+from linking_engine.models import EmbeddingBatch, PageEmbedding, PageText
 
 
 def norm(vector: tuple[float, ...]) -> float:
@@ -218,6 +220,130 @@ async def test_empty_input_makes_no_call() -> None:
         assert await client(fake).embed([]) == []
     assert fake.calls == []
     assert events(logs, "embedding.batch") == []
+
+
+# --- iter_embed ---------------------------------------------------------------------------
+
+
+async def test_iter_embed_yields_one_batch_per_request_in_input_order() -> None:
+    fake = FakeVoyage()
+    pages = [page(i, 30) for i in range(10)]
+    batches = [batch async for batch in client(fake).iter_embed(pages)]
+
+    assert all(isinstance(batch, EmbeddingBatch) for batch in batches)
+    assert len(batches) == len(fake.calls) == 3, "10 pages at cap 4 should take 3 requests"
+    assert [[e.url for e in batch.embeddings] for batch in batches] == [
+        [p.url for p in pages[0:4]],
+        [p.url for p in pages[4:8]],
+        [p.url for p in pages[8:10]],
+    ]
+    for batch, call in zip(batches, fake.calls, strict=True):
+        sent = [page_index(text) for text in call.texts]
+        assert [e.url for e in batch.embeddings] == [f"{BASE}/p{i}" for i in sent]
+        tags = [max(range(DIMENSION), key=e.vector.__getitem__) for e in batch.embeddings]
+        assert tags == sent, f"vectors attached to the wrong pages: {tags}"
+
+
+async def test_iter_embed_api_tokens_are_the_sdk_total_not_the_local_count() -> None:
+    fake = FakeVoyage()
+    batches = [b async for b in client(fake).iter_embed([page(i, 30) for i in range(10)])]
+    local = [sum(e.tokens for e in batch.embeddings) for batch in batches]
+    assert local == [120, 120, 60]
+    assert [batch.api_tokens for batch in batches] == [n + API_TOKEN_DRIFT for n in local]
+
+
+async def test_iter_embed_requests_lazily_one_batch_at_a_time() -> None:
+    fake = FakeVoyage()
+    batches = client(fake).iter_embed([page(i, 30) for i in range(10)])
+    first = await anext(batches)
+    assert len(first.embeddings) == 4
+    assert len(fake.calls) == 1, "the second request must wait until the caller asks for it"
+    await anext(batches)
+    assert len(fake.calls) == 2
+    await batches.aclose()
+    assert len(fake.calls) == 2
+
+
+async def test_batches_already_yielded_survive_a_later_request_failure() -> None:
+    rejected = sdk_error(InvalidRequestError, 400, "input too long", json_detail=True)
+    fake = FakeVoyage(fail_on={2: rejected})
+    batches = client(fake).iter_embed([page(i, 30) for i in range(10)])
+    first = await anext(batches)
+    assert [e.url for e in first.embeddings] == [page(i, 30).url for i in range(4)]
+    with pytest.raises(EmbeddingRequestError, match="HTTP 400 InvalidRequestError"):
+        await anext(batches)
+    assert fake.call_count == 2
+
+
+async def test_embed_equals_the_flattened_iter_embed() -> None:
+    pages = [page(i, n) for i, n in enumerate([80, 5, 50, 12, 49, 1, 33, 20, 20, 44])]
+    embedded = await client(FakeVoyage()).embed(pages)
+    iterated = [
+        e async for batch in client(FakeVoyage()).iter_embed(pages) for e in batch.embeddings
+    ]
+    assert embedded == iterated
+    assert [e.url for e in embedded] == [p.url for p in pages]
+    assert any(e.truncated for e in embedded), "the 80-token page should be truncated"
+
+
+async def test_iter_embed_on_empty_input_makes_no_call() -> None:
+    fake = FakeVoyage()
+    assert [batch async for batch in client(fake).iter_embed([])] == []
+    assert fake.call_count == 0
+
+
+def test_model_and_dimension_are_the_configured_values() -> None:
+    small = client(FakeVoyage())
+    assert (small.model, small.dimension) == (MODEL, DIMENSION)
+    wide = client(FakeVoyage(dimension=2048))
+    assert wide.dimension == 2048
+
+
+def test_model_and_dimension_are_read_only() -> None:
+    voyage = client(FakeVoyage())
+    with pytest.raises(AttributeError, match="has no setter"):
+        voyage.model = "other"  # type: ignore[misc]
+    with pytest.raises(AttributeError, match="has no setter"):
+        voyage.dimension = 8  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "reported",
+    [-1, 1.5, True, "12", None],
+    ids=["negative", "float", "bool", "str", "none"],
+)
+async def test_total_tokens_that_is_not_a_count_is_a_response_error(reported: object) -> None:
+    fake = FakeVoyage(usage=lambda texts: reported)
+    with pytest.raises(EmbeddingResponseError, match=r"total_tokens .* is not a count"):
+        await client(fake).embed([page(0, 10)])
+    assert fake.call_count == 1, "a malformed response is not retried"
+
+
+async def test_zero_total_tokens_is_a_valid_count() -> None:
+    fake = FakeVoyage(usage=lambda texts: 0)
+    [batch] = [b async for b in client(fake).iter_embed([page(0, 10)])]
+    assert batch.api_tokens == 0
+
+
+# --- the fake itself ----------------------------------------------------------------------
+
+
+async def test_fake_fail_on_counts_retries_as_calls() -> None:
+    fake = FakeVoyage(fail_on={1: RateLimitError("rate limited", http_status=429)})
+    with capture_logs() as logs:
+        result = await client(fake).embed([page(0, 10), page(1, 10)])
+    assert fake.call_count == 2
+    assert [r.url for r in result] == [page(0, 10).url, page(1, 10).url]
+    (batch,) = events(logs, "embedding.batch")
+    assert batch["retries"] == 1
+
+
+async def test_fake_without_recording_keeps_no_texts_but_counts() -> None:
+    fake = FakeVoyage(record_calls=False)
+    result = await client(fake).embed([page(i, 30) for i in range(10)])
+    assert len(result) == 10
+    assert fake.calls == []
+    assert (fake.call_count, fake.texts_seen) == (3, 10)
 
 
 # --- truncation --------------------------------------------------------------------------

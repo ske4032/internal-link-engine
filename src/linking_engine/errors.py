@@ -61,4 +61,8 @@ class EmbeddingAuthError(EmbeddingRequestError):
 
 
 class EmbeddingResponseError(EmbeddingError):
-    """Wrong vector count or dimension, zero vector, or not unit norm."""
+    """Wrong vector count or dimension, zero vector, not unit norm, or bad token count."""
+
+
+class EmbeddingModelMismatchError(EmbeddingError):
+    """Stored vectors mix models, lack a model, or differ from the configured model."""

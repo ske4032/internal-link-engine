@@ -112,7 +112,8 @@ class Call:
 @dataclass(frozen=True)
 class FakeResult:
     embeddings: list[list[float]]
-    total_tokens: int
+    # object, not int, so a test can hand the client a malformed count.
+    total_tokens: object
 
 
 @dataclass
@@ -126,10 +127,18 @@ class FakeVoyage:
 
     dimension: int = DIMENSION
     failures: list[BaseException] = field(default_factory=list)
+    # Raised on that 1-based call number, before `failures`; retries count as calls.
+    fail_on: dict[int, BaseException] = field(default_factory=dict)
     respond: Callable[[Sequence[str]], list[list[float]]] | None = None
+    # Replaces total_tokens for a call, to build malformed counts.
+    usage: Callable[[Sequence[str]], object] | None = None
     hang_s: float = 0.0
     hang_calls: int | None = None
+    # False keeps no texts, so the fake cannot grow a memory measurement.
+    record_calls: bool = True
     calls: list[Call] = field(default_factory=list)
+    call_count: int = 0
+    texts_seen: int = 0
     cancelled: int = 0
 
     async def embed(
@@ -141,19 +150,27 @@ class FakeVoyage:
         output_dimension: int,
         truncation: bool,
     ) -> FakeResult:
-        self.calls.append(Call(tuple(texts), model, input_type, output_dimension, truncation))
-        if self.hang_s and (self.hang_calls is None or len(self.calls) <= self.hang_calls):
+        self.call_count += 1
+        number = self.call_count
+        self.texts_seen += len(texts)
+        if self.record_calls:
+            self.calls.append(Call(tuple(texts), model, input_type, output_dimension, truncation))
+        if self.hang_s and (self.hang_calls is None or number <= self.hang_calls):
             try:
                 await asyncio.sleep(self.hang_s)
             except asyncio.CancelledError:
                 self.cancelled += 1
                 raise
+        if number in self.fail_on:
+            raise self.fail_on[number]
         if self.failures:
             raise self.failures.pop(0)
         if self.respond is not None:
             vectors = self.respond(texts)
         else:
             vectors = [tagged_vector(text, self.dimension) for text in texts]
+        if self.usage is not None:
+            return FakeResult(vectors, self.usage(texts))
         return FakeResult(vectors, sum(words(t) for t in texts) + API_TOKEN_DRIFT)
 
 
