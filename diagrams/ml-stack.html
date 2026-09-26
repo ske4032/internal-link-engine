@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The ML stack, from the surface down</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=Barlow:wght@300;400;500&family=Spline+Sans+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --deep:#12151C;
+  --deep-2:#191D26;
+  --deep-3:#222836;
+  --edge:#2E3546;
+  --pale:#DFE3EC;
+  --pale-2:#9BA3B6;
+  --pale-3:#666F85;
+
+  --pyrite:#D4A62A;
+  --verdigris:#4FA396;
+  --azurite:#5C86CB;
+  --hematite:#C0605B;
+  --stone:#788196;
+
+  --mono:"Spline Sans Mono",ui-monospace,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--deep);color:var(--pale);
+  font-family:"Barlow",system-ui,sans-serif;font-weight:300;font-size:16.5px;line-height:1.62}
+.wrap{max-width:1160px;margin:0 auto;padding:0 26px}
+h1,h2,h3{margin:0;font-family:"Bricolage Grotesque",system-ui,sans-serif;font-weight:600;line-height:1.04}
+h1{font-size:clamp(2.4rem,6vw,4.4rem);letter-spacing:-.03em;font-weight:800}
+h2{font-size:1.5rem;letter-spacing:-.02em}
+h3{font-size:1.34rem;letter-spacing:-.018em}
+p{margin:0 0 .9rem;max-width:66ch}
+.m{font-family:var(--mono)}
+
+header{padding:70px 0 34px}
+.sub{font-size:1.16rem;color:var(--pale-2);max-width:56ch;margin-top:18px;font-weight:300}
+.key{display:flex;flex-wrap:wrap;gap:16px;margin-top:26px;font-family:var(--mono);font-size:.76rem;color:var(--pale-3)}
+.key span{display:flex;align-items:center;gap:7px}
+.key i{width:11px;height:11px;border-radius:2px;display:inline-block}
+
+/* ---- the column ---- */
+.core{display:grid;grid-template-columns:64px 300px 1fr;gap:0;margin:14px 0 0;
+  border-top:1px solid var(--edge)}
+.depth{border-right:1px solid var(--edge);padding-top:10px}
+.depth div{height:74px;font-family:var(--mono);font-size:.72rem;color:var(--pale-3);
+  padding:8px 10px 0 0;text-align:right;border-bottom:1px solid var(--deep-3)}
+.column{border-right:1px solid var(--edge);padding-top:10px}
+.strat{display:block;width:100%;height:74px;border:0;border-bottom:1px solid var(--deep-3);
+  background:transparent;cursor:pointer;text-align:left;padding:0 0 0 16px;position:relative;
+  font-family:"Barlow",system-ui,sans-serif;color:var(--pale-2);transition:background .18s ease}
+.strat:before{content:"";position:absolute;left:0;top:0;bottom:1px;width:7px;background:var(--stone)}
+.strat .nm{display:block;font-size:1rem;font-weight:500;color:var(--pale);line-height:1.2;padding-top:16px}
+.strat .sh{display:block;font-family:var(--mono);font-size:.73rem;color:var(--pale-3);margin-top:5px}
+.strat:hover{background:var(--deep-2)}
+.strat[aria-selected="true"]{background:var(--deep-3)}
+.strat[aria-selected="true"] .nm{color:#fff}
+.strat:focus-visible{outline:2px solid var(--azurite);outline-offset:-2px}
+.strat[data-k="learned"]:before{background:var(--pyrite)}
+.strat[data-k="self"]:before{background:var(--verdigris)}
+.strat[data-k="unsup"]:before{background:var(--azurite)}
+.strat[data-k="fixed"]:before{background:var(--stone)}
+.strat[data-k="gone"]:before{background:var(--hematite)}
+.strat[data-k="gone"] .nm{color:var(--pale-3);text-decoration:line-through;text-decoration-thickness:1px}
+
+.detail{padding:26px 0 26px 34px}
+.badge{display:inline-block;font-family:var(--mono);font-size:.7rem;padding:3px 9px;border-radius:2px;
+  margin-bottom:13px}
+.b-learned{background:rgba(212,166,42,.14);color:var(--pyrite)}
+.b-self{background:rgba(79,163,150,.14);color:var(--verdigris)}
+.b-unsup{background:rgba(92,134,203,.14);color:var(--azurite)}
+.b-fixed{background:rgba(120,129,150,.16);color:var(--stone)}
+.b-gone{background:rgba(192,96,91,.14);color:var(--hematite)}
+.detail h3{margin-bottom:6px}
+.detail .one{color:var(--pale-2);margin-bottom:20px;font-size:1.04rem}
+.wwww{border-top:1px solid var(--edge)}
+.wwww div{display:grid;grid-template-columns:78px 1fr;gap:16px;padding:12px 0;
+  border-bottom:1px solid var(--deep-3)}
+.wwww dt{font-family:var(--mono);font-size:.73rem;color:var(--pale-3);padding-top:3px}
+.wwww dd{margin:0;font-size:.97rem;color:var(--pale-2)}
+.wwww dd strong{color:var(--pale);font-weight:500}
+pre{font-family:var(--mono);font-size:.78rem;line-height:1.6;background:var(--deep-2);
+  border:1px solid var(--edge);border-radius:2px;padding:12px 14px;overflow-x:auto;
+  margin:18px 0 0;color:var(--pale-2)}
+
+section{padding:56px 0;border-top:1px solid var(--edge);margin-top:52px}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:40px;margin-top:22px}
+.cols p{font-size:.98rem;color:var(--pale-2)}
+.cols h3{font-size:1.06rem;margin-bottom:8px;font-weight:600}
+footer{padding:30px 0 70px;font-family:var(--mono);font-size:.76rem;color:var(--pale-3)}
+
+@media (max-width:900px){
+  .core{grid-template-columns:44px 1fr}
+  .depth div{height:66px;font-size:.66rem}
+  .strat{height:66px}
+  .strat .nm{padding-top:12px;font-size:.94rem}
+  .detail{grid-column:1 / -1;padding:24px 0 0;border-top:1px solid var(--edge);margin-top:14px}
+  .cols{grid-template-columns:1fr;gap:26px}
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <h1>Nine models deep</h1>
+    <p class="sub">Text goes in at the surface. Eight transformations later a number comes out that says which link to make. Here is every layer it passes through, in the order it passes through them.</p>
+    <div class="key">
+      <span><i style="background:var(--pyrite)"></i> learned from your feedback</span>
+      <span><i style="background:var(--verdigris)"></i> pre-trained, frozen</span>
+      <span><i style="background:var(--azurite)"></i> unsupervised, per run</span>
+      <span><i style="background:var(--stone)"></i> deterministic</span>
+      <span><i style="background:var(--hematite)"></i> removed</span>
+    </div>
+
+    <div class="core">
+      <div class="depth" aria-hidden="true">
+        <div>text</div><div>1024d</div><div>1024d</div><div>scalar</div><div>id</div>
+        <div>id</div><div>1024d</div><div>top 50</div><div>3105d</div><div>0–100</div>
+        <div>verdict</div><div>—</div><div>—</div>
+      </div>
+
+      <div class="column" role="tablist" aria-label="Model layers" aria-orientation="vertical">
+        <button class="strat" role="tab" data-k="self" data-i="voyage" aria-selected="true">
+          <span class="nm">voyage-4-large</span><span class="sh">page body → 1024d dense vector</span></button>
+        <button class="strat" role="tab" data-k="fixed" data-i="pagerank" aria-selected="false">
+          <span class="nm">PageRank</span><span class="sh">weighted, damping 0.85</span></button>
+        <button class="strat" role="tab" data-k="unsup" data-i="louvainA" aria-selected="false">
+          <span class="nm">Louvain — link graph</span><span class="sh">modularity maximisation</span></button>
+        <button class="strat" role="tab" data-k="unsup" data-i="louvainB" aria-selected="false">
+          <span class="nm">Louvain — keyword graph</span><span class="sh">bipartite projection</span></button>
+        <button class="strat" role="tab" data-k="fixed" data-i="between" aria-selected="false">
+          <span class="nm">Betweenness</span><span class="sh">sampled shortest paths</span></button>
+        <button class="strat" role="tab" data-k="learned" data-i="sage" aria-selected="false">
+          <span class="nm">GraphSAGE</span><span class="sh">3-layer inductive GNN → 1024d</span></button>
+        <button class="strat" role="tab" data-k="fixed" data-i="hnsw" aria-selected="false">
+          <span class="nm">HNSW</span><span class="sh">approximate nearest neighbour</span></button>
+        <button class="strat" role="tab" data-k="learned" data-i="xattn" aria-selected="false">
+          <span class="nm">Cross-attention</span><span class="sh">pairwise interaction → 3105d</span></button>
+        <button class="strat" role="tab" data-k="learned" data-i="lmart" aria-selected="false">
+          <span class="nm">LambdaMART</span><span class="sh">gradient boosted ranking</span></button>
+        <button class="strat" role="tab" data-k="self" data-i="qwen" aria-selected="false">
+          <span class="nm">Qwen3.5-4B</span><span class="sh">content gap verdicts only</span></button>
+        <button class="strat" role="tab" data-k="gone" data-i="gen" aria-selected="false">
+          <span class="nm">LLM anchor generation</span><span class="sh">removed in v5</span></button>
+        <button class="strat" role="tab" data-k="gone" data-i="judge" aria-selected="false">
+          <span class="nm">LLM-as-judge</span><span class="sh">removed in v5</span></button>
+        <button class="strat" role="tab" data-k="gone" data-i="rerank" aria-selected="false">
+          <span class="nm">Cross-encoder reranker</span><span class="sh">never built</span></button>
+      </div>
+
+      <div class="detail" id="detail" role="tabpanel" aria-live="polite"></div>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>Two things worth noticing about the shape of this</h2>
+    <div class="cols">
+      <div>
+        <h3>Only three models learn anything</h3>
+        <p>GraphSAGE, cross-attention and LambdaMART are the only components trained on your data. Everything above them is pre-trained or deterministic — the same code runs identically for every client. Everything the system knows about <em>your</em> team's judgement lives in those three artefacts, and all three train on the same signal: which recommendations were accepted, edited, or dismissed.</p>
+        <p>That is also why the audit stage ships first. It needs none of them, and it produces the labels they need.</p>
+      </div>
+      <div>
+        <h3>The removed layers were all generative</h3>
+        <p>Three components were cut, and they have something in common: each one had a model inventing text rather than measuring something. Anchor generation invented phrases to insert into client copy. LLM-as-judge scored its own output. The reranker would have been a general model guessing at a task a purpose-trained one already handles.</p>
+        <p>What survived is measurement — embeddings, graph statistics, learned ranking over real labels. The one generative model left runs only when the answer is "this content doesn't exist yet."</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer><div class="wrap">Component reference v5. Estimates are projections until the first client's Prometheus data replaces them.</div></footer>
+
+<script>
+(function(){
+var K={learned:["learned from your feedback","b-learned"],self:["pre-trained, frozen","b-self"],
+       unsup:["unsupervised, recomputed per run","b-unsup"],fixed:["deterministic, no training","b-fixed"],
+       gone:["removed from the design","b-gone"]};
+
+var D={
+voyage:{h:"voyage-4-large",k:"self",
+ one:"A bidirectional transformer trained with contrastive learning to place semantically similar documents near each other in 1024-dimensional space.",
+ what:"Reads a full page body — up to 32,000 tokens, so nothing gets truncated — and emits one dense vector. Truncated from the model's native 2048 dimensions to 1024 using Matryoshka representation learning, which costs about 0.01 cosine and preserves rank order exactly.",
+ when:"Stage 01, on every page whose content changed since the last run. Never on a schedule.",
+ where:"Voyage API. The open-weight voyage-4-nano runs locally via TEI as the exit path — all Voyage 4 models share an embedding space, so switching needs no re-index.",
+ why:"A local bake-off against Qwen3-Embedding-0.6B showed no meaningful quality difference on real client content, which makes sense: this vector is one input among ~270 features feeding a GNN that then trains on acceptance data. Two competent embedders converge downstream. With quality neutral the decision moved to operations — one less container, no CPU embedding bottleneck.",
+ code:"input_type   document      // no query side exists here\ndimensions   1024          // MRL from 2048\ncontext      32,000 tokens\nnormalise    L2            // Neo4j cosine index assumes it"},
+
+pagerank:{h:"PageRank",k:"fixed",
+ one:"The original link-authority algorithm, weighted by where on the page each link sits.",
+ what:"Models a random surfer following links with probability 0.85 and teleporting otherwise. Authority divides across a page's outbound links, so a page with 150 links passes roughly 1/150 through each.",
+ when:"Stage 02, after every embedding pass, over the full projected graph.",
+ where:"Neo4j GDS, in-memory projection. Written back as a node property.",
+ why:"It is the correct model of how internal link equity actually flows, and it is the reason the source-side outbound count matters — recommending a 151st link on an already saturated page is close to worthless. Position weighting (body 1.0, sidebar 0.6, nav 0.4, footer 0.3) reflects that a footer link carries less than one in the copy.",
+ code:"PR(v) = (1-d)/N + d * sum over u in In(v) of\n        ( w_uv * PR(u) ) / sum of w_uk\n\nd = 0.85, 20 iterations"},
+
+louvainA:{h:"Louvain — link graph",k:"unsup",
+ one:"Unsupervised community detection that finds topical clusters by maximising modularity.",
+ what:"Groups pages that link to each other more densely than a random graph with the same degree distribution would predict. Each page comes out with a cluster id.",
+ when:"Stage 02, immediately after PageRank, on the same projection.",
+ where:"Neo4j GDS. Result is a node property and a GNN input feature.",
+ why:"Pages in the same cluster are natural linking candidates. But this clustering is circular for discovery purposes — it groups pages by the links they already have, so a new site or a new section has no clusters and therefore no recommendations. That limitation is exactly why a second pass exists.",
+ code:"Q = (1/2m) * sum_ij [ A_ij - (k_i * k_j)/2m ] * delta(c_i, c_j)"},
+
+louvainB:{h:"Louvain — keyword graph",k:"unsup",
+ one:"The same algorithm run over an entirely different graph: pages connected by shared target keywords rather than by links.",
+ what:"Bipartite projection over the TARGETS_KEYWORD relationship. Two pages are adjacent if they target overlapping keywords, regardless of whether any link exists between them.",
+ when:"Stage 02, second pass.",
+ where:"Neo4j GDS, separate projection. Produces keywordCommunityId alongside linkCommunityId.",
+ why:"Keyword relationships exist before any links do, which makes this the cold-start-safe clustering. It also makes hub-and-spoke explicit: the pillar is the head term by aggregate volume, spokes are the long-tail variants. And the disagreement between the two clusterings is itself the signal — pages in the same keyword cluster but different link clusters are precisely the missing links the system is looking for.",
+ code:"(:Page)-[:TARGETS_KEYWORD]->(:Keyword)\n  project bipartite -> page-page adjacency\n  Louvain -> keywordCommunityId\n\nboth ids become model features"},
+
+between:{h:"Betweenness centrality",k:"fixed",
+ one:"Counts how often a page sits on the shortest path between two other pages.",
+ what:"Identifies bridge pages connecting otherwise separate clusters. High betweenness with low PageRank is a structural bridge that isn't being rewarded — linking to it unlocks equity flow for a whole cluster.",
+ when:"Stage 02, third algorithm.",
+ where:"Neo4j GDS, sampled rather than exact.",
+ why:"It captures something PageRank misses entirely: structural position rather than accumulated authority. Exact computation is O(V·E) and would run 30–90 minutes on a 25k-page site, so sampling is necessary — but sampling changes the values, and whether the sampled version still carries signal as a GNN feature is unverified.",
+ code:"BC(v) = sum over s != v != t of\n        sigma(s,t | v) / sigma(s,t)\n\nO(V*E) exact -> sampled in practice"},
+
+sage:{h:"GraphSAGE",k:"learned",
+ one:"An inductive graph neural network that folds a page's neighbourhood into its representation.",
+ what:"Three layers of MEAN aggregation, so each page's final vector encodes information from three hops out. Takes ~270 graph and GSC scalars plus the 1024d content embedding, emits a 1024d vector that captures both what the page is about and where it sits.",
+ when:"Stage 03, every run for inference. Fine-tuned monthly on acceptance feedback.",
+ where:"PyTorch Geometric in a Python service. Checkpoints versioned in MinIO, loaded at run start.",
+ why:"Inductive, not transductive. A GCN learns fixed node representations and cannot generalise to pages added after training — every new page would force a retrain. GraphSAGE learns an aggregation function that works on any node. Monthly contrastive fine-tuning then pulls accepted pairs together in the space and pushes dismissed pairs apart, which is how the system learns this specific team's judgement.",
+ code:"h_v = sigma( W . MEAN( { h_u : u in N(v) } union { h_v } ) )\n\nin   ~270 scalars || content_emb[1024]\nout  gnn_embedding[1024]\n\nretrain: contrastive loss over accept/dismiss pairs"},
+
+hnsw:{h:"HNSW",k:"fixed",
+ one:"A navigable small-world graph over the vectors, giving logarithmic-time nearest neighbour search.",
+ what:"Retrieves the top 50 semantically similar pages per target at better than 95% recall. Runs on gnn_embedding, not content_embedding — so retrieval is graph-aware, not just topic-aware.",
+ when:"Stage 04, once per eligible target.",
+ where:"Neo4j 5.x native vector index. No separate vector store.",
+ why:"Exact cosine over 1024d vectors for 25,000 pages is O(N) per query and far too slow inside the pipeline. This is also the component that actually bounds candidate volume — removing the GSC eligibility filter in v4 expanded which pages could be targets, but the top-50 cap still governs how much work follows.",
+ code:"index    HNSW, cosine, 1024d\nsearch   top 50 per target\nrecall   >95%\ncomplexity O(log N) vs O(N) exact"},
+
+xattn:{h:"Cross-attention",k:"learned",
+ one:"Multi-head attention over a source and target pair, producing a vector that describes their relationship rather than either page alone.",
+ what:"Stacks the two GNN embeddings into a length-2 sequence and lets each attend to the other. The attended outputs are summed and layer-normalised into a 1024d interaction vector, then concatenated with both source and target vectors and ~30 context features.",
+ when:"Stage 05, for every surviving candidate pair.",
+ where:"Same PyTorch service as GraphSAGE.",
+ why:"Cosine similarity treats pages independently. A high-authority source adjacent to a topical hub is a genuinely different signal from the same authority score sitting in an isolated corner of the graph, and only a pairwise model can see that. This is also, functionally, a cross-encoder — which is why a separate reranking stage was evaluated and rejected.",
+ code:"seq  = [ source.gnn || target.gnn ]        [2 x 1024]\nA    = softmax( QK^T / sqrt(1024) )\nint  = LayerNorm( attended_src + attended_tgt )\n\npair = src[1024] || tgt[1024] || int[1024] || ctx[~30]\n     = ~3105d"},
+
+lmart:{h:"LambdaMART",k:"learned",
+ one:"Gradient boosted decision trees that optimise ranking quality directly, trained on what your team actually accepted.",
+ what:"Takes the 3105d pair vector and produces a score from 0 to 100. Candidates are grouped by source page, so it ranks targets within a page's context rather than globally. Gradients come from the change in NDCG@10 caused by swapping two candidates, not from a conventional loss.",
+ when:"Stage 06, every run for inference. Full retrain monthly, behind a promotion gate.",
+ where:"LightGBM. Model file versioned in MinIO, previous version retained for rollback.",
+ why:"Traffic delta is not attributable to a single link — it's confounded by algorithm updates, seasonality and content changes, so regression on outcomes would be fitting noise. But acceptance is directly observable. Ranking on it works well with hundreds of labels, which is what human feedback realistically produces. The promotion gate matters: a new model only ships if it beats production NDCG@10 on holdout, otherwise monthly retraining is a monthly regression risk.",
+ code:"objective  lambdarank\nmetric     NDCG@10\ngroups     by source page\nlabels     accepted=3 modified=2 dismissed=1 unseen=0\n\nlambda_ij = -1/(1+exp(s_i - s_j)) * |delta NDCG_ij|"},
+
+qwen:{h:"Qwen3.5-4B",k:"self",
+ one:"A 4B instruction-tuned model that runs only when the extraction ladder finds nothing, and returns a judgement about the content rather than any text to publish.",
+ what:"Emits a CONTENT_GAP verdict: either NO_TOPICAL_MENTION (the source page doesn't cover the topic, new content needed) or AWKWARD_PHRASING (the topic is there but no clean phrase exists, light rewrite needed). Routes to a writer queue, not a link-implementation queue.",
+ when:"Stage 07, only on extraction failure, and only above a priority gate.",
+ where:"Ollama, local, ~3 GB quantised. No API dependency remains in the anchor path.",
+ why:"The priority gate is not optional. Semantic similarity put every candidate pair in the set, so the topic is always related — without gating on strategic keyword priority or opportunity value, every failed extraction becomes a content request and floods the queue.",
+ code:"finding   NO_TOPICAL_MENTION | AWKWARD_PHRASING\ngate      strategic priority >= 4\n          OR opportunity_value above threshold\nmodel     qwen3.5:4b, Q4_K_M, ~3 GB"},
+
+gen:{h:"LLM anchor generation",k:"gone",
+ one:"Removed in v5. For four versions an LLM invented anchor phrases to insert into client copy when no suitable phrase existed.",
+ what:"Generated up to 27 candidates per pair — three sentences by three anchor types by three variants — then scored them on five dimensions.",
+ when:"Stage 07c, through v4.",
+ where:"Ollama locally, or Claude Haiku Batch for initial runs.",
+ why:"It came from the right answer to the wrong question. The original design used T5-base for this, and the critique correctly said an instruction-tuned model would do far better. But nobody asked whether generation was the right operation at all — that assumption was inherited and never re-examined for nine months. Inserting an invented phrase bolts a link onto copy that was never about the topic. If a page has no natural place to link a target, the honest finding is a content gap, not an anchor. Removing it also collapsed the anchor runtime from 30–90 minutes to string and vector operations.",
+ code:"v4:  extract -> extract -> extract -> LLM invents phrase\nv5:  extract -> extract -> extract -> CONTENT_GAP"},
+
+judge:{h:"LLM-as-judge naturalness",k:"gone",
+ one:"Removed in v5. Scored how naturally a candidate anchor read in its sentence, weighted at 0.30 and later 0.20 of the composite.",
+ what:"Sent the sentence with the anchor inserted back to the same model that generated it, asking for a score from 0 to 1.",
+ when:"Stage 07d, through v4.",
+ where:"Same service as generation — deliberately, to avoid a second model dependency.",
+ why:"It carried a known self-preference bias: a model rates its own output higher than an independent judge would, which made the score valid for ranking candidates within a batch but not for comparing generation strategies. That was manageable. What made it redundant was the shift to extraction — a phrase pulled from the page already reads naturally in its own sentence, because that is what made it extractable in the first place. Its weight redistributed to semantic fit and keyword alignment.",
+ code:"v4 weights  semantic .30  natural .20  keyword .30  div .10  len .10\nv5 weights  semantic .35                keyword .35  div .15  len .15"},
+
+rerank:{h:"Cross-encoder reranker",k:"gone",
+ one:"Evaluated and rejected. A second-stage model reordering candidates between retrieval and scoring.",
+ what:"Would have taken the top 50 ANN candidates and reordered them with a text cross-encoder before the pair vector was assembled.",
+ when:"Proposed between stages 04 and 05. Never built.",
+ where:"Would have been rerank-3 via API, or Qwen3-Reranker self-hosted.",
+ why:"Three reasons, and cost was the weakest of them. Cross-attention is already a cross-encoder, and it is fine-tuned monthly on acceptance feedback — a general reranker trained on query-document relevance has never seen a linking decision. The shape is also wrong: there are no queries in this pipeline, only page-to-page and sentence-to-page comparison, so adopting one means synthesising a pseudo-query and discarding most of the target page. And the economics collapse under their own fix — cheap enough to run means reranking a list the ANN already narrowed sharply, with the ranker about to order it properly anyway.",
+ code:"revisit only if:\n  NDCG@10 plateaus\n  AND error analysis shows topical-relevance misses\n\nthen: feature in the pair vector, never a filter"}
+};
+
+var panel=document.getElementById('detail');
+var tabs=document.querySelectorAll('.strat');
+
+function render(id){
+  var d=D[id], k=K[d.k];
+  panel.innerHTML=
+    '<span class="badge '+k[1]+'">'+k[0]+'</span>'+
+    '<h3>'+d.h+'</h3>'+
+    '<p class="one">'+d.one+'</p>'+
+    '<dl class="wwww">'+
+      '<div><dt>what</dt><dd>'+d.what+'</dd></div>'+
+      '<div><dt>when</dt><dd>'+d.when+'</dd></div>'+
+      '<div><dt>where</dt><dd>'+d.where+'</dd></div>'+
+      '<div><dt>why</dt><dd>'+d.why+'</dd></div>'+
+    '</dl>'+
+    '<pre>'+d.code+'</pre>';
+}
+tabs.forEach(function(t){
+  t.addEventListener('click',function(){
+    tabs.forEach(function(o){o.setAttribute('aria-selected',String(o===t));});
+    render(t.dataset.i);
+  });
+});
+render('voyage');
+})();
+</script>
+</body>
+</html>

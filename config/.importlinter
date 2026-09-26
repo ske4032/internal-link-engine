@@ -1,0 +1,85 @@
+[importlinter]
+root_package = linking_engine
+include_external_packages = True
+
+
+# ── layering ────────────────────────────────────────────────────────────────
+# Higher layers may import lower ones. Never the reverse.
+# models/ sits at the bottom because it is the only cross-module contract.
+
+[importlinter:contract:layers]
+name = Layered architecture
+type = layers
+layers =
+    api
+    pipeline
+    discovery
+    anchor
+    audit
+    graph
+    embedding
+    models
+
+
+# ── domain independence ─────────────────────────────────────────────────────
+# The three domain modules talk through models/, never to each other.
+# This is the rule most likely to erode when someone needs "just one function"
+# from audit/ inside anchor/.
+
+[importlinter:contract:domain-independence]
+name = Domain modules stay independent
+type = independence
+modules =
+    linking_engine.audit
+    linking_engine.discovery
+    linking_engine.anchor
+
+
+# ── graph algorithms are pure ───────────────────────────────────────────────
+# Algorithms take edge lists and return arrays. Only the repo layer speaks Bolt.
+# Without this, someone adds a convenience query inside an algorithm function
+# and the igraph separation dissolves.
+
+[importlinter:contract:algorithms-are-pure]
+name = Graph algorithms never touch the driver
+type = forbidden
+source_modules =
+    linking_engine.graph.algorithms
+forbidden_modules =
+    neo4j
+    motor
+    pymongo
+
+
+# ── serving path stays light ────────────────────────────────────────────────
+# The API must not drag in the ML tree.
+
+[importlinter:contract:api-excludes-ml]
+name = API never imports training code
+type = forbidden
+source_modules =
+    linking_engine.api
+forbidden_modules =
+    lightgbm
+    hdbscan
+    mlflow
+    sklearn
+    igraph
+    leidenalg
+
+
+# ── models are leaves ───────────────────────────────────────────────────────
+# Pydantic models describe data. They do not fetch it, compute it, or log it.
+
+[importlinter:contract:models-are-leaves]
+name = Models import nothing from the app
+type = forbidden
+source_modules =
+    linking_engine.models
+forbidden_modules =
+    neo4j
+    motor
+    voyageai
+    prefect
+    mlflow
+    igraph

@@ -1,0 +1,21 @@
+[project]
+name = "linking-engine-dev"
+version = "0.2.0"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "neo4j>=5.26",
+  "pymongo>=4.10",
+  "numpy>=2.0,<3",
+  "scikit-learn>=1.5",
+  "hdbscan>=0.8.38",
+  "python-igraph>=0.11",
+  "leidenalg>=0.10",
+]
+
+[project.optional-dependencies]
+# Real prose. Needs GEMINI_API_KEY.
+llm = ["google-genai>=1.0"]
+# Real embeddings. Needs VOYAGE_API_KEY.
+voyage = ["voyageai>=0.3", "tokenizers>=0.20"]
+# Only if HDBSCAN underperforms at raw 2048d. Pulls numba.
+umap = ["umap-learn>=0.5.6"]

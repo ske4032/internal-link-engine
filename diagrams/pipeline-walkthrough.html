@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>From vector to recommendation</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Work+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --paper:#F1EEE9;
+  --paper-2:#FAF8F5;
+  --ink:#16120F;
+  --ink-2:#4E463E;
+  --ink-3:#8A8177;
+  --line:#D8D2C9;
+  --ox:#8B2E38;
+  --ox-bg:#F3E4E4;
+  --moss:#426349;
+  --moss-bg:#E2ECE3;
+  --sand:#9A6A1E;
+  --sand-bg:#F5E9D6;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);
+  font-family:"Work Sans",system-ui,sans-serif;font-weight:300;
+  font-size:17px;line-height:1.66;-webkit-font-smoothing:antialiased}
+.wrap{max-width:900px;margin:0 auto;padding:0 30px}
+h1,h2{margin:0;font-family:"Instrument Serif",Georgia,serif;font-weight:400;
+  line-height:1.02;letter-spacing:-.01em}
+h1{font-size:clamp(3rem,8vw,5.6rem)}
+h2{font-size:clamp(1.9rem,4vw,2.8rem)}
+h3{margin:0;font-size:1.02rem;font-weight:600;letter-spacing:-.005em}
+p{margin:0 0 1rem;max-width:62ch}
+em{font-family:"Instrument Serif",Georgia,serif;font-style:italic;font-size:1.08em}
+
+/* hero */
+.hero{padding:96px 0 54px}
+.hero h1 em{display:block;color:var(--ox)}
+.hero p{font-size:1.24rem;line-height:1.5;color:var(--ink-2);margin-top:26px;max-width:50ch}
+
+/* stage */
+.stage{border-top:1px solid var(--line);padding:52px 0}
+.stage-head{display:flex;gap:22px;align-items:baseline;margin-bottom:22px}
+.num{font-family:"Instrument Serif",Georgia,serif;font-size:3.4rem;line-height:.8;
+  color:var(--ox);min-width:52px}
+.stage-head .t h2{margin-bottom:4px}
+.stage-head .t .kick{font-size:.82rem;font-weight:500;color:var(--ink-3);
+  letter-spacing:.02em;margin-bottom:6px}
+.body{padding-left:74px}
+
+/* data state chips */
+.state{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:20px 0 6px;
+  padding:12px 16px;background:var(--paper-2);border:1px solid var(--line);border-radius:2px}
+.state .lbl{font-size:.76rem;color:var(--ink-3);margin-right:4px}
+.pill{font-family:ui-monospace,monospace;font-size:.76rem;padding:4px 9px;
+  border:1px solid var(--line);border-radius:2px;background:var(--paper);white-space:nowrap}
+.pill.hot{background:var(--ox-bg);border-color:var(--ox);color:var(--ox)}
+.pill.out{background:var(--moss-bg);border-color:var(--moss);color:var(--moss)}
+.arrow{color:var(--ink-3);font-size:.8rem}
+
+/* mechanics box */
+.mech{background:var(--paper-2);border:1px solid var(--line);border-radius:2px;
+  padding:16px 20px;margin:20px 0;font-family:ui-monospace,monospace;
+  font-size:.81rem;line-height:1.7;color:var(--ink-2);white-space:pre;overflow-x:auto}
+
+/* aside */
+.aside{border-left:3px solid var(--sand);background:var(--sand-bg);
+  padding:14px 18px;margin:22px 0;font-size:.95rem;color:var(--ink-2);max-width:62ch}
+.aside strong{color:var(--sand);font-weight:600}
+
+/* verdict list */
+.verdicts{margin:20px 0 0;border-top:1px solid var(--line)}
+.verdicts div{display:grid;grid-template-columns:130px 1fr;gap:18px;
+  padding:11px 0;border-bottom:1px solid var(--line);font-size:.95rem}
+.verdicts dt{font-family:ui-monospace,monospace;font-size:.8rem;color:var(--ox);padding-top:3px}
+.verdicts dd{margin:0;color:var(--ink-2)}
+
+/* queue sample */
+.queue{margin-top:24px;border:1px solid var(--line);background:var(--paper-2);border-radius:2px}
+.item{padding:16px 20px;border-bottom:1px solid var(--line)}
+.item:last-child{border-bottom:0}
+.item-top{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:7px}
+.type{font-family:ui-monospace,monospace;font-size:.72rem;padding:3px 8px;border-radius:2px;
+  background:var(--ox-bg);color:var(--ox)}
+.type.add{background:var(--moss-bg);color:var(--moss)}
+.type.gap{background:var(--sand-bg);color:var(--sand)}
+.path{font-family:ui-monospace,monospace;font-size:.83rem;color:var(--ink)}
+.score{margin-left:auto;font-family:"Instrument Serif",serif;font-size:1.4rem;color:var(--ink)}
+.item p{margin:0;font-size:.92rem;color:var(--ink-2);max-width:none}
+.item .swap{font-family:ui-monospace,monospace;font-size:.82rem}
+.strike{text-decoration:line-through;color:var(--ink-3)}
+
+/* loop */
+.loop{background:var(--ink);color:var(--paper);margin-top:0}
+.loop .wrap{padding-top:60px;padding-bottom:66px}
+.loop h2{color:var(--paper)}
+.loop p{color:#C9C2B8}
+.loop .num{color:var(--paper)}
+.loop .mech{background:#241E1A;border-color:#3A322C;color:#C9C2B8}
+.loop .stage{border-top-color:#3A322C}
+
+footer{padding:34px 0 72px;font-size:.85rem;color:var(--ink-3)}
+
+@media (max-width:700px){
+  body{font-size:16px}
+  .wrap{padding:0 22px}
+  .hero{padding:64px 0 40px}
+  .body{padding-left:0}
+  .num{font-size:2.6rem;min-width:42px}
+  .stage-head{gap:14px}
+  .verdicts div{grid-template-columns:1fr;gap:2px}
+  .score{margin-left:0}
+}
+</style>
+</head>
+<body>
+
+<section class="hero">
+  <div class="wrap">
+    <h1>From vector<em>to recommendation</em></h1>
+    <p>Every page is now a point in 2048-dimensional space. Here is what happens between that and a ranked list someone can act on.</p>
+    <div class="state">
+      <span class="lbl">Data right now</span>
+      <span class="pill hot">content_embedding[2048]</span>
+      <span class="arrow">per page, written to Neo4j</span>
+    </div>
+  </div>
+</section>
+
+<section class="stage">
+  <div class="wrap">
+    <div class="stage-head">
+      <div class="num">1</div>
+      <div class="t">
+        <div class="kick">Runs alongside the embedding step, not after it</div>
+        <h2>Graph analytics</h2>
+      </div>
+    </div>
+    <div class="body">
+      <p>The link structure is already fully known the moment the site is crawled &mdash; it doesn't need page text at all. So this step starts immediately, in parallel with the embedding step, rather than waiting for it. Three algorithms run over it.</p>
+
+      <div class="mech">PageRank        internal authority, weighted by link position
+Leiden ×2       link graph    &rarr; linkCommunityId
+                keyword graph &rarr; keywordCommunityId
+Betweenness     pages bridging otherwise separate clusters, computed exactly</div>
+
+      <p>Clustering pages by their existing links is circular. A new section has no links, so it forms no cluster, so it gets no recommendations &mdash; precisely the pages that need help most. Keyword relationships exist before any link does, so the second pass clusters on those instead.</p>
+
+      <div class="aside"><strong>The disagreement is the signal.</strong> Two pages in the same keyword cluster but different link clusters belong together topically and aren't connected. That gap is what the discovery stage is looking for.</div>
+
+      <div class="state">
+        <span class="lbl">Data now</span>
+        <span class="pill hot">pageRank</span>
+        <span class="pill hot">2 &times; communityId</span>
+        <span class="pill hot">betweenness</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="stage">
+  <div class="wrap">
+    <div class="stage-head">
+      <div class="num">1b</div>
+      <div class="t">
+        <div class="kick">A third, different kind of clustering</div>
+        <h2>Content clusters</h2>
+      </div>
+    </div>
+    <div class="body">
+      <p>The two clusterings above ask what is connected, and what we say a page is about. This one asks what a page is <em>actually</em> about, judged purely from its content &mdash; independent of both link structure and declared keywords.</p>
+
+      <div class="mech">HDBSCAN         groups pages by content similarity
+                &rarr; hubId, or &minus;1 for pages that fit no coherent topic</div>
+
+      <p>That &minus;1 label is the useful part. A page that belongs to no coherent topic is a real finding &mdash; the other two clusterings must place every page somewhere, so neither can say a page simply doesn't fit anywhere.</p>
+
+      <div class="aside"><strong>Two things this makes possible.</strong> Ranking which topic-to-topic connections are missing &mdash; a handful of high-value structural links rather than thousands of page-level ones. And checking whether the page a site treats as its pillar is actually the one closest to the centre of its topic.</div>
+
+      <div class="state">
+        <span class="lbl">Data now</span>
+        <span class="pill">content_embedding[2048]</span>
+        <span class="pill hot">hubId</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="stage">
+  <div class="wrap">
+    <div class="stage-head">
+      <div class="num">2</div>
+      <div class="t">
+        <div class="kick">Stage one &middot; two passes</div>
+        <h2>Audit what exists</h2>
+      </div>
+    </div>
+    <div class="body">
+      <p>Before looking for new links, score every link already on the site. Six dimensions per edge, in two passes &mdash; the first needs nothing but page structure, so it runs while embedding is still going. The second waits for it.</p>
+
+      <div class="mech">Pass A &mdash; no embeddings needed, runs immediately
+  anchor quality      generic? duplicated across the profile?
+  keyword alignment   does the anchor describe the target?
+  equity efficiency   source authority × position weight ÷ target need
+  technical health    404, redirect, nofollow, noindex target
+
+Pass B &mdash; needs embeddings
+  context relevance   cosine(surrounding sentence, target vector)
+  anchor&middot;target fit   cosine(anchor text, target page) &mdash; catches an
+                      anchor that names the right keyword but points
+                      at the wrong page</div>
+
+      <dl class="verdicts">
+        <div><dt>REANCHOR</dt><dd>Link is fine, the wording says nothing about the destination</dd></div>
+        <div><dt>REMOVE</dt><dd>No topical justification; dilutes the authority of links that earn it</dd></div>
+        <div><dt>FIX</dt><dd>Broken, redirected, nofollowed, or pointing at a noindex page</dd></div>
+      </dl>
+
+      <div class="aside"><strong>This is usually where the value is.</strong> A pillar page with forty inbound links all anchored "read more" is losing something on every one of them. That's a bigger and cheaper win than a forty-first link &mdash; and Pass A needs no machine learning at all, just pattern matching and arithmetic.</div>
+    </div>
+  </div>
+</section>
+
+<section class="stage">
+  <div class="wrap">
+    <div class="stage-head">
+      <div class="num">3</div>
+      <div class="t">
+        <div class="kick">Stage two · three trained models</div>
+        <h2>Discover what's missing</h2>
+      </div>
+    </div>
+    <div class="body">
+      <p>Eligibility is three hard constraints and nothing else. Indexable, not itself, not already linked.</p>
+
+      <p>Impressions, ranking position, page age, saturation — none of them filter anything out. They all become features the ranker weighs. A page ranking third on a valuable term still needs links to reach first, and a page ranking nowhere may be the one that needs them most.</p>
+
+      <div class="mech">HNSW              top 50 similar pages per target, plus which
+                  topic cluster and content hub each one sits in
+GraphSAGE         page + its neighbourhood      → gnn_embedding[2048]
+cross-attention   both pages attend to each other → pair vector
+LambdaMART        → opportunity_score 0–100</div>
+
+      <p>GraphSAGE is what separates two pages with identical copy &mdash; one a pillar linked from forty places, one an orphan six clicks deep. Same content vector, very different position vector.</p>
+
+      <div class="state">
+        <span class="lbl">Data now</span>
+        <span class="pill">gnn_embedding[2048]</span>
+        <span class="arrow">&rarr;</span>
+        <span class="pill hot">pair vector</span>
+        <span class="arrow">&rarr;</span>
+        <span class="pill out">score 0&ndash;100</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="stage">
+  <div class="wrap">
+    <div class="stage-head">
+      <div class="num">4</div>
+      <div class="t">
+        <div class="kick">Shared by both stages · deterministic</div>
+        <h2>Resolve the anchor</h2>
+      </div>
+    </div>
+    <div class="body">
+      <p>Anchor text is a ranking signal, not a copywriting problem. The keyword is the specification; the job is to find where the source page already says it.</p>
+
+      <div class="mech">keyword   strategic primary
+       →  GSC query by opportunity value
+          impressions × (CTR@1 − CTR@current)
+       →  title / h1
+
+ladder    1  exact keyword in the source body      → link that phrase
+          2  close variant (stem, plural)          → link it
+          3  overlapping words, cheaply checked     → link it
+          4  related in meaning, more expensive     → link it
+          5  nothing suitable                       → CONTENT_GAP</div>
+
+      <p>No text is generated. The engine finds words already on the page and moves the link onto them. Step 3 catches most of what would otherwise need the expensive step 4 check, for a fraction of the cost. When nothing suitable exists at all, inserting a phrase would bolt a link onto copy that was never about the topic &mdash; so it reports a content gap instead, routed to whoever writes, not whoever implements links.</p>
+
+      <div class="aside"><strong>The type mix is a preference, not a rule.</strong> A healthy inbound profile mixes exact, partial, natural and branded anchors. That preference chooses between candidates that already exist in the copy &mdash; it is never a reason to skip a good link because the ratio wanted something else. And when comparing an anchor to the words the page already uses elsewhere, overlap is measured the same cheap way as step 3 above &mdash; meaning is the wrong yardstick for &ldquo;have we said this exact phrase too many times already.&rdquo;</div>
+    </div>
+  </div>
+</section>
+
+<section class="stage">
+  <div class="wrap">
+    <div class="stage-head">
+      <div class="num">5</div>
+      <div class="t">
+        <div class="kick">Materialise and serve</div>
+        <h2>One ranked queue</h2>
+      </div>
+    </div>
+    <div class="body">
+      <div class="mech">Neo4j    SUGGESTED_ACTION edge, five action types
+Mongo    full payload: score, signals, placements, assumptions
+Valkey   cache invalidated → next read under 10ms</div>
+
+      <p>Two caps applied after ranking: no single destination appears in more than 15% of results, and no single source page contributes more than ten items. Otherwise hub pages would swallow the whole queue.</p>
+
+      <div class="queue">
+        <div class="item">
+          <div class="item-top">
+            <span class="type">REANCHOR</span>
+            <span class="path">/blog/press-maintenance → /hydraulic-press</span>
+            <span class="score">78</span>
+          </div>
+          <p class="swap"><span class="strike">"click here"</span> &nbsp;→&nbsp; "industrial hydraulic press"</p>
+          <p>The phrase is already in the linking sentence.</p>
+        </div>
+        <div class="item">
+          <div class="item-top">
+            <span class="type add">ADD_LINK</span>
+            <span class="path">/blog/choosing-a-press → /press-safety-2026</span>
+            <span class="score">71</span>
+          </div>
+          <p>Anchor "machine guarding standards", paragraph four. Target is new with no inbound links.</p>
+        </div>
+        <div class="item">
+          <div class="item-top">
+            <span class="type">FIX</span>
+            <span class="path">/hydraulic-press → /press-brake</span>
+            <span class="score">64</span>
+          </div>
+          <p>Redirect chain, two hops. Point at the final URL.</p>
+        </div>
+        <div class="item">
+          <div class="item-top">
+            <span class="type gap">CONTENT_GAP</span>
+            <span class="path">/blog/materials → /hydraulic-press</span>
+            <span class="score">52</span>
+          </div>
+          <p>Topic isn't covered on the source page. Add a paragraph on machine selection to create a natural link point.</p>
+        </div>
+      </div>
+
+      <p style="margin-top:22px">Every item carries the signals behind it and flags its own assumptions. A person decides. Nothing publishes automatically.</p>
+    </div>
+  </div>
+</section>
+
+<section class="loop">
+  <div class="wrap">
+    <div class="stage-head">
+      <div class="num">6</div>
+      <div class="t">
+        <div class="kick" style="color:#8A8177">Monthly</div>
+        <h2>It learns from the answer</h2>
+      </div>
+    </div>
+    <div class="body">
+      <p>Accept, dismiss, or edit — each writes back. Once a month three models retrain on that record.</p>
+
+      <div class="mech">GraphSAGE       accepted pairs pulled closer in vector space
+LambdaMART      re-ranked on graded labels, NDCG@10
+anchor weights  shifted toward what actually gets accepted
+
+promotion gate  a new ranker ships only if it beats the
+                current one on held-out data</div>
+
+      <p>That check runs automatically, and is tracked so the decision is never lost &mdash; if a retrained model doesn't clear the bar, the previous one keeps serving.</p>
+
+      <p>Nothing about the algorithms changes. The system gets better because it learns which recommendations this particular team says yes to.</p>
+    </div>
+  </div>
+</section>
+
+<footer><div class="wrap">Internal linking intelligence engine &middot; component reference v5.5</div></footer>
+
+</body>
+</html>

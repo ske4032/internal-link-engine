@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Internal linking engine</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,300;0,400;0,500;1,6..72,400&family=Inter+Tight:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --paper:#EDF0EE;
+  --paper-2:#F7F9F8;
+  --ink:#0E1614;
+  --ink-soft:#4A5651;
+  --ink-faint:#7C8781;
+  --line:#CDD5D1;
+  --deep:#14584A;
+  --deep-soft:#DCEAE5;
+  --ochre:#8A5A16;
+  --ochre-soft:#F2E6D2;
+  --rule:1px solid var(--line);
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;background:var(--paper);color:var(--ink);
+  font-family:"Newsreader",Georgia,serif;font-size:18px;line-height:1.65;
+  font-weight:300;
+}
+.wrap{max-width:1040px;margin:0 auto;padding:0 28px}
+h1,h2,h3{font-weight:400;line-height:1.12;margin:0}
+h1{font-size:clamp(2.6rem,6.4vw,4.6rem);letter-spacing:-.025em}
+h2{font-size:clamp(1.6rem,3.4vw,2.3rem);letter-spacing:-.018em}
+h3{font-size:1.16rem;letter-spacing:-.008em;font-weight:500}
+p{margin:0 0 1.1rem;max-width:64ch}
+em{font-style:italic;color:var(--ink-soft)}
+.ui{font-family:"Inter Tight",system-ui,sans-serif;font-weight:400}
+
+/* ---------- hero ---------- */
+.hero{padding:76px 0 40px;border-bottom:var(--rule)}
+.hero h1{max-width:15ch}
+.hero .lede{font-size:1.32rem;line-height:1.5;margin-top:26px;max-width:52ch;color:var(--ink-soft)}
+.hero .lede strong{font-weight:500;color:var(--ink)}
+
+/* ---------- graph ---------- */
+.stage{margin:38px 0 0;border:var(--rule);background:var(--paper-2);border-radius:3px;overflow:hidden}
+.stage-head{display:flex;flex-wrap:wrap;gap:14px;align-items:center;justify-content:space-between;
+  padding:14px 18px;border-bottom:var(--rule)}
+.stage-head p{margin:0;font-size:.9rem;color:var(--ink-faint)}
+.switch{display:flex;gap:0;border:var(--rule);border-radius:2px;overflow:hidden;background:var(--paper)}
+.switch button{
+  font-family:"Inter Tight",system-ui,sans-serif;font-size:.83rem;font-weight:500;
+  padding:7px 15px;border:0;background:transparent;color:var(--ink-soft);cursor:pointer;
+  border-right:var(--rule);
+}
+.switch button:last-child{border-right:0}
+.switch button[aria-pressed="true"]{background:var(--ink);color:var(--paper-2)}
+.switch button:focus-visible{outline:2px solid var(--deep);outline-offset:-2px}
+svg.graph{display:block;width:100%;height:auto}
+.node circle{fill:var(--paper-2);stroke:var(--ink-soft);stroke-width:1.4}
+.node text{font-family:"Inter Tight",system-ui,sans-serif;font-size:11px;fill:var(--ink-soft)}
+.node.pillar circle{fill:var(--ink);stroke:var(--ink)}
+.node.pillar text{fill:var(--ink);font-weight:600}
+.node.orphan circle{stroke-dasharray:3 3;stroke:var(--ochre)}
+.node.orphan text{fill:var(--ochre)}
+.edge{stroke:var(--ink-faint);stroke-width:1.1;fill:none}
+.edge.weak{stroke:var(--ochre);stroke-width:1.3;stroke-dasharray:4 3;opacity:0}
+.edge.found{stroke:var(--deep);stroke-width:1.8;fill:none;opacity:0;
+  stroke-dasharray:220;stroke-dashoffset:220}
+.stage[data-view="after"] .edge.found{opacity:1;stroke-dashoffset:0;
+  transition:stroke-dashoffset .9s ease,opacity .3s ease}
+.stage[data-view="after"] .edge.weak{opacity:1;transition:opacity .4s ease}
+.stage[data-view="after"] .node.orphan circle{stroke-dasharray:0}
+.legend{display:flex;flex-wrap:wrap;gap:18px;padding:13px 18px;border-top:var(--rule);
+  font-family:"Inter Tight",system-ui,sans-serif;font-size:.8rem;color:var(--ink-faint)}
+.legend span{display:flex;align-items:center;gap:7px}
+.legend i{width:20px;height:0;border-top:2px solid;display:inline-block}
+@media (prefers-reduced-motion:reduce){
+  .stage[data-view="after"] .edge.found{transition:none}
+}
+
+/* ---------- sections ---------- */
+section{padding:62px 0;border-bottom:var(--rule)}
+.kicker{font-family:"Inter Tight",system-ui,sans-serif;font-size:.82rem;font-weight:500;
+  color:var(--deep);margin:0 0 12px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:44px;margin-top:30px}
+.stagebox{border-left:3px solid var(--deep);padding-left:20px}
+.stagebox:last-child{border-left-color:var(--ochre)}
+.stagebox h3{margin-bottom:8px}
+.stagebox p{font-size:1rem;color:var(--ink-soft);margin-bottom:0}
+
+/* ---------- action picker ---------- */
+.picker{display:flex;flex-wrap:wrap;gap:8px;margin:26px 0 22px}
+.picker button{
+  font-family:"Inter Tight",system-ui,sans-serif;font-size:.86rem;font-weight:500;
+  padding:8px 14px;border:var(--rule);background:var(--paper-2);color:var(--ink-soft);
+  border-radius:2px;cursor:pointer;
+}
+.picker button[aria-selected="true"]{background:var(--ink);border-color:var(--ink);color:var(--paper-2)}
+.picker button:focus-visible{outline:2px solid var(--deep);outline-offset:2px}
+.detail{border:var(--rule);background:var(--paper-2);border-radius:3px;padding:26px 28px;min-height:238px}
+.detail h3{margin-bottom:6px}
+.detail .who{font-family:"Inter Tight",system-ui,sans-serif;font-size:.8rem;color:var(--deep);margin-bottom:16px}
+.detail p{font-size:1rem;margin-bottom:16px}
+.sample{border-top:var(--rule);padding-top:15px;font-size:.95rem;color:var(--ink-soft)}
+.sample .row{display:flex;gap:12px;padding:3px 0}
+.sample .lbl{font-family:"Inter Tight",system-ui,sans-serif;font-size:.76rem;color:var(--ink-faint);
+  min-width:74px;padding-top:4px}
+.url{font-family:"Inter Tight",system-ui,sans-serif;font-size:.88rem;color:var(--ink)}
+mark{background:var(--deep-soft);color:var(--ink);padding:1px 3px;border-radius:2px}
+mark.bad{background:var(--ochre-soft)}
+
+/* ---------- anchor demo ---------- */
+.demo{border:var(--rule);background:var(--paper-2);border-radius:3px;margin-top:28px}
+.demo-row{padding:22px 26px;border-bottom:var(--rule)}
+.demo-row:last-child{border-bottom:0}
+.demo-tag{font-family:"Inter Tight",system-ui,sans-serif;font-size:.78rem;font-weight:500;
+  color:var(--ink-faint);margin-bottom:9px}
+.demo-row.good .demo-tag{color:var(--deep)}
+.sentence{font-size:1.1rem;line-height:1.6;margin:0}
+.linkish{border-bottom:2px solid var(--ochre);color:var(--ochre)}
+.demo-row.good .linkish{border-bottom-color:var(--deep);color:var(--deep)}
+
+/* ---------- honest list ---------- */
+.plain{list-style:none;padding:0;margin:22px 0 0;max-width:62ch}
+.plain li{padding:11px 0 11px 26px;border-bottom:var(--rule);position:relative;font-size:1rem;color:var(--ink-soft)}
+.plain li:before{content:"";position:absolute;left:0;top:20px;width:12px;height:0;border-top:1px solid var(--ink-faint)}
+footer{padding:44px 0 70px;font-family:"Inter Tight",system-ui,sans-serif;font-size:.86rem;color:var(--ink-faint)}
+
+@media (max-width:720px){
+  body{font-size:17px}
+  .wrap{padding:0 20px}
+  .hero{padding:52px 0 32px}
+  .two{grid-template-columns:1fr;gap:30px}
+  section{padding:46px 0}
+  .detail{padding:22px}
+}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <h1>Every page you publish is a link waiting to be made.</h1>
+    <p class="lede">Most sites have hundreds of internal links that point to the wrong place, say nothing useful, or were never made at all. <strong>This engine reads your whole site as a graph and tells you exactly which links to fix and which to add.</strong></p>
+
+    <div class="stage" id="stage" data-view="before">
+      <div class="stage-head">
+        <p class="ui">A small site, eleven pages</p>
+        <div class="switch" role="group" aria-label="Graph view">
+          <button type="button" data-view="before" aria-pressed="true">Your site today</button>
+          <button type="button" data-view="after" aria-pressed="false">What the engine finds</button>
+        </div>
+      </div>
+
+      <svg class="graph" viewBox="0 0 900 420" role="img" aria-label="A site link graph. Switching views reveals missing links the engine discovers and existing links it flags as weak.">
+        <g class="edges">
+          <path class="edge" d="M450 210 L250 120"/>
+          <path class="edge" d="M450 210 L250 300"/>
+          <path class="edge" d="M450 210 L660 130"/>
+          <path class="edge" d="M450 210 L660 290"/>
+          <path class="edge" d="M250 120 L120 70"/>
+          <path class="edge" d="M250 300 L120 350"/>
+          <path class="edge" d="M660 130 L790 80"/>
+          <path class="edge weak" d="M660 290 L790 340"/>
+          <path class="edge found" d="M120 70 C 300 30, 520 40, 660 130"/>
+          <path class="edge found" d="M120 350 C 300 400, 520 390, 660 290"/>
+          <path class="edge found" d="M250 120 C 340 190, 360 240, 250 300"/>
+          <path class="edge found" d="M790 80 C 860 200, 860 240, 790 340"/>
+          <path class="edge found" d="M450 210 L560 400"/>
+        </g>
+        <g class="node pillar"><circle cx="450" cy="210" r="17"/><text x="450" y="248" text-anchor="middle">Hub page</text></g>
+        <g class="node"><circle cx="250" cy="120" r="11"/><text x="250" y="100" text-anchor="middle">Guide</text></g>
+        <g class="node"><circle cx="250" cy="300" r="11"/><text x="250" y="332" text-anchor="middle">Guide</text></g>
+        <g class="node"><circle cx="660" cy="130" r="11"/><text x="660" y="110" text-anchor="middle">Product</text></g>
+        <g class="node"><circle cx="660" cy="290" r="11"/><text x="660" y="322" text-anchor="middle">Product</text></g>
+        <g class="node"><circle cx="120" cy="70" r="9"/><text x="120" y="50" text-anchor="middle">Article</text></g>
+        <g class="node"><circle cx="120" cy="350" r="9"/><text x="120" y="378" text-anchor="middle">Article</text></g>
+        <g class="node"><circle cx="790" cy="80" r="9"/><text x="790" y="60" text-anchor="middle">Article</text></g>
+        <g class="node"><circle cx="790" cy="340" r="9"/><text x="790" y="368" text-anchor="middle">Article</text></g>
+        <g class="node orphan"><circle cx="560" cy="400" r="9"/><text x="560" y="382" text-anchor="middle">New page</text></g>
+      </svg>
+
+      <div class="legend ui">
+        <span><i style="border-color:var(--ink-faint)"></i> Links you have</span>
+        <span><i style="border-color:var(--deep)"></i> Links you're missing</span>
+        <span><i style="border-color:var(--ochre);border-top-style:dashed"></i> Links that need fixing</span>
+      </div>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <p class="kicker ui">How it works</p>
+    <h2>Two jobs, not one</h2>
+    <p>Most linking tools only suggest new links. On a site that's been running for years, the bigger win is usually hiding in the links you already have.</p>
+
+    <div class="two">
+      <div class="stagebox">
+        <h3>It audits what's there</h3>
+        <p>Every existing link gets scored. Does the anchor text describe the page it points to? Is the link buried in a footer when it belongs in the copy? Is it broken, redirected, or pointing somewhere that no longer matters? A page with forty inbound links all saying "read more" is losing something on every one of them.</p>
+      </div>
+      <div class="stagebox">
+        <h3>It finds what's missing</h3>
+        <p>Then it reads the meaning of every page and the structure of the whole site, and works out which pages should be connected but aren't. New pages that nothing points to. Guides that cover the same topic without acknowledging each other. Pages sitting three clicks deeper than they deserve.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker ui">The output</p>
+    <h2>Five things it can tell you</h2>
+    <p>Every finding is one of five kinds. Pick one to see what it looks like in practice.</p>
+
+    <div class="picker" role="tablist" aria-label="Recommendation types">
+      <button type="button" role="tab" data-key="add" aria-selected="true">Add a link</button>
+      <button type="button" role="tab" data-key="reanchor" aria-selected="false">Fix the wording</button>
+      <button type="button" role="tab" data-key="remove" aria-selected="false">Remove it</button>
+      <button type="button" role="tab" data-key="fix" aria-selected="false">Repair it</button>
+      <button type="button" role="tab" data-key="gap" aria-selected="false">Write something</button>
+    </div>
+
+    <div class="detail" id="detail" role="tabpanel" aria-live="polite"></div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker ui">Anchor text</p>
+    <h2>It doesn't write your copy. It finds the words already in it.</h2>
+    <p>The clickable text of a link tells search engines what the destination page is about. "Click here" tells them nothing. But rewriting a client's content to insert keywords is the wrong fix, and it's what most automated tools do.</p>
+    <p>This engine looks for a phrase already sitting in your page that describes the target, and links that instead. Nothing is invented.</p>
+
+    <div class="demo">
+      <div class="demo-row">
+        <p class="demo-tag ui">What's on the page now</p>
+        <p class="sentence">Choosing between machine types depends on your throughput. <span class="linkish">Click here</span> to see the range.</p>
+      </div>
+      <div class="demo-row good">
+        <p class="demo-tag ui">What the engine proposes</p>
+        <p class="sentence">Choosing between <span class="linkish">machine types</span> depends on your throughput. Click here to see the range.</p>
+      </div>
+    </div>
+
+    <p style="margin-top:26px">The words didn't change. The link moved onto the phrase that was already describing the destination. When no such phrase exists anywhere on the page, the engine says so instead of inventing one, and sends it to whoever writes your content.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker ui">What to expect</p>
+    <h2>What it does and doesn't promise</h2>
+    <ul class="plain">
+      <li>It ranks opportunities by how valuable they're likely to be. It does not predict how much traffic any single link will bring, because that isn't honestly knowable.</li>
+      <li>It learns from you. Every suggestion you accept, edit, or dismiss trains the ranking, so the queue matches your judgement more closely over time.</li>
+      <li>It shows its reasoning. Every recommendation lists the signals behind it and flags its own assumptions.</li>
+      <li>It runs when your content changes, not on a timer. Nothing recomputes while your site sits still.</li>
+      <li>A person still decides. Nothing is published automatically.</li>
+    </ul>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap ui">Internal linking intelligence engine, version 5.</div>
+</footer>
+
+<script>
+(function(){
+  var stage=document.getElementById('stage');
+  var btns=stage.querySelectorAll('.switch button');
+  btns.forEach(function(b){
+    b.addEventListener('click',function(){
+      btns.forEach(function(o){o.setAttribute('aria-pressed', String(o===b));});
+      stage.setAttribute('data-view', b.dataset.view);
+    });
+  });
+
+  var data={
+    add:{t:"Add a link",who:"For whoever implements links",
+      d:"Two pages cover related ground and nothing connects them. The engine names the source, the destination, the sentence to place the link in, and the exact words to use as the link text.",
+      rows:[["From","/blog/press-maintenance"],["To","/hydraulic-press"],
+            ["Wording",'"<mark>industrial hydraulic press</mark>" — already in paragraph four']]},
+    reanchor:{t:"Fix the wording",who:"For whoever implements links",
+      d:"The link exists and points somewhere sensible, but the clickable text says nothing about the destination. This is usually the most common finding on an established site, and the cheapest to act on.",
+      rows:[["Now",'<mark class="bad">"click here"</mark>'],
+            ["Instead",'<mark>"industrial hydraulic press"</mark>'],
+            ["Why","The exact phrase appears in the linking sentence already"]]},
+    remove:{t:"Remove it",who:"For whoever implements links",
+      d:"A link with no topical justification pointing at a page that already has plenty. Every outbound link on a page divides that page's authority, so links that aren't earning their place are diluting the ones that are.",
+      rows:[["Link","/blog/press-maintenance to /about-us"],
+            ["Destination has","412 inbound links already"],
+            ["Why","No topical relationship; the page is saturated"]]},
+    fix:{t:"Repair it",who:"For whoever maintains the site",
+      d:"Broken links, links passing through redirects, links marked so search engines ignore them, and links pointing at pages set to stay out of search results. Mechanical problems with clear answers.",
+      rows:[["Found","Redirect chain, two hops"],
+            ["Target","/hydraulic-press-v2 to /hydraulic-press"],
+            ["Why","Update the link to point straight at the final page"]]},
+    gap:{t:"Write something",who:"For whoever writes your content",
+      d:"The two pages should be connected, but the source page never mentions the topic in words that could carry a link. Inserting a phrase would be dishonest, so the engine reports the gap instead. This only appears for destinations that genuinely matter.",
+      rows:[["Finding","The topic is not covered on the source page"],
+            ["Closest text",'"routine servicing intervals vary by machine type"'],
+            ["Suggestion","Add a short paragraph on machine selection"]]}
+  };
+
+  var detail=document.getElementById('detail');
+  var tabs=document.querySelectorAll('.picker button');
+
+  function render(key){
+    var d=data[key];
+    var rows=d.rows.map(function(r){
+      return '<div class="row"><div class="lbl">'+r[0]+'</div><div class="url">'+r[1]+'</div></div>';
+    }).join('');
+    detail.innerHTML='<h3>'+d.t+'</h3><p class="who ui">'+d.who+'</p><p>'+d.d+'</p><div class="sample">'+rows+'</div>';
+  }
+
+  tabs.forEach(function(tb){
+    tb.addEventListener('click',function(){
+      tabs.forEach(function(o){o.setAttribute('aria-selected', String(o===tb));});
+      render(tb.dataset.key);
+    });
+  });
+  render('add');
+})();
+</script>
+</body>
+</html>

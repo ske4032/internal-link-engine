@@ -1,0 +1,65 @@
+name: linking-engine-dev
+
+services:
+
+  neo4j:
+    image: neo4j:5.26-community          # 5.18+ required for vector.similarity.cosine
+    container_name: neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/localdevpassword
+      NEO4J_PLUGINS: '["graph-data-science","apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: gds.*,apoc.*
+      NEO4J_dbms_security_procedures_allowlist: gds.*,apoc.*
+      NEO4J_server_memory_heap_initial__size: 2G
+      NEO4J_server_memory_heap_max__size: 2G
+      NEO4J_server_memory_pagecache__size: 1G
+    volumes:
+      - neo4j-data:/data
+      - ./scripts:/scripts:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      retries: 20
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+  mongo:
+    image: mongo:8.0
+    container_name: mongo
+    command: ["--replSet", "rs0", "--bind_ip_all", "--wiredTigerCacheSizeGB", "1"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+      - ./mongo-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      retries: 15
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  mongo-init-rs:
+    image: mongo:8.0
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: >
+      mongosh --host mongo:27017 --quiet --eval
+      "try { rs.status() } catch (e) {
+         rs.initiate({_id:'rs0', members:[{_id:0, host:'localhost:27017'}]})
+       }"
+
+volumes:
+  neo4j-data:
+  mongo-data:

@@ -1,0 +1,1633 @@
+title,body,labels,milestone
+"[01] Repo scaffold, tooling, quality gates","## Why
+
+Five quality gates enforced from the first commit. Retrofitting architectural
+contracts onto code that already violates them means either a large refactor or a
+pile of exemptions that defeat the purpose.
+
+## Steps
+
+**a.** `uv init` and copy `pyproject.toml` from the Setup wiki page verbatim. Do
+not trim the dependency list — the pins are deliberate (`numpy>=2.0,<3` because
+hdbscan, umap and lightgbm each lag NumPy majors).
+
+**b.** Create the package layout under `src/linking_engine/`:
+```
+api/  models/  ingest/  embedding/  graph/  audit/  anchor/  discovery/  ml/  pipeline/
+```
+Each gets an `__init__.py`. `graph/` gets two files, `repo.py` and
+`algorithms.py` — the split is enforced by contract, not convention.
+
+**c.** Copy `.importlinter` to the repo root. Five contracts; the load-bearing one
+is `algorithms-are-pure`, which forbids `graph.algorithms` from importing `neo4j`.
+
+**d.** Add `.pre-commit-config.yaml` running ruff check, ruff format, and mypy on
+staged files. Leave deptry and lint-imports to CI — they need the whole tree.
+
+**e.** Add `.github/workflows/ci.yml`:
+```yaml
+- uv sync --all-extras
+- uv run ruff check
+- uv run ruff format --check
+- uv run mypy --strict src/
+- uv run deptry src/
+- uv run lint-imports
+- uv run pytest
+```
+
+**f.** Create one trivial test so `pytest` exits 0 rather than ""no tests
+collected"", which some CI configs treat as failure.
+
+**g.** `.env.example` with every key the app reads, no real values. `.env` in
+`.gitignore`.
+
+## Acceptance
+
+- `uv sync && uv run pytest` passes on a clean clone
+- All five gates pass on an empty codebase
+- `uv run lint-imports` reports 5 contracts kept
+
+## Gotchas
+
+- Python 3.14 is not yet supported by the ML tree. Pin `>=3.12,<3.14`.
+- `asyncio_mode = ""auto""` is already in the pytest config — async tests need no
+  decorator, and forgetting one is a silent skip.
+
+**Estimate:** 1 day","core,phase-0-foundation",Core Engine
+[02] Pydantic domain models,"## Why
+
+Models are the only thing crossing module boundaries. Every other rule in the
+codebase depends on this holding.
+
+## Steps
+
+**a.** `models/enums.py`:
+```python
+class ActionType(StrEnum):
+    ADD_LINK = ""ADD_LINK""
+    REANCHOR = ""REANCHOR""
+    REMOVE = ""REMOVE""
+    FIX = ""FIX""
+    CONTENT_GAP = ""CONTENT_GAP""
+
+class AnchorType(StrEnum):
+    EXACT = ""EXACT""; PARTIAL = ""PARTIAL""
+    NATURAL = ""NATURAL""; BRANDED = ""BRANDED""
+
+class IssueFlag(StrEnum):
+    GENERIC = ""GENERIC""; MISALIGNED = ""MISALIGNED""
+    OFF_TOPIC = ""OFF_TOPIC""; OVER_OPTIMISED = ""OVER_OPTIMISED""
+    WASTED_EQUITY = ""WASTED_EQUITY""; BROKEN = ""BROKEN""
+    REDIRECTED = ""REDIRECTED""; NOFOLLOW = ""NOFOLLOW""
+    NOINDEX_TARGET = ""NOINDEX_TARGET""
+
+class LifecycleStage(StrEnum):
+    NEW = ""NEW""; EMERGING = ""EMERGING""
+    ESTABLISHED = ""ESTABLISHED""; MATURE = ""MATURE""
+```
+
+There is deliberately **no REPOSITION**. The crawler extracts body links only, so
+there is no footer to move a link out of.
+
+**b.** `models/page.py` — `Page`, `Keyword`, `Link`. Every model:
+```python
+model_config = ConfigDict(frozen=True, extra=""forbid"")
+```
+`extra=""forbid""` catches a renamed field at the boundary instead of silently
+dropping it. `frozen=True` because these represent fetched or computed state.
+
+**c.** `models/audit.py` — `LinkAuditResult` with all six scored dimensions
+(`anchor_quality`, `keyword_alignment`, `context_relevance`, `anchor_target_fit`,
+`equity_efficiency`, plus `issue_flags`), each `Field(ge=0, le=1)` except
+`anchor_quality_score` which is `ge=0, le=100`.
+
+**d.** `models/features.py` — `PairFeatures`, roughly 30 fields. Group by comment
+block: GSC, lifecycle, strategic, target structural, source structural, cluster,
+semantic. Use `float | None` for GSC fields, since new pages have no data, and add
+an explicit `has_gsc_data: bool` so the model can distinguish missing from zero.
+
+**e.** `models/recommendation.py` — `Recommendation` and `AnchorCandidate`.
+`AnchorCandidate.source` is `Literal[""EXTRACTED"", ""GENERATED""]`; post-v5 it should
+always be EXTRACTED, but the field stays so acceptance can be tracked separately
+if that changes.
+
+**f.** `models/tenant.py` — `TenantConfig` via `pydantic-settings`, with the
+defaults from the Data Model wiki page.
+
+## Acceptance
+
+- `mypy --strict` clean with `disallow_any_explicit` on this package
+- Round-trip test: model → `model_dump()` → model, for each type
+- A test asserting `extra=""forbid""` actually raises on an unknown field
+
+## Gotchas
+
+- Use `HttpUrl` for urls, but note it normalises — `/foo` and `/foo/` may differ.
+  Canonicalise before constructing, not after.
+- `frozenset` for `issue_flags`, not `set` — models are frozen and `set` is not
+  hashable.
+
+**Depends on:** #1
+
+**Estimate:** 1 day","core,phase-0-foundation",Core Engine
+"[03] Neo4j and Mongo repos, schema migrations, vector indexes","## Why
+
+`graph/repo.py` is the only module permitted to talk to Neo4j. That boundary is
+enforced by `.importlinter`, and everything downstream assumes it.
+
+## Steps
+
+**a.** `graph/repo.py` — async driver with a module-level singleton and pooling:
+```python
+driver = AsyncGraphDatabase.driver(uri, auth=(u, p), max_connection_pool_size=50)
+```
+Expose typed methods returning Pydantic models. Never leak a `Record`.
+
+**b.** Migration runner. Read `.cypher` files from `migrations/` in filename
+order, track applied ones in a `(:_Migration {name, appliedAt})` node, run each
+inside its own transaction. All statements must be idempotent — `IF NOT EXISTS`
+on every constraint and index.
+
+**c.** `migrations/001_schema.cypher` — constraints on `Page.url` and
+`(Keyword.text, Keyword.language)`, plus indexes on `topic`, `isIndexable`,
+`lifecycleStage`, `linkCommunityId`, `keywordCommunityId`, and on `LINKS_TO`
+`auditedAt` and `anchorType`.
+
+**d.** `migrations/002_vectors.cypher`:
+```cypher
+CREATE VECTOR INDEX page_content IF NOT EXISTS
+  FOR (p:Page) ON p.content_embedding
+  OPTIONS { indexConfig: {
+    `vector.dimensions`: 2048,
+    `vector.similarity_function`: 'cosine' }};
+```
+Same for `page_gnn`.
+
+⚠️ **Dimension is fixed at creation.** Changing it later means dropping the index,
+re-embedding every page, and retraining the GNN. 2048 is chosen because Matryoshka
+makes downgrading to 1024 a truncation of data already held, while upgrading needs
+a full re-embed — take the reversible direction.
+
+**e.** `ingest/mongo_repo.py` with `motor`. Every collection is tenant-scoped and
+every compound index leads with `tenantId`. Connection string needs
+`?directConnection=true` against a single-node replica set.
+
+**f.** Startup health check: assert Neo4j version ≥ 5.18 by calling
+`RETURN vector.similarity.cosine([1.0,0.0],[1.0,0.0])` and failing loudly if it
+errors.
+
+## Acceptance
+
+- `testcontainers` spins real Neo4j and Mongo; migrations apply twice with no error
+- `SHOW INDEXES` reports both vector indexes at 2048 dimensions
+- Repo methods return Pydantic models, verified by mypy
+
+## Gotchas
+
+- Neo4j internal ids are **not stable** across restarts or deletions. Fine as a
+  within-run mapping, dangerous cached.
+- Mongo needs the replica set for transactions. Without `directConnection=true`
+  the driver tries to discover other members and hangs with no useful error.
+
+**Depends on:** #2
+
+**Estimate:** 1 day","core,phase-0-foundation",Core Engine
+[04] Voyage client: token-aware batching and backoff,"## Why
+
+Batching by list length fails on long pages and wastes headroom on short ones.
+voyage-4-large caps at **120,000 tokens per request** — not 1M, which is the lite
+models. Getting this wrong means the first real run errors out mid-corpus.
+
+## Limits
+
+```
+model              voyage-4-large
+output_dimension   2048
+input_type         document      everything here is a document, no query side
+max per request    120,000 tokens
+max list length    1,000
+rate limits        3M TPM / 2000 RPM
+```
+
+At ~3,300 tokens per page that is roughly **36 pages per call**.
+
+## Steps
+
+**a.** `embedding/voyage_client.py` wrapping the SDK. Config from
+`pydantic-settings`, never hardcoded.
+
+**b.** Token-aware batcher:
+```python
+async def token_batches(texts, budget=110_000, max_items=1000):
+    batch, total = [], 0
+    for t in texts:
+        n = vo.count_tokens([t])[0]
+        if total + n > budget or len(batch) >= max_items:
+            yield batch
+            batch, total = [], 0
+        batch.append(t); total += n
+    if batch:
+        yield batch
+```
+110K not 120K, for headroom against token-count drift.
+
+**c.** Retry with `tenacity` — exponential backoff, jitter, retry on 429 and 5xx,
+never on 4xx other than 429. This is per-call backoff *inside* a task; Prefect
+retries whole tasks, which is a different granularity.
+
+**d.** Always pass `input_type=""document""`. There is no query side anywhere in
+this pipeline — Step ④ is page-to-page and Step ⑦ is phrase-to-page. Getting this
+backwards costs retrieval quality silently.
+
+**e.** L2 normalise before returning. Neo4j's cosine index assumes unit vectors.
+Voyage returns normalised by default, but assert it rather than trusting it —
+`output_dtype=""int8""` would change that.
+
+**f.** Emit a metric per batch: token count, item count, latency, retry count.
+
+## Acceptance
+
+- Unit test with a mocked client proves no batch exceeds 110K tokens
+- A 5,000-token page and a 200-token page batch correctly together
+- 429 triggers backoff and eventually succeeds
+- Returned vectors have norm 1.0 ± 1e-6
+
+## Gotchas
+
+- `count_tokens` needs `pip install tokenizers` — already in the manifest.
+- Rate limit is per minute across all requests. At 25k pages the run takes ~28
+  minutes and you *will* hit it; backoff must work, not just exist.
+
+**Depends on:** #2
+
+**Estimate:** 1.5 days","core,phase-1-embedding",Core Engine
+[05] Embedding write path with crash resume,"## Why
+
+A run that dies halfway must leave a **consistent prefix**, not a half-written
+index. And a partially populated HNSW index returns plausible-looking candidates
+from an incomplete pool with no error at all — the failure is silent.
+
+## Steps
+
+**a.** Decouple the API batch from the DB write. Accumulate ~500 pages in a
+buffer, then flush in a single `UNWIND`. Writing 36 rows at a time means 700 round
+trips on a 25k-page corpus.
+
+**b.** Write vector, hash, model and timestamp in the same transaction:
+```cypher
+UNWIND $rows AS r
+MATCH (p:Page {url: r.url})
+SET p.content_embedding    = r.vec,
+    p.embeddedContentHash  = r.hash,
+    p.embeddingModel       = $model,
+    p.embeddedAt           = datetime()
+```
+
+**c.** Resume query — only embed what changed:
+```cypher
+MATCH (p:Page)
+WHERE p.embeddedContentHash IS NULL
+   OR p.embeddedContentHash <> p.contentHash
+RETURN p.url
+```
+
+**d.** Mixed-model guard, run at startup:
+```cypher
+MATCH (p:Page) WHERE p.content_embedding IS NOT NULL
+RETURN count(DISTINCT p.embeddingModel) AS models
+```
+More than 1 means two vector spaces in one index. **Fail the run.** Cosine between
+vectors from different models is meaningless, and nothing else will tell you.
+
+**e.** Progress logging every flush: pages done, remaining, tokens spent, elapsed.
+
+**f.** Cap the buffer. 25k pages at 2048d float32 is ~200 MB held in Python before
+anything is durable. 500–1000 is the right window.
+
+## Acceptance
+
+- Kill the process mid-run; rerun embeds only the remainder
+- Editing one page's body re-embeds exactly that page
+- Mixed `embeddingModel` values cause a startup failure with a clear message
+- Memory stays flat across a full run
+
+## Gotchas
+
+- `contentHash` must be computed over the same text you embed. Hash the body you
+  send, not the raw HTML.
+- Do not put the resume check inside the batch loop — one query up front.
+
+**Depends on:** #3, #4
+
+**Estimate:** 1 day","core,phase-1-embedding",Core Engine
+"[06] Anchor and surrounding-sentence embeddings, deduplicated","## Why
+
+Feeds `contextRelevance` and `anchorTargetFit`. Naively embedding every edge means
+250k texts; deduplication usually cuts that to a few thousand.
+
+## Steps
+
+**a.** Collect unique anchor strings across all `LINKS_TO` edges:
+```python
+unique = {normalise(l.anchor_text) for l in links}
+```
+Anchor text repeats heavily — `""click here""` might appear 400 times.
+
+**b.** Skip anything the generic dictionary already flags. Its verdict is decided;
+an embedding adds nothing.
+
+**c.** Embed the unique set, then map back to edges by normalised string.
+
+**d.** Surrounding sentences are mostly unique, so dedupe by `(source_url,
+content_hash, sentence_index)` instead and cache across runs — an unchanged page
+has unchanged sentences.
+
+**e.** Write `surroundingEmbedding` onto the relationship. Note there is **no
+relationship vector index** in Neo4j Community, so this cannot be ANN-searched.
+Fine — the audit scans edges sequentially and uses
+`vector.similarity.cosine()` directly.
+
+## Acceptance
+
+- Deduplication ratio logged; expect roughly 8k unique from 250k edges
+- Same anchor text on different edges yields the identical vector
+- Relationship property round-trips through the driver
+
+## Gotchas
+
+- Normalise before deduplicating — `""Click Here""`, `""click here ""` and
+  `""click here""` are one string for this purpose.
+- Sentence embeddings are `input_type=""document""`. A sentence is corpus text being
+  matched, not a search query.
+
+**Depends on:** #5
+
+**Estimate:** 0.5 days","core,phase-1-embedding",Core Engine
+"[07] igraph backend: edge pull, id mapping, graph construction","## Why
+
+Algorithms run in-process, not in Neo4j GDS. That removes the 4-core Community
+cap, the 3-projection limit, and JVM cache-miss overhead on BFS — which dominates,
+since betweenness is 6.25 billion edge visits at 25k nodes and BFS is pure pointer
+chasing. Contiguous int32 adjacency arrays keep the prefetcher fed; heap pointers
+do not.
+
+Result: graph analytics drops from ~50 min to 2–4 min.
+
+## Steps
+
+**a.** `graph/algorithms.py` must not import `neo4j`, `motor` or `pymongo`. This
+is enforced by `.importlinter`. Algorithms take edge lists and return arrays;
+only `graph/repo.py` speaks Bolt.
+
+**b.** Edge pull in the repo layer, returning integer ids:
+```cypher
+MATCH (a:Page)-[:LINKS_TO]->(b:Page)
+RETURN id(a) AS s, id(b) AS t
+```
+Integer ids, not URLs — igraph wants contiguous integers and string keys are far
+slower.
+
+**c.** Build a dense mapping. Neo4j ids are sparse, igraph needs `0..n-1`:
+```python
+node_ids = sorted({s for s, _ in rows} | {t for _, t in rows} | all_page_ids)
+to_dense = {nid: i for i, nid in enumerate(node_ids)}
+edges = [(to_dense[s], to_dense[t]) for s, t in rows]
+g = ig.Graph(n=len(node_ids), edges=edges, directed=False)
+```
+Include isolated pages in `node_ids` — orphans must exist in the graph with degree
+zero, or they silently drop out of every result.
+
+**d.** ⚠️ **Rebuild the mapping every run.** Neo4j internal ids are not stable
+across restarts or after deletions. Never cache it.
+
+**e.** Undirected for Leiden and betweenness; keep a directed copy for PageRank,
+since link direction genuinely matters for authority flow.
+
+**f.** Log construction cost: rows fetched, build seconds, node and edge counts.
+
+## Acceptance
+
+- 250k edges pull and build in under 30 seconds
+- Orphan pages appear in the graph with degree 0
+- `lint-imports` confirms `algorithms.py` imports no driver
+- Round-trip: dense index → Neo4j id → url is lossless
+
+## Gotchas
+
+- Only body links exist in `LINKS_TO` — the crawler discards nav, header, footer
+  and sidebar at extraction, so no filtering is needed here.
+- Two pages may link to each other. Decide whether that is one undirected edge or
+  two, and be consistent — it changes degree counts.
+
+**Depends on:** #3
+
+**Estimate:** 1 day","core,phase-2-graph",Core Engine
+[08] PageRank and exact betweenness via igraph,"## Why
+
+Betweenness is the most expensive algorithm in the pipeline at O(V·E). In-process
+it runs exactly, which removes the sampling instability and the small-cluster
+blind spot that sampling introduces.
+
+```
+PageRank        2-5s     damping 0.85
+betweenness    60-190s   exact, all cores
+```
+
+## Steps
+
+**a.** PageRank on the directed graph:
+```python
+pr = g_directed.pagerank(damping=0.85, weights=None)
+```
+
+**b.** Betweenness on the undirected graph:
+```python
+bc = g.betweenness()
+```
+Exact. Do not sample unless a measured runtime forces it — sampling is weakest at
+exactly the thing betweenness is for, since a page bridging two *small* clusters
+lies on few shortest paths overall.
+
+**c.** Store betweenness as **percentile rank**, not raw value. Removes cross-run
+magnitude drift and matches how trees consume it.
+
+**d.** Write back in one batched `UNWIND`, chunked at ~5k rows.
+
+**e.** ⚠️ **Correctness gate before trusting this.** Run the same graph through
+GDS and igraph, compare:
+```python
+spearman(gds_pagerank, igraph_pagerank)   # must exceed 0.99
+```
+A fast wrong PageRank is worse than a slow right one.
+
+**f.** Emit timings per algorithm so the runtime table can be replaced with
+measurements.
+
+## Acceptance
+
+- Spearman vs GDS > 0.99 on the synthetic corpus
+- Exact betweenness completes in under 4 minutes at 25k nodes
+- Percentile ranks are stable across two identical runs
+
+## Gotchas
+
+- **This task may be deleted.** If `spearman(betweenness, pagerank) > 0.8` on real
+  data, betweenness is redundant with PageRank and the whole stage comes out. See
+  the Phase 2 gate.
+- igraph's `pagerank` on a disconnected graph handles the teleport correctly, but
+  isolated nodes still get a small nonzero value. Expected, not a bug.
+
+**Depends on:** #7
+
+**Estimate:** 0.5 days","core,phase-2-graph",Core Engine
+[09] Leiden ×2 via leidenalg: link graph and keyword graph,"## Why
+
+Two clusterings answering two questions. The second is the cold-start fix and is
+easy to skip by accident.
+
+## Steps
+
+**a.** Pass A over `LINKS_TO`:
+```python
+part = la.find_partition(g, la.RBConfigurationVertexPartition,
+                         resolution_parameter=1.0, seed=42)
+```
+`RBConfiguration` rather than `Modularity` because it exposes a resolution
+parameter for tuning cluster granularity. Write to `linkCommunityId`.
+
+**b.** Pass B needs a **bipartite projection**. Build page↔keyword adjacency from
+`TARGETS_KEYWORD`, then project to page-page — two pages are adjacent if they
+target overlapping keywords, regardless of any link between them:
+```cypher
+MATCH (p:Page)-[:TARGETS_KEYWORD]->(k:Keyword)
+RETURN id(p) AS page, id(k) AS keyword
+```
+Weight the projected edge by shared keyword count. Write to
+`keywordCommunityId`.
+
+**c.** Why Pass B exists: clustering pages by the links they already have is
+circular. A new section has no links, so no cluster, so no recommendations —
+precisely the pages that need help. Keyword relationships exist before any link
+does.
+
+**d.** Derive pillar and spoke per keyword cluster: pillar is the head term by
+aggregate search volume, spokes are long-tail variants.
+
+**e.** Fixed `seed=42` in development for reproducibility. In production consider
+omitting it — a fixed seed hides genuine instability you would rather see.
+
+**f.** Log per pass: community count, modularity, largest community as a fraction
+of nodes, singleton count.
+
+## Acceptance
+
+- Both passes complete in under 20 seconds at 25k nodes
+- Leiden guarantees connected communities; assert no community splits into
+  multiple weakly-connected components
+- On the synthetic corpus, ARI against planted topics exceeds 0.7
+
+## Gotchas
+
+- `largest_community_pct` above ~40% means the clustering is not discriminating.
+  Log it and watch it.
+- Leiden is order-dependent. Without a seed, cluster **ids** change between runs
+  even when the partition is similar — never persist an id as a stable identifier.
+
+**Depends on:** #7
+
+**Estimate:** 1 day","core,phase-2-graph",Core Engine
+[10] HDBSCAN over content embeddings,"## Why
+
+A third clustering answering a third question:
+```
+linkCommunityId      what is connected
+keywordCommunityId   what we say it is about
+hubId                what it is actually about
+```
+
+Its unique output is the `-1` noise label — a page belonging to no coherent topic.
+Neither Leiden pass can express that, because Leiden must place every node
+somewhere.
+
+## Steps
+
+**a.** Pull all `content_embedding` vectors into a NumPy array, ordered by the
+same dense index used for the graph.
+
+**b.** Cluster:
+```python
+cl = hdbscan.HDBSCAN(min_cluster_size=15, min_samples=None,
+                     cluster_selection_method=""eom"", prediction_data=True)
+labels = cl.fit_predict(X.astype(np.float64))
+```
+Try raw 2048d first. Only add UMAP if quality is poor — it pulls numba and adds a
+second stochastic step with its own parameters.
+
+**c.** Write `hubId`, with `-1` preserved as a real value rather than nulled.
+
+**d.** Compute cluster centroids and store them. Needed by both hub-bridge scoring
+and the pillar check.
+
+**e.** ⚠️ **Cluster ids are unstable across runs.** If `hubId` feeds the model as
+a categorical feature, match centroids between runs to keep ids stable, or the
+feature is noise.
+
+**f.** Log clusters found, noise count and fraction, largest cluster fraction, and
+the condensed-tree depth.
+
+## Acceptance
+
+- On the synthetic corpus, the 24 planted noise pages are largely labelled `-1`
+- Clusters recover the 5 planted topics, ARI > 0.6
+- Runs in under 3 minutes at 25k pages
+
+## Gotchas
+
+- **This task may be deleted.** If `ARI(leiden, hdbscan) > 0.85` the two are
+  duplicate features. See the Phase 2 gate.
+- `min_cluster_size` too small fragments topics; too large merges them. 15 is a
+  starting point, not a measured value.
+
+**Depends on:** #5
+
+**Estimate:** 0.5 days","core,phase-2-graph",Core Engine
+[11] GATE: clustering and betweenness evaluation,"## 🚦 Run before writing Phase 3. Two outcomes delete later work.
+
+Half a day of measurement that can remove days of building. Do not skip it because
+the code already exists.
+
+## Steps
+
+**a.** Seed the corpus and run the harnesses:
+```bash
+make seed
+make eval              # ARI/NMI vs planted topics, noise P/R, purity
+make eval-stability    # label churn across 4 runs
+```
+
+**b.** Apply the decision rules:
+```
+ARI(leiden, hdbscan) 0.3-0.7    keep both — they disagree usefully
+                     > 0.85     DROP HDBSCAN, delete #10
+noise_recall         < 0.5      HDBSCAN's main advantage failed
+spearman(bc, pagerank) > 0.8    DELETE betweenness, remove from #8
+```
+
+**c.** Check label stability. Leiden with a fixed seed is reproducible; HDBSCAN
+labels churn. Pairwise ARI below ~0.8 across runs means `hubId` needs centroid
+matching before it can be a categorical feature — a real cost that appears in no
+quality metric.
+
+**d.** Check per-topic purity, not just aggregate ARI. This is where density
+sensitivity shows: the corpus plants spreads from 0.18 to 0.55, and a global
+resolution parameter cannot serve both equally.
+
+**e.** Write the outcome into the wiki `Measurement-Backlog` with the numbers, not
+just the conclusion. Future work needs to see what was measured.
+
+## Acceptance
+
+- Decision recorded with supporting numbers
+- Any deleted work removed from the roadmap, not left as dead code
+- Feature list for Phase 4 finalised
+
+## Gotchas
+
+- Synthetic embeddings are built to cluster cleanly. A good result here proves the
+  plumbing works, not that clustering is good on real content.
+- If everything scores near-perfectly, suspect the corpus is too easy rather than
+  celebrating.
+
+**Depends on:** #8, #9, #10
+
+**Estimate:** 0.5 days","core,phase-2-graph,gate",Core Engine
+[12] Candidate retrieval: hard constraints and HNSW,"## Why
+
+Narrows an O(n²) pair space. The critical design point: **eligibility is not
+priority**. Everything the old GSC filter decided is now a feature the ranker
+weighs, and the ranker must see the candidates to learn their value.
+
+## Steps
+
+**a.** Eligibility is three constraints and nothing else:
+```cypher
+MATCH (t:Page) WHERE t.isIndexable = true
+MATCH (s:Page) WHERE s.url <> t.url
+  AND NOT (s)-[:LINKS_TO]->(t)
+```
+
+⚠️ **No GSC filter.** v3 required `impressions > 500 AND position 4-20`. Two
+defects: `avg_position` is a mean over a heavily skewed query distribution, so a
+page averaging 2.5 might rank #1 on five branded terms and #28 on forty commercial
+ones. And it excluded new pages, orphans, striking-distance pages and pillars —
+making hub-and-spoke unrepresentable.
+
+**b.** HNSW top-50 per target:
+```cypher
+CALL db.index.vector.queryNodes('page_gnn', 50, $target_vec)
+YIELD node, score
+```
+Use `page_gnn` once GraphSAGE exists, `page_content` until then.
+
+**c.** Apply hard constraints as a post-filter, and over-fetch (say 60) so
+filtering still leaves 50.
+
+**d.** Batch per target rather than per pair. 25k targets × 1 query, not 1.25M.
+
+**e.** Emit candidate counts per target and total, plus the filter drop rate.
+
+## Acceptance
+
+- The 3 planted orphan NEW pages appear as candidate targets — if not, something
+  is still filtering
+- 25k targets complete in under 10 minutes
+- No pair where a `LINKS_TO` already exists
+
+## Gotchas
+
+- Vector index queries return the query node itself. Exclude by id, not by score.
+- Do not cap total candidates globally. Capping per target is correct; capping
+  overall silently drops whole sections.
+
+**Depends on:** #5, #9
+
+**Estimate:** 1.5 days","core,phase-3-retrieval",Core Engine
+[13] Jaccard signals: GSC query and strategic keyword overlap,"## Why
+
+Both are set-against-set with **comparable sizes**, which is precisely Jaccard's
+shape. The strategic keyword version is the cold-start-safe counterpart — it works
+when neither page has GSC data yet.
+
+## Steps
+
+**a.** GSC query overlap:
+```python
+qa = {q.query for q in queries_for(source)}
+qb = {q.query for q in queries_for(target)}
+jaccard = len(qa & qb) / len(qa | qb) if (qa | qb) else 0.0
+```
+Null-safe: a new page has an empty set, which yields 0.0, not an error.
+
+**b.** Strategic keyword overlap, same computation over `TARGETS_KEYWORD`. This
+one works with zero GSC data, which is the whole point.
+
+**c.** Both are **scoring inputs, not gates**. A pair with zero overlap still
+proceeds — it just carries a weak signal.
+
+**d.** Precompute query sets per URL once into a dict, rather than querying Mongo
+per pair. 1.25M pairs × 2 Mongo round trips is not viable.
+
+**e.** Add `keyword_gap`: keywords the page *targets* minus keywords it *ranks
+for*. A large gap on a high-priority keyword is a strong signal the page needs
+link support.
+
+## Acceptance
+
+- Pages with no GSC data score 0.0 rather than raising
+- Precomputation means no per-pair database access
+- Planted bridge-gap pairs show high query overlap despite near-zero link density
+
+## Gotchas
+
+- Normalise query strings before set operations — casing and whitespace.
+- **Do not use cosine here.** These are sets of comparable size. Cosine is for the
+  length-asymmetric cases in #16.
+
+**Depends on:** #12
+
+**Estimate:** 1 day","core,phase-3-retrieval",Core Engine
+[14] Cluster membership signals,"## Why
+
+The three clusterings are only useful in combination. Their **disagreement** is
+the signal, not any one of them alone.
+
+## Steps
+
+**a.** Attach `linkCommunityId`, `keywordCommunityId` and `hubId` for both source
+and target, plus booleans for whether each matches.
+
+**b.** Derive `cluster_agreement`:
+```
+same keyword + same link cluster       already well connected
+same keyword + different link cluster  ← the missing link
+different keyword + same link cluster  possibly a link to remove
+```
+Encode as a small categorical, not three separate booleans — the interaction is
+what carries information.
+
+**c.** Handle `hubId == -1` explicitly. Noise is a real category, not missing
+data, and must not be treated as its own cluster in a match test.
+
+**d.** If the Phase 2 gate dropped HDBSCAN, omit `hubId` here rather than passing
+nulls.
+
+## Acceptance
+
+- **GATE:** the 3 planted orphan NEW pages appear as candidate targets with
+  correct cluster ids
+- `cluster_agreement` distribution is logged; the ""missing link"" bucket should be
+  a meaningful minority, not near-zero or near-everything
+
+## Gotchas
+
+- Cluster ids are not stable across runs. These are per-run features, never
+  persisted identifiers.
+
+**Depends on:** #9, #10, #12
+
+**Estimate:** 0.5 days","core,phase-3-retrieval,gate",Core Engine
+[15] Feature assembly: ~30 context features,"## Why
+
+This is what LambdaMART actually sees. Everything the removed GSC filter used to
+decide is here as a feature.
+
+## Feature groups
+
+```
+GSC          impressions_log, position_band (one-hot with NULL bucket),
+             ctr_gap, has_gsc_data, query_count
+lifecycle    stage one-hot, page_age_days
+strategic    kw_count, max_priority, keyword_gap, pair_kw_overlap
+target       inbound_count, is_orphan, crawl_depth, saturation_ratio
+source       outbound_count, outbound_density, link_equity_share
+cluster      linkCommunityId, keywordCommunityId, hubId, cluster_agreement
+semantic     cosine(source, target), contextRelevance, anchorTargetFit
+```
+
+## Steps
+
+**a.** `has_gsc_data` as an explicit boolean. Trees handle missingness better when
+told about it than when it is imputed to zero.
+
+**b.** `position_band` one-hot **with a NULL bucket**. A page that does not rank is
+categorically different from one ranking at position 50.
+
+**c.** `target_saturation_ratio` = actual inbound ÷ expected for its PageRank
+tier. A pillar with 400 inbound links on a 5k-page site is saturated; one with 12
+is under-linked regardless of how well it ranks. This expresses correctly what the
+position filter was crudely gesturing at.
+
+**d.** Source-side outbound features. Equity divides across a page's links, so a
+page with 150 outbound links passes ~1/150 through each — a 151st is near
+worthless. Nothing before v5 prevented recommending twenty new links on one page.
+```
+source_outbound_count
+source_outbound_density     links per 1,000 words
+source_link_equity_share    1 / (outbound_count + 1)
+```
+
+**e.** Assemble as a `pandas.DataFrame` with a stable column order, and persist
+that order — LightGBM depends on positional consistency between train and predict.
+
+**f.** ⚠️ **Chunk the assembly.** 1.25M pairs × 30 features is fine, but if this
+later includes embeddings the memory ceiling arrives fast. Build the streaming
+pattern now: assemble, score, discard in ~50k batches.
+
+**g.** Cache the feature matrix to Parquet keyed by corpus hash. Recomputing on
+every experiment iteration is wasteful.
+
+## Acceptance
+
+- Feature matrix for 1.25M pairs builds in under 45 minutes
+- No column is entirely null or entirely constant
+- Column order is deterministic across runs
+- Memory stays bounded with chunking
+
+## Gotchas
+
+- Log-scale impressions. Raw values span orders of magnitude and dominate splits.
+- `crawl_depth` comes from BFS over the crawl, not from the body-link graph — a
+  page can be shallow via nav and unreachable via body links.
+
+**Depends on:** #13, #14
+
+**Estimate:** 2 days","core,phase-4-features",Core Engine
+[16] Cosine dimensions: contextRelevance and anchorTargetFit,"## Why
+
+`anchorTargetFit` is the gap nothing else covers. `keywordAlignment` asks whether
+the anchor contains the target's keyword — it cannot catch an anchor that matches
+the keyword while the target page is about something else:
+
+```
+anchor:  ""hydraulic press tonnage""          ← lexically fine
+target:  page about press brake bending     ← wrong page entirely
+```
+
+## Steps
+
+**a.** Compute both:
+```python
+contextRelevance = cosine(link.surroundingEmbedding, target.gnn_embedding)
+anchorTargetFit  = cosine(anchor_embedding,          target.content_embedding)
+```
+
+**b.** ⚠️ **Both must be cosine, not Jaccard.** Length asymmetry: a 3-token anchor
+against a 2,000-token page maxes out near 3/2000 ≈ 0.0015 on Jaccard, so every
+score collapses into noise. Cosine treats both as directions in semantic space
+regardless of length.
+
+The rule that generalises:
+```
+comparable set sizes    → Jaccard    (query sets, keyword sets, anchor vs keyword)
+length-asymmetric       → cosine     (anchor vs page, sentence vs page)
+```
+
+**c.** Use `vector.similarity.cosine()` in Cypher where both vectors are already
+stored — avoids pulling them over the wire. Requires Neo4j 5.18+.
+
+**d.** ⚠️ **Thresholds do not port across embedding models.** Local testing showed
+0.75 flagging 2/3 test queries on Qwen and 0/3 on Voyage for identical content.
+Re-derive for voyage-4-large; do not inherit a number from anywhere.
+
+**e.** Log the distribution of both scores so thresholds can be set from data
+rather than guessed.
+
+## Acceptance
+
+- Both bounded in [0,1] after normalisation
+- 250k edges score in under 20 minutes
+- Score distributions logged and visibly bimodal, not clustered at one end
+
+## Gotchas
+
+- `surroundingEmbedding` is on the relationship. There is no relationship vector
+  index in Community, so this is a sequential scan — fine here, but do not attempt
+  ANN over it.
+
+**Depends on:** #6, #15
+
+**Estimate:** 0.5 days","core,phase-4-features",Core Engine
+[17] Hand-weighted linear scorer,"## Why
+
+The baseline every later model must beat. Deliberately simple and legible — the
+point is having something measurable before LambdaMART, not getting the weights
+right.
+
+## Steps
+
+**a.** Normalise each feature to [0,1] with a documented method — min-max on
+bounded features, percentile rank on heavy-tailed ones like PageRank.
+
+**b.** Weighted sum with weights in config, not code, so they can be swept without
+a deploy.
+
+**c.** Scale to `opportunity_score` 0–100 and assign tiers (HIGH/MEDIUM/LOW) by
+percentile within the run, not absolute cutoffs.
+
+**d.** Emit per-recommendation the top three contributing features and their
+values. This is what makes the output explainable and what you will read during
+threshold tuning.
+
+**e.** Persist scores so the NDCG harness in #26 can compare against them.
+
+## Acceptance
+
+- Scores span the full 0–100 range, not clustered
+- Contribution breakdown appears on every recommendation
+- Deterministic: same input, same score
+
+## Gotchas
+
+- These weights encode your priors. That is fine and expected — just do not
+  mistake a good synthetic result for validation.
+
+**Depends on:** #15, #16
+
+**Estimate:** 1 day","core,phase-4-features",Core Engine
+[18] Hub-to-hub bridge scoring,"## Why
+
+Produces a handful of high-leverage **structural** recommendations rather than
+thousands of page-level ones. Two topics that share search demand but have almost
+no links between them is a strategic finding, not a per-page one.
+
+## Steps
+
+**a.** Score every cluster pair:
+```python
+bridge_gap = (0.4 * cosine(centroid_a, centroid_b)
+            + 0.6 * jaccard(queries_a, queries_b)
+            - link_density * 50)
+```
+Query Jaccard is weighted higher than semantic similarity because shared *demand*
+is stronger evidence than shared vocabulary.
+
+**b.** `link_density` = cross-cluster links ÷ (size_a × size_b). The ×50 scaling
+puts it on a comparable range to the other terms — tune it against real data.
+
+**c.** For the top-ranked pairs, pick the best page pair: source with highest
+centrality and outbound capacity, target closest to the source cluster's centroid.
+
+**d.** Emit as its own recommendation type with cluster sizes and the shared
+queries that justify it.
+
+## Acceptance
+
+- **GATE:** both planted bridge gaps rank in the top 3 by `bridge_gap`. They have
+  3 and 5 cross-links against ≥57 for every other pair, so the signal is clean if
+  the scoring is right.
+- Well-connected pairs rank near the bottom
+
+## Gotchas
+
+- Requires `hubId` from #10. If the Phase 2 gate dropped HDBSCAN, this can run on
+  `keywordCommunityId` instead — note the substitution in the output.
+- The ×50 constant is a guess. Log the three terms separately so it can be tuned.
+
+**Depends on:** #10, #13
+
+**Estimate:** 0.5 days","core,phase-4-features,gate",Core Engine
+[19] Keyword resolution chain,"## Why
+
+Determines what the anchor is *for*. Getting this wrong degrades every anchor
+downstream, and v4's version had a defect inherited from the removed GSC filter.
+
+## Steps
+
+**a.** Resolution order:
+```
+1  strategic primary keyword          if assigned
+2  highest-opportunity GSC query      see below
+3  extracted from title / h1          last resort
+```
+
+**b.** ⚠️ **GSC selection is by opportunity value, not position band.** v4 took the
+top query where the target ranked 5–20 — the same defect as the removed Step ④
+filter, relocated. A page at position 3 on a high-value commercial term still
+needs links to reach 1.
+```python
+opportunity_value = impressions * (ctr_at_1 - ctr_at_current)
+```
+Estimated click upside. Favours high-demand terms wherever they rank, and
+deprioritises positions 1–2 naturally where upside is near zero — no hard cutoff.
+
+**c.** The CTR curve comes from **#36**, derived per tenant. Do not use an industry
+table; curves differ substantially by vertical and SERP feature mix.
+
+**d.** Title/h1 fallback: strip brand suffixes and boilerplate before using.
+
+**e.** Record which rung produced the keyword. Needed to diagnose poor anchors
+later.
+
+**f.** The two sources disagree usefully — a page targeting ""industrial hydraulic
+press"" but ranking for ""press machine repair"" is a content gap, captured as
+`keyword_gap`.
+
+## Acceptance
+
+- Pages with a strategic primary always use it
+- Pages with no GSC data fall through to title without error
+- Rung distribution logged across the corpus
+
+## Gotchas
+
+- Every page in the synthetic corpus has a strategic keyword, so rungs 2 and 3 are
+  barely exercised there. Test them explicitly with fixtures.
+
+**Depends on:** #3
+
+**Estimate:** 1 day","core,phase-5-anchors",Core Engine
+[20] Extraction ladder rungs 1-2,"## Why
+
+Anchor text is a ranking signal, not a copywriting problem. The keyword is the
+specification and the operation is **extraction** — find where the topic is
+already mentioned and link that phrase. That is what an SEO does by hand; you do
+not rewrite the client's copy.
+
+## Steps
+
+**a.** Rung 1, exact match. Case-insensitive, whitespace-normalised, word-boundary
+aware so ""press"" does not match inside ""pressure"". Return the phrase with its
+character offsets — the caller needs to know *where*.
+
+**b.** Rung 2, stemmed variant:
+```python
+from nltk.stem.snowball import SnowballStemmer
+stem = SnowballStemmer(LANG_MAP[page.language]).stem
+```
+⚠️ **Key off `page.language`, not hardcoded English.** Snowball ships ~15
+languages and tenants are multilingual. Cheap now, painful to retrofit once
+English is assumed throughout.
+
+Handles plurals, `-ing`, `-ed`, and modifier drop (""industrial hydraulic press"" →
+""hydraulic press"").
+
+**c.** Sentence-split the body first, so a match returns its containing sentence
+for context.
+
+**d.** If several sentences match, prefer earlier ones — link prominence within
+the copy is a real signal.
+
+**e.** Return a structured result: matched phrase, rung, sentence, offsets. Never
+a bare string.
+
+## Acceptance
+
+- Pages containing their head term verbatim resolve at rung 1
+- Plural and `-ing` forms resolve at rung 2
+- Non-English pages use the correct stemmer
+- No match inside a larger word
+
+## Gotchas
+
+- Do not stem the whole document up front — expensive and destroys offsets. Stem
+  the keyword and candidate phrases only.
+
+**Depends on:** #19
+
+**Estimate:** 1 day","core,phase-5-anchors",Core Engine
+[21] Rung 2.5: Jaccard on stemmed token sets,"## Why
+
+Sits between stemmed matching and embedding cosine, and saves the expensive rung.
+
+```
+keyword:  ""industrial hydraulic press""
+phrase:   ""hydraulic press systems""
+
+rung 2    may miss — different token count
+rung 3    catches it, costs an embedding call
+rung 2.5  jaccard on stemmed sets = 0.5 → free
+```
+
+Rung 3 embeds candidate noun phrases **per pair**, so anything diverted before it
+is a direct saving.
+
+## Steps
+
+**a.** Extract candidate noun-ish phrases per sentence — 2–5 word windows is
+sufficient without a POS tagger.
+
+**b.** Stem both sides, compare as sets:
+```python
+jaccard = len(kw_stems & phrase_stems) / len(kw_stems | phrase_stems)
+```
+
+**c.** Threshold at 0.5 initially. Sweep 0.3–0.7 and measure what fraction of
+rung-3 hits this diverts and whether it introduces bad matches.
+
+**d.** Both sides are short and comparable in size, which is why Jaccard is
+correct here — unlike #16 where the asymmetry demands cosine.
+
+**e.** Log the divert rate. Worth keeping if it takes more than ~20% of rung-3
+traffic without false positives.
+
+## Acceptance
+
+- Diverts a measurable fraction of rung-3 traffic
+- False-positive rate stays low across the threshold sweep
+- Threshold is config, not a literal
+
+## Gotchas
+
+- Very short keywords (one token) make Jaccard degenerate — either 0 or 1. Skip
+  this rung for single-token keywords.
+
+**Depends on:** #20
+
+**Estimate:** 0.5 days","core,phase-5-anchors",Core Engine
+[22] Rung 3: semantic phrase match with caching,"## Why
+
+The last resort before `CONTENT_GAP`, and the expensive one — it embeds candidate
+phrases per pair.
+
+## Steps
+
+**a.** Extract candidate noun phrases. spaCy if the `nlp` extra is installed,
+otherwise the 2–5 word windows from #21.
+
+**b.** Embed candidates and compare to `target.gnn_embedding`. Threshold ~0.62 as
+a starting point.
+
+**c.** ⚠️ **Cache aggressively** by `(source_url, content_hash)`. The same source
+page appears across many pairs, and its candidate phrases do not change between
+them. Without this the cost is unbounded.
+
+**d.** Cap candidates per sentence — 10 is plenty. Embedding every n-gram is
+wasteful.
+
+**e.** ⚠️ **Re-derive the threshold for voyage-4-large.** 0.62 was derived against
+different embeddings and absolute cosine values do not port between models.
+
+**f.** Log rung-3 invocation count and cache hit rate. If the hit rate is low, the
+cache key is wrong.
+
+## Acceptance
+
+- Cache hit rate above 80% on a full run
+- Threshold derived from the corpus, not inherited
+- Rung 3 fires on a minority of pairs
+
+## Gotchas
+
+- Rung 3 returning a phrase with zero lexical overlap is legitimate — that is the
+  point of a semantic rung. But log those cases; they are the ones most likely to
+  read oddly.
+
+**Depends on:** #20, #6
+
+**Estimate:** 1 day","core,phase-5-anchors",Core Engine
+[23] Anchor scoring and type distribution,"## Why
+
+Picks between candidates and keeps the inbound anchor profile healthy without ever
+blocking a good link.
+
+## Steps
+
+**a.** Four weighted dimensions:
+```
+semantic   .35    cosine(anchor, target.gnn_embedding)
+keyword    .35    0.7 * jaccard(stemmed) + 0.3 * cosine
+diversity  .15    JACCARD vs existing inbound anchors — not cosine
+length     .15    optimal 2-4 words
+```
+
+**b.** ⚠️ **Diversity must be Jaccard.** Over-optimisation is about repeating
+*words*. Cosine rates ""commercial press machine"" as non-diverse against
+""industrial hydraulic press"" at 0.85; Jaccard correctly gives 0.20.
+
+**c.** Naturalness was **removed**. It existed to catch awkward LLM phrasing, and
+an extracted phrase already reads naturally in its own sentence — that is what
+made it extractable. This also removes the LLM-as-judge self-preference bias.
+
+**d.** Type distribution (15 exact / 20 partial / 50 natural / 15 branded): count
+the target's existing inbound anchors by type, prefer whichever is
+underrepresented.
+
+**e.** ⚠️ **Ordering matters and was ambiguous in v4.** Extraction runs first. The
+profile only chooses *between candidates that already exist in the copy*. If the
+sole available phrase is a partial match, use it even when the profile wants
+exact. Never skip a good link because a ratio preferred something else.
+
+**f.** Profile is per-tenant config. The 15/20/50/15 figures are conventional SEO
+heuristics, not measured.
+
+## Acceptance
+
+- **GATE:** extraction succeeds on ~78% of pages and falls through on ~22%, within
+  ±5%. Check against `db.pages.find({_planted: ""NO_HEAD_TERM""})`.
+- Diversity penalises literal repetition, not semantic similarity
+- A partial-only page still produces a link
+
+## Gotchas
+
+- Type classification needs the keyword. An anchor is EXACT relative to a specific
+  keyword, not in the abstract.
+
+**Depends on:** #22
+
+**Estimate:** 0.5 days","core,phase-5-anchors,gate",Core Engine
+[24] Proxy label generation,"## Why
+
+LambdaMART trains on acceptance labels. On synthetic data nobody has accepted
+anything, so labels come from planted structure.
+
+## Steps
+
+**a.** Assign graded labels:
+```python
+label = 3  if pair spans a planted BRIDGE_GAP
+        3  if target is a planted ORPHAN_NEW_STRATEGIC page
+        2  if source and target share keywordCommunityId
+        1  if target is TRUE_NOISE          # should rank low
+        0  otherwise
+```
+
+**b.** Group by source page — LambdaMART ranks *within* a group, so grouping must
+match how recommendations are consumed.
+
+**c.** Balance check: if label 3 is under ~1% of pairs the model has almost nothing
+to learn from. Log the distribution.
+
+**d.** Hold out 20% by **source page**, not by pair. Splitting pairs leaks — the
+same source appears on both sides.
+
+**e.** ⚠️ **State the limitation in the output.** This validates plumbing and
+feature engineering, not ranking quality. A model that learns these perfectly has
+learned *your priors*.
+
+## Acceptance
+
+- Label distribution logged and non-degenerate
+- Holdout split is by source page with no overlap
+- Reproducible from a seed
+
+## Gotchas
+
+- Do not use features to derive labels. Labelling on `keywordCommunityId` and
+  *also* feeding it as a feature makes that feature trivially predictive and the
+  evaluation meaningless. Either drop the feature or drop that label rule.
+
+**Depends on:** #15
+
+**Estimate:** 1 day","core,phase-6a-ranking",Core Engine
+[25] LightGBM lambdarank,"## Why
+
+Ranking rather than regression because traffic delta is not attributable to a
+single link — confounded by algorithm updates, seasonality, content changes.
+Acceptance is directly observable.
+
+## Steps
+
+**a.** Configure:
+```python
+params = dict(objective=""lambdarank"", metric=""ndcg"", ndcg_eval_at=[10],
+              learning_rate=0.05, num_leaves=31,
+              min_data_in_leaf=20, feature_fraction=0.8)
+```
+
+**b.** `group` array must be the count of rows per source page, in the same order
+as the data. This is the most common LightGBM ranking mistake and it fails
+silently — you get a model, just a meaningless one.
+
+**c.** Early stopping on validation NDCG@10, 50 rounds patience.
+
+**d.** Persist the feature column order alongside the model. LightGBM depends on
+positional consistency between train and predict.
+
+**e.** Export feature importance by gain, not split count. Split count rewards
+high-cardinality features regardless of usefulness.
+
+**f.** Chunked inference from the start — assemble, score, discard in ~50k
+batches. At 2048d the pair vector roughly doubles, so the memory ceiling arrives
+sooner than earlier estimates suggested.
+
+## Acceptance
+
+- Trains without error on the synthetic corpus
+- NDCG@10 improves over training rounds
+- Feature importance is non-degenerate — no single feature above ~60% gain
+- Inference on 1.25M pairs stays within memory
+
+## Gotchas
+
+- A single feature dominating usually means label leakage. Check #24's gotcha.
+- `min_data_in_leaf=20` is high for small label counts. Lower it for early runs
+  and raise it as labels accumulate.
+
+**Depends on:** #24
+
+**Estimate:** 1.5 days","core,phase-6a-ranking",Core Engine
+[26] NDCG@10 harness: baseline vs learned,"## Why
+
+**The gate.** If the learned model does not beat a hand-weighted linear scorer,
+the features are the problem, not the model — and no amount of tuning fixes that.
+
+## Steps
+
+**a.** Score the same holdout with both #17 and #25.
+
+**b.** Compute NDCG@10 per source group, then average. Report the distribution,
+not just the mean — a good average hiding many zero-scoring groups is a different
+situation from uniform mediocrity.
+
+**c.** ⚠️ **Log `n_labelled_pairs` alongside every NDCG figure.** With few labels
+the metric is noise: grouped by source page, most groups have one or two graded
+items and the rest zeros. The number must never be read without its sample size.
+
+**d.** Also report precision@5 and the fraction of groups with any label above 0 —
+NDCG alone hides sparsity.
+
+**e.** Bootstrap a confidence interval over source groups. A 0.02 improvement with
+a 0.08 interval is not an improvement.
+
+## Acceptance
+
+- Both scorers evaluated identically
+- CI reported alongside the point estimate
+- Result written into the wiki with numbers
+
+## Gotchas
+
+- NDCG needs a graded relevance scale. Binary labels make it degenerate to
+  something close to MAP.
+
+**Depends on:** #17, #25
+
+**Estimate:** 1 day","core,phase-6a-ranking",Core Engine
+[27] MLflow tracking and feature importance report,"## Why
+
+Feature importance is **the real output of this phase**. It answers three
+measurement-backlog questions at once.
+
+## Steps
+
+**a.** Point at the existing MLflow server. Log params, metrics, the model
+artefact, feature importance, and the label distribution.
+
+**b.** Tag runs with corpus size, seed, feature set version and git SHA. Without
+these, comparing runs later is guesswork.
+
+**c.** Log feature importance as an artefact, not just a metric, so it is
+inspectable.
+
+**d.** Read the outcomes:
+```
+betweenness low        → delete #8, saves 60-190s/run
+hubId low              → HDBSCAN was a duplicate, drop #10
+keyword_gap high       → strategic keyword work paid off
+saturation_ratio high  → outbound features earned their place
+```
+
+**e.** Promotion gate is a **registry stage transition**, not application logic. A
+version moves to Production only if it beats the current Production NDCG@10 on
+holdout.
+
+**f.** Block promotion from local runs. Only CI transitions stages.
+
+## Acceptance
+
+- Runs appear in MLflow with full tags
+- Feature importance retrievable as an artefact
+- Promotion gate rejects a worse model
+
+## Gotchas
+
+- MLflow's artefact store is MinIO. Verify `MLFLOW_S3_ENDPOINT_URL` is set or
+  artefact logging fails with an unhelpful boto3 error.
+
+**Depends on:** #25
+
+**Estimate:** 0.5 days","core,phase-6a-ranking",Core Engine
+[28] Run real crawl through the full pipeline,"## Why
+
+First contact with real content. Settles three things synthetic data structurally
+cannot.
+
+## Steps
+
+**a.** Ingest one real crawl into a separate tenant so synthetic and real never
+mix.
+
+**b.** Full pipeline end to end, timing every stage. Compare against the runtime
+projections — every number in the wiki is an estimate until this runs.
+
+**c.** Measure **extraction hit rate** per rung. The 78% synthetic figure is a
+generator property, not a fact about the web. This determines `CONTENT_GAP` volume
+and how much opportunity is actionable without writing new content.
+
+**d.** Measure **fixable-link rate**: verdicts emitted ÷ total edges.
+```
+< 10%   audit is a feature, discovery is the product
+> 30%   the audit IS the product
+```
+This drives the roadmap split.
+
+**e.** Sanity-read 20 recommendations. Not a metric — a smell test. Anything
+obviously wrong here means a bug, not a tuning problem.
+
+**f.** Note embedding behaviour on real text: boilerplate, inconsistent lengths,
+navigation remnants that survived extraction.
+
+## Acceptance
+
+- Pipeline completes without manual intervention
+- Both rates measured and recorded
+- Stage timings replace the projections in the wiki
+
+## Gotchas
+
+- Real crawls have redirect chains, duplicate content and pagination the synthetic
+  corpus lacks. Expect ingestion bugs here, not algorithm bugs.
+
+**Depends on:** #23, #26
+
+**Estimate:** 0.5 days","core,phase-6b-real-labels",Core Engine
+[29] Stratified sampling and blind label export,"## Why
+
+How the labels are drawn determines whether the evaluation means anything.
+
+## Steps
+
+**a.** Sample ~200 pairs **stratified by score decile**, roughly 20 per decile.
+
+⚠️ **Do not take the top 200.** Labelling only high scorers means the model never
+sees negatives and learns nothing about what to reject. The bottom deciles need
+labelling precisely to confirm they belong there.
+
+**b.** Export to CSV **without scores, ranks or any model output**. Columns:
+source url, target url, proposed anchor, the sentence it sits in, target title.
+
+**c.** Shuffle before export. Ordering leaks the ranking.
+
+**d.** Label as accept / modify / dismiss. Modify means the link is wanted but the
+anchor needs changing — a partial win, and it maps to label 2.
+
+**e.** Join back on a random id, not on position.
+
+**f.** ⚠️ **Label blind.** Labelling with the score visible anchors you to it and
+makes the evaluation circular.
+
+## Acceptance
+
+- Export has no model output in any column
+- Every decile represented
+- Join is verifiable and lossless
+
+## Gotchas
+
+- 200 labels from one person is directionally sound but a sample of one. State it
+  in the write-up so a strong NDCG is not read as validated against the
+  profession.
+
+**Depends on:** #28
+
+**Estimate:** 0.5 days","core,phase-6b-real-labels",Core Engine
+"[30] Retrain on real labels, holdout NDCG@10","## 🚦 The gate that answers ""does the intelligence core work.""
+
+Everything before this validates plumbing.
+
+## Steps
+
+**a.** Map labels: accept → 3, modify → 2, dismiss → 1, unlabelled → 0.
+
+**b.** Train on ~150, hold out ~50, split by source page.
+
+**c.** Compare three scorers on the same holdout: hand-weighted baseline,
+proxy-label model from #25, and the real-label model.
+
+**d.** The proxy-vs-real comparison is informative in itself. If the proxy model
+performs near-randomly on real labels, the planted structure did not reflect real
+judgement — worth knowing before trusting any synthetic result again.
+
+**e.** Report feature importance from the real-label model and diff it against the
+proxy one. Features that matter for real judgement but not for planted structure
+are the interesting ones.
+
+**f.** 200 labels will **not** support GraphSAGE — the extra capacity overfits long
+before it helps. Do not read a poor result as evidence against the GNN.
+
+## Acceptance
+
+- Learned model beats the heuristic baseline on held-out real labels
+- Bootstrap CI reported
+- Proxy-vs-real importance diff recorded
+
+## Gotchas
+
+- If real-label NDCG is barely above the baseline, the honest conclusion is that
+  ~30 tabular features carry most of the available signal — which is useful, and
+  argues against building the GNN.
+
+**Depends on:** #29
+
+**Estimate:** 1 day","core,phase-6b-real-labels,gate",Core Engine
+[31] End-to-end runs at three scales,"## Steps
+
+**a.** Run at 600, 5,000 and 25,000 pages, logging duration per stage.
+
+**b.** Compare against the projections. Betweenness grows O(V·E), so 5k is ~70×
+the work of 600 — the place scaling assumptions break first.
+
+**c.** Watch peak memory at 25k, particularly during feature assembly and
+LambdaMART inference.
+
+**d.** Verify the parallel schedule actually overlaps: graph analytics and audit
+pass A should run inside the embedding window, not after it.
+
+**e.** Update the Architecture runtime table with measured numbers and delete the
+""provisional"" note.
+
+## Acceptance
+
+- All three complete
+- Measured timings replace projections
+- Peak memory stays within a 32 GB node at 25k
+
+## Gotchas
+
+- 25k pages against the real Voyage API costs real money and takes ~28 minutes.
+  Run it once, not iteratively.
+
+**Depends on:** #30
+
+**Estimate:** 0.5 days","core,phase-7-validation",Core Engine
+[32] Ground truth assertion suite,"## Why
+
+Turns ""it seems to work"" into a pass/fail board that runs in CI.
+
+## The ten checks
+
+```
+Synthetic
+ 1  clusters recover 5 planted topics        ARI vs _topic > 0.7
+ 2  24 noise pages excluded or flagged       noise_recall > 0.6
+ 3  3 orphan NEW pages surface as ADD_LINK   all in top decile
+ 4  2 bridge gaps rank top by hub score      both in top 3 pairs
+ 5  2 pillar mismatches caught               centroid-nearest != declared
+ 6  extraction ~78% hit, ~22% fallthrough    within ±5%
+ 7  learned ranker beats heuristic           NDCG@10 improvement
+
+Real crawl
+ 8  extraction hit rate on real content      measured, not asserted
+ 9  fixable-link rate                        measured, not asserted
+10  ranker beats baseline on real labels     the actual gate
+```
+
+## Steps
+
+**a.** Implement 1–7 as pytest tests against a seeded corpus, marked `slow`.
+
+**b.** Implement 8–10 as a reporting script, not assertions — they measure rather
+than gate, and the right threshold is unknown until measured.
+
+**c.** Each failure message must state expected, actual, and which planted fixture
+it refers to.
+
+**d.** Run the suite in CI nightly, not per PR — it needs a seeded corpus and real
+embeddings.
+
+## Acceptance
+
+- All seven synthetic checks pass
+- Three real-crawl measurements recorded
+- Failures are diagnosable from the message alone
+
+## Gotchas
+
+- Checks 1–7 depend on the corpus seed. Pin it, and re-verify after any generator
+  change.
+
+**Depends on:** #31
+
+**Estimate:** 1 day","core,phase-7-validation",Core Engine
+[33] Feature importance report and decision write-up,"## Why
+
+Close the loop. Several measurement-backlog items are now answerable, and the ones
+that are not need stating explicitly so a green board is not over-read.
+
+## Steps
+
+**a.** Close out the backlog items this build settled, with numbers.
+
+**b.** Record the deletions: did betweenness survive? HDBSCAN? Remove dead code,
+do not leave it behind a flag.
+
+**c.** Write the ""does not prove"" section:
+```
+generalisation beyond one site     one real crawl, one content style
+labeller agreement                 200 labels, one person
+2048 vs 1024                       untested for full-page doc-to-doc
+                                   comparison with voyage-4-large
+long-page dilution                 chunking deferred, every page is one vector
+```
+
+**d.** Decide on Phase 7 of the wider roadmap — GraphSAGE and cross-attention —
+using the #30 result. If ~30 tabular features carry most of the signal, that is a
+strong argument against 19 more days.
+
+**e.** Update Architecture, Decisions and Measurement-Backlog so the wiki reflects
+what was built rather than what was planned.
+
+## Acceptance
+
+- Every backlog item either closed with numbers or restated with a plan
+- Deleted components removed from wiki and code
+- Next-phase decision recorded with its justification
+
+## Gotchas
+
+- The temptation is to declare success. The more useful artefact is a precise list
+  of what remains unknown.
+
+**Depends on:** #27, #32
+
+**Estimate:** 0.5 days","core,phase-7-validation",Core Engine
