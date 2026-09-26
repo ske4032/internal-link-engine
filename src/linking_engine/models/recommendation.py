@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 from linking_engine.models.enums import (
     ActionType,
@@ -16,6 +16,7 @@ from linking_engine.models.enums import (
     ContentGapFinding,
     RecommendationStatus,
 )
+from linking_engine.urls import UrlKey
 
 
 def _as_ordered_pairs(value: object) -> object:
@@ -70,8 +71,8 @@ class Recommendation(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    source_url: HttpUrl
-    target_url: HttpUrl
+    source_url: UrlKey
+    target_url: UrlKey
     action_type: ActionType
     finding: ContentGapFinding | None
 

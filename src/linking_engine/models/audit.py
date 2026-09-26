@@ -6,9 +6,10 @@ the `link_audit` collection so issue history over time is queryable.
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field
 
 from linking_engine.models.enums import ActionType, IssueFlag
+from linking_engine.urls import UrlKey
 
 
 class LinkAuditResult(BaseModel):
@@ -24,8 +25,8 @@ class LinkAuditResult(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    source_url: HttpUrl
-    target_url: HttpUrl
+    source_url: UrlKey
+    target_url: UrlKey
 
     anchor_quality_score: float = Field(ge=0, le=100)
     keyword_alignment: float = Field(ge=0, le=1)

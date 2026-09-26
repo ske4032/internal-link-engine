@@ -37,6 +37,7 @@ from linking_engine.models import (
     Page,
     TenantGraphCounts,
 )
+from linking_engine.urls import normalise_url
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping, Sequence
@@ -403,6 +404,7 @@ class GraphRepo:
     ) -> int:
         """Create missing nodes for uncrawled link targets; existing nodes are untouched."""
         _require_tenant(tenant_id)
+        urls = [normalise_url(url) for url in urls]
         written = 0
         for chunk in batched(urls, batch_size):
             written += await self._write_all(
@@ -422,6 +424,7 @@ class GraphRepo:
         other edges leaving those sources are deleted. Both endpoints must exist.
         Returns (written, deleted)."""
         _require_tenant(tenant_id)
+        sources = [normalise_url(url) for url in sources]
         source_set = set(sources)
         stray = {str(link.source_url) for link in links} - source_set
         if stray:
@@ -464,6 +467,7 @@ class GraphRepo:
     ) -> int:
         """Write one flush of content vectors in one transaction: every row is written or none."""
         _require_tenant(tenant_id)
+        urls = [normalise_url(url) for url in urls]
         _check_embeddings(urls, body_hashes, vectors, model=model, dimensions=dimensions)
         rows = [
             {"url": url, "hash": body_hash, "vec": vector}
@@ -494,6 +498,7 @@ class GraphRepo:
         batch_size: int = PAGE_BATCH,
     ) -> list[Page]:
         _require_tenant(tenant_id)
+        urls = [normalise_url(url) for url in urls]
         query = _GET_PAGES if include_vectors else _GET_PAGES_NO_VECTORS
         pages: list[Page] = []
         for chunk in batched(urls, batch_size):
@@ -519,6 +524,7 @@ class GraphRepo:
         self, tenant_id: str, source_urls: Sequence[str], *, batch_size: int = PAGE_BATCH
     ) -> list[Link]:
         _require_tenant(tenant_id)
+        source_urls = [normalise_url(url) for url in source_urls]
         links: list[Link] = []
         for chunk in batched(source_urls, batch_size):
             rows = await self._read(_LINKS_FROM, tenant=tenant_id, urls=list(chunk))

@@ -29,6 +29,7 @@ from linking_engine.errors import (
     SchemaError,
 )
 from linking_engine.models import CrawlPage, LinkRecord, PageRecord, PageSummary
+from linking_engine.urls import normalise_url
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -230,12 +231,14 @@ class MongoRepo:
         self, tenant_id: str, urls: Sequence[str], *, batch_size: int = READ_BATCH
     ) -> list[PageRecord]:
         _require_tenant(tenant_id)
+        urls = [normalise_url(url) for url in urls]
         return await self._find_in("pages", tenant_id, "url", urls, PageRecord, batch_size)
 
     async def links_for(
         self, tenant_id: str, source_urls: Sequence[str], *, batch_size: int = READ_BATCH
     ) -> list[LinkRecord]:
         _require_tenant(tenant_id)
+        source_urls = [normalise_url(url) for url in source_urls]
         return await self._find_in(
             "links", tenant_id, "sourceUrl", source_urls, LinkRecord, batch_size
         )

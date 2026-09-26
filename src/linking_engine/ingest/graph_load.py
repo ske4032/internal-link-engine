@@ -5,49 +5,14 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from itertools import batched
 from typing import TYPE_CHECKING, Final
-from urllib.parse import urlsplit
-
-from pydantic import HttpUrl
 
 from linking_engine.models import GraphLoadReport, Link, Page
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
-
     from linking_engine.graph.repo import GraphRepo
     from linking_engine.ingest.mongo_repo import MongoRepo
 
 LOAD_BATCH: Final = 500
-
-
-def canonical_key(url: str) -> str:
-    """Scheme, www. and trailing slash are ignored when matching link targets to pages."""
-    parts = urlsplit(url)
-    host = (parts.hostname or "").removeprefix("www.")
-    port = f":{parts.port}" if parts.port else ""
-    path = parts.path.rstrip("/") or "/"
-    query = f"?{parts.query}" if parts.query else ""
-    return f"{host}{port}{path}{query}"
-
-
-class TargetResolver:
-    """Maps a link target to a crawled page url, or to one placeholder url per canonical key."""
-
-    def __init__(self, crawled: Iterable[str]) -> None:
-        self._crawled = set(crawled)
-        self._canonical: dict[str, str] = {}
-        for url in sorted(self._crawled):
-            self._canonical.setdefault(canonical_key(url), url)
-        self._placeholders: dict[str, str] = {}
-
-    def resolve(self, url: str) -> tuple[str, bool]:
-        """Returns (url to link to, is_placeholder)."""
-        if url in self._crawled:
-            return url, False
-        key = canonical_key(url)
-        if key in self._canonical:
-            return self._canonical[key], False
-        return self._placeholders.setdefault(key, url), True
 
 
 async def load_tenant_graph(
@@ -70,9 +35,10 @@ async def load_tenant_graph(
                 for summary in summaries
             ],
         )
-        crawled.extend(str(summary.url) for summary in summaries)
+        crawled.extend(summary.url for summary in summaries)
 
-    resolver = TargetResolver(crawled)
+    # Urls are normalised keys, so a link target either is a crawled page or becomes a placeholder.
+    known = set(crawled)
     placeholders: set[str] = set()
     links = external = self_links = deleted = 0
     for sources in batched(crawled, batch_size):
@@ -82,17 +48,17 @@ async def load_tenant_graph(
             if not record.is_internal:
                 external += 1
                 continue
-            target, is_placeholder = resolver.resolve(str(record.target_url))
-            if target == str(record.source_url):
+            target = record.target_url
+            if target == record.source_url:
                 self_links += 1
                 continue
-            if is_placeholder and target not in placeholders:
+            if target not in known and target not in placeholders:
                 placeholders.add(target)
                 new_placeholders.append(target)
             batch.append(
                 Link(
                     source_url=record.source_url,
-                    target_url=HttpUrl(target),
+                    target_url=target,
                     position=record.position,
                     anchor_text=record.anchor_text,
                     surrounding_text=record.surrounding_text,

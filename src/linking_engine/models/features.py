@@ -9,9 +9,10 @@ source != target AND NOT already linked``, and everything here is a signal the
 ranker weighs afterwards.
 """
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field
 
 from linking_engine.models.enums import LifecycleStage
+from linking_engine.urls import UrlKey
 
 
 class PairFeatures(BaseModel):
@@ -26,8 +27,8 @@ class PairFeatures(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     # ── identity ────────────────────────────────────────────────────────────
-    source_url: HttpUrl
-    target_url: HttpUrl
+    source_url: UrlKey
+    target_url: UrlKey
 
     # ── GSC ─────────────────────────────────────────────────────────────────
     # Impressions are log-scaled: the raw distribution spans several orders of

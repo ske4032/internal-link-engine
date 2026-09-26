@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
-from pydantic import HttpUrl
 from pymongo import AsyncMongoClient
 
 from linking_engine.errors import DatabaseAuthError, DatabaseReadError, DatabaseUnavailableError
@@ -11,7 +10,7 @@ from linking_engine.ingest.markdown_clean import body_hash
 from linking_engine.ingest.mongo_repo import INDEXES, CrawlSource, MongoRepo
 from linking_engine.models import Heading, LinkRecord, PageRecord
 
-BASE = "https://example.com"
+BASE = "example.com"
 SCRAPED = datetime(2026, 9, 19, 15, 40, 30, tzinfo=UTC)
 
 
@@ -34,6 +33,7 @@ def record(path: str, links: int = 0, **fields: object) -> PageRecord:
         "content_hash": "abc",
         "scraped_at": SCRAPED,
         "source": "crawl.pages_v2",
+        "crawl_url": url(path),
     }
     data.update(fields)
     data.setdefault("body_hash", body_hash(str(data["body_text"])))
@@ -42,9 +42,9 @@ def record(path: str, links: int = 0, **fields: object) -> PageRecord:
 
 def link_record(source: str, position: int, target: str, *, internal: bool = True) -> LinkRecord:
     return LinkRecord(
-        source_url=HttpUrl(url(source)),
+        source_url=str(url(source)),
         position=position,
-        target_url=HttpUrl(url(target) if internal else f"https://other.test{target}"),
+        target_url=str(url(target) if internal else f"https://other.test{target}"),
         anchor_text=f"anchor {position}",
         surrounding_text="around the anchor",
         is_internal=internal,
@@ -230,7 +230,7 @@ async def test_crawl_source_reads_the_crawler_shape(mongo_uri: str) -> None:
     await client["crawl_test"]["pages_v2"].insert_many(
         [
             {
-                "url": url(f"/c{i}"),
+                "url": f"https://{BASE}/c{i}",
                 "title": "T",
                 "description": "D",
                 "content": "# Hello",
@@ -238,7 +238,7 @@ async def test_crawl_source_reads_the_crawler_shape(mongo_uri: str) -> None:
                 "usable": True,
                 "contentHash": "h",
                 "scrapedAt": "2026-09-19T15:40:30+00:00",
-                "internalLinks": [url("/")],
+                "internalLinks": [f"https://{BASE}/"],
                 "source": "example.com",
             }
             for i in range(3)
@@ -247,6 +247,6 @@ async def test_crawl_source_reads_the_crawler_shape(mongo_uri: str) -> None:
     await client.close()
     async with await CrawlSource.connect(mongo_uri, "crawl_test", "pages_v2") as source:
         pages = [p async for batch in source.iter_pages(batch_size=2) for p in batch]
-    assert [str(p.url) for p in pages] == [url(f"/c{i}") for i in range(3)]
+    assert [str(p.url) for p in pages] == [f"https://{BASE}/c{i}" for i in range(3)]
     assert pages[0].scraped_at == datetime(2026, 9, 19, 15, 40, 30, tzinfo=UTC)
     assert pages[0].content == "# Hello"

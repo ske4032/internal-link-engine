@@ -4,18 +4,17 @@ Field names are the snake_case form of the Neo4j property names in the Data
 Model. Every model is frozen and forbids extra fields, so a renamed property
 fails at the boundary instead of silently dropping data.
 
-Urls are :class:`~pydantic.HttpUrl`, which normalises on construction - ``/foo``
-and ``/foo/`` remain distinct urls and normalisation is not reversible. Canonical
-form is decided by the crawler before a `Page` is built; nothing here rewrites a
-url after the fact.
+Urls are normalised keys (see :func:`linking_engine.urls.normalise_url`): no
+scheme, www, query or trailing slash, so one page has one identity across tenants.
 """
 
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field
 
 from linking_engine.models.enums import ActionType, AnchorType, IssueFlag, LifecycleStage, PageType
+from linking_engine.urls import UrlKey
 
 # Vectors are ``tuple[float, ...]`` rather than ``list[float]``: these models are
 # frozen and therefore hashable, and a list field would raise on hash. The tuple
@@ -33,7 +32,7 @@ class Page(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     # ── crawl ───────────────────────────────────────────────────────────────
-    url: HttpUrl
+    url: UrlKey
     is_placeholder: bool = False
     status_code: int | None = Field(default=None, ge=100, le=599)
     content_hash: str | None = None
@@ -101,8 +100,8 @@ class Link(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    source_url: HttpUrl
-    target_url: HttpUrl
+    source_url: UrlKey
+    target_url: UrlKey
     # Ordinal in the source body; (source, position) identifies the edge.
     position: int = Field(ge=0)
     anchor_text: str

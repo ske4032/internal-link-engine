@@ -17,6 +17,7 @@ import os
 import re
 import statistics
 from collections import Counter
+from urllib.parse import urlsplit
 
 from linking_engine.ingest.markdown_clean import (
     body_hash,
@@ -26,7 +27,8 @@ from linking_engine.ingest.markdown_clean import (
     line_shares,
 )
 from linking_engine.ingest.mongo_repo import CrawlSource, MongoRepo
-from linking_engine.models import CrawlPage, Heading, LinkRecord, PageRecord
+from linking_engine.models import CleanedPage, CrawlPage, Heading, LinkRecord, PageRecord
+from linking_engine.urls import normalise_url
 
 # Anything that should never survive cleaning.
 RESIDUE = {
@@ -42,6 +44,12 @@ RESIDUE = {
 
 def pct(values: list[int], q: float) -> int:
     return sorted(values)[min(len(values) - 1, int(len(values) * q))]
+
+
+def _rank(doc: CrawlPage) -> tuple[bool, bool, int, str]:
+    """Which of several crawled urls with one key to keep: 200, then https, then shortest."""
+    url = str(doc.url)
+    return (doc.status_code != 200, urlsplit(url).scheme != "https", len(url), url)
 
 
 async def main() -> None:
@@ -125,22 +133,13 @@ async def main() -> None:
 
     links = [link for _, page in pages for link in page.links]
     internal = [link for link in links if link.is_internal]
-    crawled = {str(page.url) for _, page in pages}
-    crawled_loose = {u.rstrip("/").replace("http://", "https://") for u in crawled}
-    hits = sum(1 for link in internal if str(link.target_url) in crawled)
-    hits_loose = sum(
-        1
-        for link in internal
-        if str(link.target_url).rstrip("/").replace("http://", "https://") in crawled_loose
-    )
+    crawled = {normalise_url(str(page.url)) for _, page in pages}
+    hits = sum(1 for link in internal if normalise_url(str(link.target_url)) in crawled)
     print(
         f"\nlinks extracted: {len(links)} ({len(internal)} internal, {len(links) - len(internal)} external)"
     )
     if internal:
-        print(
-            f"  internal targets that are prepared pages: {hits / len(internal):.0%} exact, "
-            f"{hits_loose / len(internal):.0%} ignoring trailing slash and scheme"
-        )
+        print(f"  internal targets that are prepared pages: {hits / len(internal):.0%}")
 
     before = [len(doc.content or "") for doc, _ in pages]
     after = [len(page.body_text) for _, page in pages]
@@ -186,13 +185,30 @@ async def main() -> None:
     if not args.write:
         print("\ndry run: nothing written")
         return
-    records: list[PageRecord] = []
-    link_records: list[LinkRecord] = []
+    chosen: dict[str, tuple[CrawlPage, CleanedPage]] = {}
+    merged: list[str] = []
     for doc in docs:
         page = clean_page(doc.content or "", str(doc.url), title=doc.title, boilerplate=boilerplate)
+        key = normalise_url(str(doc.url))
+        current = chosen.get(key)
+        if current is None or _rank(doc) < _rank(current[0]):
+            if current is not None:
+                merged.append(str(current[0].url))
+            chosen[key] = (doc, page)
+        else:
+            merged.append(str(doc.url))
+    if merged:
+        print(
+            f"\n{len(merged)} crawled urls share a normalised key with a kept page, e.g. {merged[:5]}"
+        )
+
+    records: list[PageRecord] = []
+    link_records: list[LinkRecord] = []
+    for key, (doc, page) in chosen.items():
         records.append(
             PageRecord(
-                url=page.url,
+                url=key,
+                crawl_url=str(doc.url),
                 status_code=doc.status_code,
                 usable=doc.usable,
                 meta_title=page.title,
@@ -210,9 +226,9 @@ async def main() -> None:
         )
         link_records.extend(
             LinkRecord(
-                source_url=page.url,
+                source_url=key,
                 position=position,
-                target_url=link.target_url,
+                target_url=str(link.target_url),
                 anchor_text=link.anchor_text,
                 surrounding_text=link.surrounding_text,
                 is_internal=link.is_internal,
