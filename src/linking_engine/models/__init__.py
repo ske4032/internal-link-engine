@@ -11,7 +11,16 @@ not fetch it, compute it, or log it.
 """
 
 from linking_engine.models.audit import LinkAuditResult
-from linking_engine.models.corpus import CleanedPage, ExtractedLink
+from linking_engine.models.corpus import (
+    CleanedPage,
+    CrawlPage,
+    ExtractedLink,
+    GraphLoadReport,
+    Heading,
+    LinkRecord,
+    PageRecord,
+    PageSummary,
+)
 from linking_engine.models.enums import (
     ActionType,
     AnchorType,
@@ -23,7 +32,7 @@ from linking_engine.models.enums import (
     RecommendationStatus,
 )
 from linking_engine.models.features import PairFeatures
-from linking_engine.models.page import Keyword, Link, Page
+from linking_engine.models.page import Keyword, Link, Page, TenantGraphCounts
 from linking_engine.models.recommendation import AnchorCandidate, Recommendation
 from linking_engine.models.tenant import AnchorTypeProfile, TenantConfig
 
@@ -34,17 +43,24 @@ __all__ = [
     "AnchorTypeProfile",
     "CleanedPage",
     "ContentGapFinding",
+    "CrawlPage",
     "ExtractedLink",
+    "GraphLoadReport",
+    "Heading",
     "IssueFlag",
     "Keyword",
     "KeywordSource",
     "LifecycleStage",
     "Link",
     "LinkAuditResult",
+    "LinkRecord",
     "Page",
+    "PageRecord",
+    "PageSummary",
     "PageType",
     "PairFeatures",
     "Recommendation",
     "RecommendationStatus",
     "TenantConfig",
+    "TenantGraphCounts",
 ]

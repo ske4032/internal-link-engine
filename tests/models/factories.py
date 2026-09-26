@@ -80,7 +80,9 @@ PAGE_KWARGS: dict[str, object] = {
     "url": SOURCE_URL,
     "page_type": PageType.ARTICLE,
     "is_indexable": True,
-    "http_status": 200,
+    "status_code": 200,
+    "is_placeholder": False,
+    "content_hash": "ab" * 32,
     "word_count": 1450,
     "crawl_depth": 2,
     "language": "en",
@@ -111,6 +113,7 @@ KEYWORD_KWARGS: dict[str, object] = {
 LINK_KWARGS: dict[str, object] = {
     "source_url": SOURCE_URL,
     "target_url": TARGET_URL,
+    "position": 0,
     "anchor_text": "trail running shoes",
     "anchor_type": AnchorType.PARTIAL,
     # Body links only (ADR-004): "body" is the only value that can reach the model.
@@ -119,7 +122,7 @@ LINK_KWARGS: dict[str, object] = {
     "is_follow": True,
     "surrounding_text": "A good pair of trail running shoes matters more than the route.",
     "surrounding_embedding": VECTOR,
-    "target_http_status": 200,
+    "target_status_code": 200,
 }
 
 AUDIT_KWARGS: dict[str, object] = {

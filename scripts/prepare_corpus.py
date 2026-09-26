@@ -5,33 +5,18 @@ Dry run by default: reports what cleaning produces and writes nothing.
     uv run --env-file .env python scripts/prepare_corpus.py
     uv run --env-file .env python scripts/prepare_corpus.py --tenant action1 --write
 
-The source database is read-only: it is only ever queried with ``find``, and the
-script refuses to run if source and target are the same database.
-
-With ``--write`` two collections in the project database are upserted, keyed so
-re-runs converge (ADR-013):
-
-* ``pages``, one per source page, keyed ``(tenantId, url)``: status and usable
-  flag as crawled, meta title, meta description, h1, heading outline, clean
-  body text, word count, link count, content hash, scrape time.
-* ``links``, one per body link, keyed ``(tenantId, sourceUrl, position)``:
-  target url, anchor text, surrounding sentence, internal flag. Positions past a
-  page's current link count are deleted, so a page that lost links converges.
-
-Every source page is written; downstream stages use ``statusCode`` and
-``usable`` to decide what to embed.
+The source is read through CrawlSource, which has no write methods. With
+--write, pages and links are upserted into MONGO_DB under --tenant.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import re
 import statistics
 from collections import Counter
-from datetime import UTC, datetime
-
-from pymongo import DeleteMany, MongoClient, UpdateOne
 
 from linking_engine.ingest.markdown_clean import (
     clean_meta,
@@ -39,6 +24,8 @@ from linking_engine.ingest.markdown_clean import (
     find_boilerplate,
     line_shares,
 )
+from linking_engine.ingest.mongo_repo import CrawlSource, MongoRepo
+from linking_engine.models import CrawlPage, Heading, LinkRecord, PageRecord
 
 # Anything that should never survive cleaning.
 RESIDUE = {
@@ -56,7 +43,7 @@ def pct(values: list[int], q: float) -> int:
     return sorted(values)[min(len(values) - 1, int(len(values) * q))]
 
 
-def main() -> None:
+async def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -73,45 +60,31 @@ def main() -> None:
     if args.source_db == os.environ["MONGO_DB"]:
         ap.error("source and target database must differ: the source is read-only")
 
-    client = MongoClient(os.environ["MONGO_URI"])
-    source = client[args.source_db][args.source_collection]
-    docs = list(
-        source.find(
-            {},
-            {
-                "url": 1,
-                "title": 1,
-                "description": 1,
-                "content": 1,
-                "statusCode": 1,
-                "usable": 1,
-                "contentHash": 1,
-                "scrapedAt": 1,
-            },
-        )
-    )
+    uri = os.environ["MONGO_URI"]
+    async with await CrawlSource.connect(uri, args.source_db, args.source_collection) as source:
+        docs: list[CrawlPage] = [doc async for batch in source.iter_pages() for doc in batch]
     skipped: Counter[str] = Counter()
-    keep = []
+    keep: list[CrawlPage] = []
     for doc in docs:
-        if doc.get("statusCode") != 200:
-            skipped[f"status {doc.get('statusCode')}"] += 1
-        elif not doc.get("usable"):
+        if doc.status_code != 200:
+            skipped[f"status {doc.status_code}"] += 1
+        elif not doc.usable:
             skipped["not usable"] += 1
-        elif not doc.get("content"):
+        elif not doc.content:
             skipped["no content"] += 1
         else:
             keep.append(doc)
 
-    shares = line_shares(doc["content"] for doc in keep)
+    shares = line_shares(doc.content or "" for doc in keep)
     boilerplate = find_boilerplate(
-        (doc["content"] for doc in keep),
+        (doc.content or "" for doc in keep),
         min_share=args.boilerplate_share,
         nav_min_share=args.nav_share,
     )
     pages = [
         (
             doc,
-            clean_page(doc["content"], doc["url"], title=doc.get("title"), boilerplate=boilerplate),
+            clean_page(doc.content or "", str(doc.url), title=doc.title, boilerplate=boilerplate),
         )
         for doc in keep
     ]
@@ -168,7 +141,7 @@ def main() -> None:
             f"{hits_loose / len(internal):.0%} ignoring trailing slash and scheme"
         )
 
-    before = [len(doc["content"]) for doc, _ in pages]
+    before = [len(doc.content or "") for doc, _ in pages]
     after = [len(page.body_text) for _, page in pages]
     print(
         f"\ncharacters per page  before: median {statistics.median(before):,.0f}, "
@@ -199,10 +172,10 @@ def main() -> None:
     for kind, n in residue.most_common():
         print(f"  {kind:20} {n:4} pages  e.g. ...{example[kind]!r}...")
 
-    sample = next((p for d, p in pages if d["url"] == args.sample), None) if args.sample else None
+    sample = next((p for d, p in pages if str(d.url) == args.sample), None) if args.sample else None
     if sample is None:
         sample = sorted(pages, key=lambda dp: len(dp[1].body_text))[len(pages) // 2][1]
-    raw = next(doc["content"] for doc, page in pages if page is sample)
+    raw = next(doc.content or "" for doc, page in pages if page is sample)
     print(f"\nsample {sample.url}  (h1: {sample.h1!r})")
     print("---- before (first 500 chars) ----")
     print(raw[:500])
@@ -212,88 +185,48 @@ def main() -> None:
     if not args.write:
         print("\ndry run: nothing written")
         return
-    db = client[os.environ["MONGO_DB"]]
-    now = datetime.now(UTC)
-    source_name = f"{args.source_db}.{args.source_collection}"
-    written = [
-        (
-            doc,
-            clean_page(
-                doc.get("content") or "",
-                doc["url"],
-                title=doc.get("title"),
-                boilerplate=boilerplate,
-            ),
-        )
-        for doc in docs
-    ]
-    page_ops = []
-    link_ops: list[UpdateOne | DeleteMany] = []
-    for doc, page in written:
-        url = str(page.url)
-        description = clean_meta(doc.get("description"))
-        page_ops.append(
-            UpdateOne(
-                {"tenantId": args.tenant, "url": url},
-                {
-                    "$set": {
-                        "tenantId": args.tenant,
-                        "url": url,
-                        "statusCode": doc.get("statusCode"),
-                        "usable": doc.get("usable"),
-                        "metaTitle": page.title,
-                        "metaDescription": description,
-                        "h1": page.h1,
-                        "headings": [{"level": lvl, "text": txt} for lvl, txt in page.headings],
-                        "bodyText": page.body_text,
-                        "wordCount": len(page.body_text.split()),
-                        "linkCount": len(page.links),
-                        "contentHash": doc.get("contentHash"),
-                        "scrapedAt": doc.get("scrapedAt"),
-                        "source": source_name,
-                        "preparedAt": now,
-                    }
-                },
-                upsert=True,
+    records: list[PageRecord] = []
+    link_records: list[LinkRecord] = []
+    for doc in docs:
+        page = clean_page(doc.content or "", str(doc.url), title=doc.title, boilerplate=boilerplate)
+        records.append(
+            PageRecord(
+                url=page.url,
+                status_code=doc.status_code,
+                usable=doc.usable,
+                meta_title=page.title,
+                meta_description=clean_meta(doc.description),
+                h1=page.h1,
+                headings=tuple(Heading(level=lvl, text=txt) for lvl, txt in page.headings),
+                body_text=page.body_text,
+                word_count=len(page.body_text.split()),
+                link_count=len(page.links),
+                content_hash=doc.content_hash,
+                scraped_at=doc.scraped_at,
+                source=f"{args.source_db}.{args.source_collection}",
             )
         )
-        for position, link in enumerate(page.links):
-            link_ops.append(
-                UpdateOne(
-                    {"tenantId": args.tenant, "sourceUrl": url, "position": position},
-                    {
-                        "$set": {
-                            "tenantId": args.tenant,
-                            "sourceUrl": url,
-                            "position": position,
-                            "targetUrl": str(link.target_url),
-                            "anchorText": link.anchor_text,
-                            "surroundingText": link.surrounding_text,
-                            "isInternal": link.is_internal,
-                            "preparedAt": now,
-                        }
-                    },
-                    upsert=True,
-                )
+        link_records.extend(
+            LinkRecord(
+                source_url=page.url,
+                position=position,
+                target_url=link.target_url,
+                anchor_text=link.anchor_text,
+                surrounding_text=link.surrounding_text,
+                is_internal=link.is_internal,
             )
-        link_ops.append(
-            DeleteMany(
-                {
-                    "tenantId": args.tenant,
-                    "sourceUrl": url,
-                    "position": {"$gte": len(page.links)},
-                }
-            )
+            for position, link in enumerate(page.links)
         )
-    pages_result = db["pages"].bulk_write(page_ops, ordered=False)
-    links_result = db["links"].bulk_write(link_ops, ordered=False)
+    async with await MongoRepo.connect(uri, os.environ["MONGO_DB"]) as repo:
+        await repo.ensure_indexes()
+        written_pages, written_links, deleted = await repo.write_pages(
+            args.tenant, records, link_records
+        )
     print(
-        f"\nwritten to {os.environ['MONGO_DB']} under tenant {args.tenant!r}:\n"
-        f"  pages: {pages_result.upserted_count} inserted, {pages_result.modified_count} updated\n"
-        f"  links: {links_result.upserted_count} inserted, {links_result.modified_count} updated, "
-        f"{links_result.deleted_count} stale deleted"
+        f"\nwritten to {os.environ['MONGO_DB']} under tenant {args.tenant!r}: "
+        f"{written_pages} pages, {written_links} links, {deleted} stale links deleted"
     )
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
