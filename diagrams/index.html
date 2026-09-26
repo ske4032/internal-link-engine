@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Internal linking engine — diagrams</title>
+<style>
+  :root{
+    --bg:#fbfaf8; --panel:#fff; --ink:#16150f; --muted:#6a675c;
+    --line:#e3e0d8; --accent:#1c6b4a; --shadow:0 1px 2px rgba(20,18,10,.04),0 8px 24px rgba(20,18,10,.06);
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --bg:#131311; --panel:#1b1b18; --ink:#eceae3; --muted:#9a968a;
+      --line:#2c2c27; --accent:#5fc493; --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#131311; --panel:#1b1b18; --ink:#eceae3; --muted:#9a968a;
+    --line:#2c2c27; --accent:#5fc493; --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.35);
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font:16px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:760px; margin:0 auto; padding:64px 24px 88px}
+  header{margin-bottom:48px}
+  .eyebrow{
+    font-size:12px; letter-spacing:.09em; text-transform:uppercase;
+    color:var(--muted); margin:0 0 14px; font-weight:600;
+  }
+  h1{
+    font-size:clamp(28px,5vw,40px); line-height:1.15; margin:0 0 16px;
+    letter-spacing:-.02em; font-weight:600;
+  }
+  .lede{margin:0; color:var(--muted); font-size:17px; max-width:56ch}
+  .grid{display:grid; gap:14px; margin:0; padding:0; list-style:none}
+  a.card{
+    display:block; padding:22px 24px; background:var(--panel);
+    border:1px solid var(--line); border-radius:12px; text-decoration:none;
+    color:inherit; box-shadow:var(--shadow);
+    transition:transform .14s ease, border-color .14s ease;
+  }
+  a.card:hover{transform:translateY(-2px); border-color:var(--accent)}
+  a.card:focus-visible{outline:2px solid var(--accent); outline-offset:3px}
+  .card h2{
+    margin:0 0 7px; font-size:18px; font-weight:600; letter-spacing:-.01em;
+    display:flex; align-items:baseline; gap:10px; flex-wrap:wrap;
+  }
+  .card h2 .arrow{color:var(--accent); font-weight:400}
+  .card p{margin:0; color:var(--muted); font-size:14.5px; line-height:1.55}
+  .tag{
+    display:inline-block; margin-top:12px; font-size:11.5px; letter-spacing:.05em;
+    text-transform:uppercase; color:var(--muted); font-weight:600;
+    border:1px solid var(--line); border-radius:99px; padding:3px 10px;
+  }
+  footer{
+    margin-top:44px; padding-top:22px; border-top:1px solid var(--line);
+    color:var(--muted); font-size:14px;
+  }
+  footer a{color:var(--accent)}
+  .note{margin:34px 0 0; font-size:14px; color:var(--muted)}
+  code{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px;
+    background:var(--panel); border:1px solid var(--line); border-radius:5px; padding:1.5px 5px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <p class="eyebrow">SEO internal linking engine</p>
+    <h1>Diagrams</h1>
+    <p class="lede">
+      Four walkthroughs of the same system at different altitudes — from why it
+      exists down to every model it passes through.
+    </p>
+  </header>
+
+  <ul class="grid">
+    <li><a class="card" href="linking-engine-pitch.html">
+      <h2>The case for it <span class="arrow">&rarr;</span></h2>
+      <p>Every page you publish is a link waiting to be made. Most sites have
+         hundreds of internal links pointing to the wrong place, saying nothing
+         useful, or never made at all.</p>
+      <span class="tag">Non-technical</span>
+    </a></li>
+
+    <li><a class="card" href="linking-engine-tech.html">
+      <h2>Technical walkthrough <span class="arrow">&rarr;</span></h2>
+      <p>A graph and learning-to-rank system that audits a site's existing
+         internal links and discovers the ones it's missing. Eleven stages,
+         three trained models — what each computes and what to expect from it.</p>
+      <span class="tag">Architecture</span>
+    </a></li>
+
+    <li><a class="card" href="ml-stack.html">
+      <h2>Nine models deep <span class="arrow">&rarr;</span></h2>
+      <p>Text goes in at the surface. Eight transformations later a number comes
+         out that says which link to make. Every layer, in the order it's passed
+         through.</p>
+      <span class="tag">ML stack</span>
+    </a></li>
+
+    <li><a class="card" href="pipeline-walkthrough.html">
+      <h2>From vector to recommendation <span class="arrow">&rarr;</span></h2>
+      <p>The pipeline end to end: how an embedding becomes a ranked, anchored
+         link recommendation with a verdict attached.</p>
+      <span class="tag">Pipeline</span>
+    </a></li>
+  </ul>
+
+  <p class="note">
+    Two further diagrams ship as React source and need a build step to view:
+    <code>architecture-diagram.jsx</code> and <code>system-design.jsx</code>.
+  </p>
+
+  <footer>
+    <a href="https://github.com/ske4032/internal-link-engine">Repository</a> &middot;
+    <a href="https://github.com/ske4032/internal-link-engine/wiki">Wiki</a> &middot;
+    <a href="https://github.com/ske4032/internal-link-engine/issues">Build plan</a>
+  </footer>
+</div>
+</body>
+</html>
