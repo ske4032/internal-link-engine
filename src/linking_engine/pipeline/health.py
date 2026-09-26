@@ -38,12 +38,12 @@ async def check_service_versions(
     mlflow_uri: str,
     mlflow_auth: tuple[str, str] | None,
     *,
-    timeout: float = 10.0,
+    http_timeout_s: float = 10.0,
 ) -> dict[str, tuple[str, str]]:
     """Returns {service: (client, server)}; raises ServiceError on mismatch or failure."""
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=http_timeout_s) as client:
         prefect = await _get(client, f"{prefect_api_url.rstrip('/')}/admin/version")
-    async with httpx.AsyncClient(timeout=timeout, auth=mlflow_auth) as client:
+    async with httpx.AsyncClient(timeout=http_timeout_s, auth=mlflow_auth) as client:
         mlflow = await _get(client, f"{mlflow_uri.rstrip('/')}/version")
     found = {
         "prefect": (version("prefect"), prefect.strip().strip('"')),

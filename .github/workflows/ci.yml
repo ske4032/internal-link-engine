@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"   # weekly: full-history gitleaks, fresh pip-audit advisories
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -17,6 +20,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # gitleaks needs history; PRs scan their commits, schedule/dispatch scan all
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -47,7 +52,7 @@ jobs:
         run: uv run ruff format --check
 
       - name: mypy --strict
-        run: uv run mypy --strict src/
+        run: uv run mypy --strict src/ scripts/
 
       - name: deptry
         run: uv run deptry src/
@@ -57,3 +62,16 @@ jobs:
 
       - name: pytest
         run: uv run pytest
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: pip-audit
+        # GHSA-8mgp-746c-j5xp: nltk model save/load path bypass, no fix released. We only use
+        # SnowballStemmer, which is not affected. Remove the ignore once nltk ships a fix.
+        run: |
+          uv export --frozen --format requirements-txt --no-emit-project -o requirements-audit.txt
+          uvx --from "pip-audit==2.9.0" pip-audit -r requirements-audit.txt --disable-pip \
+            --progress-spinner off --ignore-vuln GHSA-8mgp-746c-j5xp

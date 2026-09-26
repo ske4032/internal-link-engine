@@ -35,5 +35,5 @@ def test_newer_client_minor_raises() -> None:
 async def test_unreachable_service_raises() -> None:
     with pytest.raises(ServiceError, match="cannot reach"):
         await check_service_versions(
-            "http://127.0.0.1:1/api", "http://127.0.0.1:1", None, timeout=1
+            "http://127.0.0.1:1/api", "http://127.0.0.1:1", None, http_timeout_s=1
         )

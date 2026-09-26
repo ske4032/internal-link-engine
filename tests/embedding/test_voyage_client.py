@@ -207,7 +207,8 @@ async def test_order_is_preserved_across_batches() -> None:
         assert e["api_tokens"] == e["tokens"] + API_TOKEN_DRIFT, (
             "api_tokens must be the SDK's count"
         )
-        assert isinstance(e["latency_ms"], int | float) and e["latency_ms"] >= 0
+        assert isinstance(e["latency_ms"], int | float)
+        assert e["latency_ms"] >= 0
         assert e["truncated"] == 0
 
 
@@ -375,7 +376,8 @@ async def test_rejected_status_fails_once_with_status_and_type(
     expected = EmbeddingAuthError if status in (401, 403) else EmbeddingRequestError
     assert type(exc) is expected, f"HTTP {status} should raise {expected.__name__}, got {exc!r}"
     assert (exc.status_code, exc.error_type) == (status, cls.__name__)
-    assert f"HTTP {status}" in message and cls.__name__ in message, message
+    assert f"HTTP {status}" in message, message
+    assert cls.__name__ in message, message
     assert message.endswith(f": HTTP {status} {cls.__name__}: {detail}"), message
     assert "retries exhausted" not in message, message
     assert REQUEST_ID not in message, f"request-id prefix leaked: {message}"
@@ -416,7 +418,8 @@ async def test_unclassified_sdk_error_is_not_retried() -> None:
     assert len(fake.calls) == 1
     assert (exc.status_code, exc.error_type) == (None, "APIError")
     assert str(exc).endswith(": APIError: Invalid response object from API"), str(exc)
-    assert "HTTP" not in str(exc) and "retries exhausted" not in str(exc), str(exc)
+    assert "HTTP" not in str(exc), str(exc)
+    assert "retries exhausted" not in str(exc), str(exc)
     assert exc.__cause__ is error
 
 
@@ -558,7 +561,7 @@ def test_default_sdk_deadline_sits_above_the_client_deadline(
 
 @pytest.mark.parametrize(("model", "dimension"), [(" ", DIMENSION), (MODEL, 0)])
 def test_client_rejects_blank_model_or_non_positive_dimension(model: str, dimension: int) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="must be"):
         voyage_client.VoyageClient(
             settings(),
             model=model,
