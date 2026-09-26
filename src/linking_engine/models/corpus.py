@@ -10,6 +10,8 @@ from datetime import datetime
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, HttpUrl
 
+from linking_engine.urls import UrlKey
+
 
 class ExtractedLink(BaseModel):
     """One link found in a page body, before any anchor classification."""
@@ -59,7 +61,9 @@ class PageRecord(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    url: HttpUrl
+    url: UrlKey
+    # The url as crawled, before normalisation.
+    crawl_url: str = Field(min_length=1)
     status_code: int | None = Field(ge=100, le=599)
     usable: bool | None
     meta_title: str | None
@@ -95,7 +99,7 @@ class PageSummary(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    url: HttpUrl
+    url: UrlKey
     status_code: int | None = Field(ge=100, le=599)
     word_count: int = Field(ge=0)
     content_hash: str | None
@@ -107,9 +111,9 @@ class LinkRecord(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    source_url: HttpUrl
+    source_url: UrlKey
     position: int = Field(ge=0)
-    target_url: HttpUrl
+    target_url: UrlKey
     anchor_text: str = Field(min_length=1)
     surrounding_text: str
     is_internal: bool

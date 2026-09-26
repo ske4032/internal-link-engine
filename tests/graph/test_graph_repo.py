@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-from pydantic import HttpUrl
 
 from linking_engine.errors import (
     DatabaseAuthError,
@@ -20,7 +19,7 @@ from linking_engine.graph.repo import (
 )
 from linking_engine.models import ActionType, IssueFlag, Link, Page, TenantGraphCounts
 
-BASE = "https://example.com"
+BASE = "example.com"
 
 
 def page(path: str, **fields: object) -> Page:
@@ -31,8 +30,8 @@ def page(path: str, **fields: object) -> Page:
 
 def link(source: str, target: str, position: int, anchor: str = "anchor") -> Link:
     return Link(
-        source_url=HttpUrl(f"{BASE}{source}"),
-        target_url=HttpUrl(f"{BASE}{target}"),
+        source_url=str(f"{BASE}{source}"),
+        target_url=str(f"{BASE}{target}"),
         position=position,
         anchor_text=anchor,
         surrounding_text=f"text with {anchor}",
@@ -115,9 +114,9 @@ async def test_schema_after_migration(graph: GraphRepo) -> None:
 @pytest.mark.integration
 async def test_legacy_status_properties_are_renamed(graph: GraphRepo, tenant: str) -> None:
     await graph._auto(
-        "CREATE (:Page {tenantId: $t, url: 'https://x.test/a', httpStatus: 200})"
+        "CREATE (:Page {tenantId: $t, url: 'x.test/a', httpStatus: 200})"
         "-[:LINKS_TO {position: 0, targetHttpStatus: 404}]->"
-        "(:Page {tenantId: $t, url: 'https://x.test/b'})",
+        "(:Page {tenantId: $t, url: 'x.test/b'})",
         t=tenant,
     )
     migration = next(m for m in load_migrations() if m.name == "003_status_code.cypher")
@@ -253,11 +252,9 @@ async def test_tenants_are_isolated(graph: GraphRepo, tenant: str) -> None:
 async def test_node_that_does_not_fit_the_model_raises_read_error(
     graph: GraphRepo, tenant: str
 ) -> None:
-    await graph._auto(
-        "CREATE (:Page {tenantId: $t, url: 'https://x.test/a', statusCode: 42})", t=tenant
-    )
+    await graph._auto("CREATE (:Page {tenantId: $t, url: 'x.test/a', statusCode: 42})", t=tenant)
     with pytest.raises(DatabaseReadError, match="does not fit the Page model"):
-        await graph.get_pages(tenant, ["https://x.test/a"])
+        await graph.get_pages(tenant, ["x.test/a"])
 
 
 @pytest.mark.integration

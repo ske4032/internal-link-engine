@@ -4,9 +4,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
-from pydantic import HttpUrl
 
-from linking_engine.ingest.graph_load import TargetResolver, canonical_key, load_tenant_graph
+from linking_engine.ingest.graph_load import load_tenant_graph
 from linking_engine.ingest.markdown_clean import body_hash
 from linking_engine.models import (
     EmbeddingSelection,
@@ -21,38 +20,13 @@ if TYPE_CHECKING:
     from linking_engine.graph.repo import GraphRepo
     from linking_engine.ingest.mongo_repo import MongoRepo
 
-BASE = "https://www.example.com"
-
-
-@pytest.mark.parametrize(
-    ("url", "key"),
-    [
-        ("https://www.example.com/a/", "example.com/a"),
-        ("http://example.com/a", "example.com/a"),
-        ("https://example.com/", "example.com/"),
-        ("https://example.com", "example.com/"),
-        ("https://example.com:8443/a?x=1", "example.com:8443/a?x=1"),
-    ],
-)
-def test_canonical_key(url: str, key: str) -> None:
-    assert canonical_key(url) == key
-
-
-def test_resolver_prefers_exact_then_canonical_then_one_placeholder_per_key() -> None:
-    resolver = TargetResolver(["https://www.example.com/a/", "https://www.example.com/b"])
-    assert resolver.resolve("https://www.example.com/a/") == ("https://www.example.com/a/", False)
-    assert resolver.resolve("http://example.com/a") == ("https://www.example.com/a/", False)
-    assert resolver.resolve("https://www.example.com/b/") == ("https://www.example.com/b", False)
-    assert resolver.resolve("https://www.example.com/new/") == (
-        "https://www.example.com/new/",
-        True,
-    )
-    assert resolver.resolve("https://example.com/new") == ("https://www.example.com/new/", True)
+BASE = "example.com"
 
 
 def page(path: str, links: int, body: str = "text") -> PageRecord:
     return PageRecord(
-        url=HttpUrl(f"{BASE}{path}"),
+        url=f"{BASE}{path}",
+        crawl_url=f"{BASE}{path}",
         status_code=200,
         usable=True,
         meta_title=None,
@@ -71,9 +45,9 @@ def page(path: str, links: int, body: str = "text") -> PageRecord:
 
 def link(source: str, position: int, target: str, *, internal: bool = True) -> LinkRecord:
     return LinkRecord(
-        source_url=HttpUrl(f"{BASE}{source}"),
+        source_url=str(f"{BASE}{source}"),
         position=position,
-        target_url=HttpUrl(target if target.startswith("http") else f"{BASE}{target}"),
+        target_url=str(target if target.startswith("http") else f"{BASE}{target}"),
         anchor_text="anchor",
         surrounding_text="around",
         is_internal=internal,

@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, NoReturn
 
 import numpy as np
 import pytest
-from pydantic import HttpUrl
 from pymongo import AsyncMongoClient
 from structlog.testing import capture_logs
 from voyage_fakes import (
@@ -56,7 +55,7 @@ if TYPE_CHECKING:
     from linking_engine.ingest.mongo_repo import MongoRepo
     from linking_engine.models import PageEmbedding, PageText
 
-BASE = "https://example.com"
+BASE = "example.com"
 GHOST = f"{BASE}/ghost"
 DIM = 2048
 OTHER_MODEL = "voyage-3-large"
@@ -82,7 +81,8 @@ def record(
 ) -> PageRecord:
     text = body(i) if text is None else text
     return PageRecord(
-        url=HttpUrl(url(i)),
+        url=url(i),
+        crawl_url=url(i),
         status_code=status,
         usable=usable,
         meta_title=None,
@@ -209,9 +209,9 @@ async def seed_mixed(mongo: MongoRepo, graph: GraphRepo, tenant: str) -> None:
         *(record(i, status=code) for i, code in NON_2XX.items()),
     ]
     ghost_link = LinkRecord(
-        source_url=HttpUrl(url(0)),
+        source_url=str(url(0)),
         position=0,
-        target_url=HttpUrl(GHOST),
+        target_url=str(GHOST),
         anchor_text="ghost",
         surrounding_text="a link to a page never crawled",
         is_internal=True,
@@ -934,7 +934,7 @@ async def test_one_flush_with_every_skip_reason_reports_each_on_its_event(
     pages = [record(0), record(1, usable=False), record(2, ""), record(3), record(4)]
     await seed(mongo, graph, tenant, [*pages, record(6), record(7)])
     await graph.upsert_pages(
-        tenant, [Page(url=HttpUrl(url(5)), status_code=200, body_hash=body_hash(body(5)))]
+        tenant, [Page(url=str(url(5)), status_code=200, body_hash=body_hash(body(5)))]
     )
     await mongo.write_pages(tenant, [record(3, body(3, tag=1003))], [])
     fake = FakeVoyage(dimension=DIM)
@@ -1016,10 +1016,7 @@ async def test_graph_pages_missing_from_mongo_are_skipped_with_a_capped_sample(
     graph_only = list(range(10, 17))
     await graph.upsert_pages(
         tenant,
-        [
-            Page(url=HttpUrl(url(i)), status_code=200, body_hash=body_hash(body(i)))
-            for i in graph_only
-        ],
+        [Page(url=str(url(i)), status_code=200, body_hash=body_hash(body(i))) for i in graph_only],
     )
     with capture_logs() as logs:
         report = await embed_tenant(mongo, graph, client(FakeVoyage(dimension=DIM)), tenant)

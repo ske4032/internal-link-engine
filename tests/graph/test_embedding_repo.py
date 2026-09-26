@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
     import numpy.typing as npt
 
-BASE = "https://example.com"
+BASE = "example.com"
 MODEL = "voyage-4-large"
 OTHER_MODEL = "voyage-3-large"
 DIM = VECTOR_DIMENSIONS

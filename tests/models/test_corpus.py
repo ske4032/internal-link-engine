@@ -24,6 +24,7 @@ RECORD: dict[str, object] = {
     "body_hash": HASH,
     "scraped_at": None,
     "source": "test",
+    "crawl_url": "https://example.com/a",
 }
 SUMMARY: dict[str, object] = {
     "url": "https://example.com/a",
