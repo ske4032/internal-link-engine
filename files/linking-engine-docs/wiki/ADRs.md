@@ -561,3 +561,35 @@ that now exist outside the project; both stay out of scope until #30 and are
 rewritten when the roadmap reopens, not now. Deletion is reversible through git
 history; if a second developer or CI ever needs the full stack, the replacement
 mirrors the deployed topology rather than restoring the old file.
+
+---
+
+## ADR-015: One Neo4j instance, every node scoped by `tenantId`
+
+**Status:** Accepted (2026-09-26; supersedes "one Neo4j instance per tenant" in Decisions)
+
+**Context.** Real crawl data, the `action1` site's `pages_v2` collection, will sit
+beside the synthetic `demo` corpus. MongoDB is already tenant-scoped. Neo4j was
+not: the synthetic seeder wiped the whole graph, page URL uniqueness was global,
+and vector search and the graph algorithms spanned every page. The documented
+design was one Community instance per tenant; the alternative is one instance
+with a tenant key on every node.
+
+**Decision.** One Neo4j instance. Every node carries `tenantId`. Uniqueness is
+composite: `(tenantId, url)` for `Page`, `(tenantId, text, language)` for
+`Keyword`. Every repository read and write takes a tenant id and filters on it;
+the graph pulls behind PageRank, Leiden and betweenness are per tenant; no query
+may return or modify another tenant's nodes. Relationships are scoped through
+their endpoints. Deletion is per tenant, `MATCH (n {tenantId: $t}) DETACH DELETE n`,
+never a global wipe. The already-loaded synthetic corpus was stamped
+`tenantId = 'demo'` on 2026-09-26.
+
+**Consequences.** One driver and no per-tenant infrastructure, but isolation now
+rests on the repository layer rather than on separate processes, so the repo
+test suite must include a cross-tenant leak test. The shared vector index
+returns neighbours from every tenant, so retrieval (issue #12) must isolate: an
+exact per-tenant cosine scan, post-filtering with oversampling, or a per-tenant
+label with its own index. That choice belongs to #12. The legacy seeder's global
+`MATCH (n) DETACH DELETE n` must never run once a second tenant is loaded.
+Revisit if tenants grow large enough that shared heap, page cache or noisy
+neighbours matter; one instance per tenant remains the escape route.
