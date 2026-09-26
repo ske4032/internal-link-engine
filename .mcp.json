@@ -3,6 +3,10 @@
     "cxpak": {
       "command": "cxpak",
       "args": ["serve", "--mcp", "."]
+    },
+    "zvec_grep": {
+      "command": "zg",
+      "args": ["server", "--stdio"]
     }
   }
 }
