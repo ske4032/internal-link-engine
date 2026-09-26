@@ -1,4 +1,4 @@
-"""Persistence exceptions. Driver errors are translated into these; the original is __cause__."""
+"""Persistence and embedding exceptions. SDK errors are translated into these; the original is __cause__."""
 
 from typing import Literal
 
@@ -35,3 +35,30 @@ class SchemaError(DatabaseError):
 
 class ServiceError(Exception):
     """Prefect or MLflow is unreachable or incompatible."""
+
+
+class EmbeddingError(Exception):
+    """Base embedding error; status_code and error_type describe the provider failure."""
+
+    def __init__(
+        self, message: str, *, status_code: int | None = None, error_type: str | None = None
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_type = error_type or type(self).__name__
+
+
+class EmbeddingUnavailableError(EmbeddingError):
+    """Rate limited, server error, timeout or connection failure after retries."""
+
+
+class EmbeddingRequestError(EmbeddingError):
+    """Request rejected (bad input or credentials); never retried."""
+
+
+class EmbeddingAuthError(EmbeddingRequestError):
+    """Credentials rejected (HTTP 401 or 403)."""
+
+
+class EmbeddingResponseError(EmbeddingError):
+    """Wrong vector count or dimension, zero vector, or not unit norm."""
