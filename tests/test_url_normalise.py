@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from linking_engine.urls import host_of, normalise_url
+from linking_engine.urls import UrlRules, host_of, is_kept_param, normalise_url, url_rules
 
 
 @pytest.mark.parametrize(
@@ -63,3 +63,50 @@ def test_normalising_a_key_returns_it_unchanged() -> None:
 def test_host_of() -> None:
     assert host_of("example.com:8080/a/b") == "example.com:8080"
     assert host_of("example.com") == "example.com"
+
+
+@pytest.mark.parametrize(
+    ("url", "key"),
+    [
+        ("https://www.action1.com/blog?page=2", "action1.com/blog?page=2"),
+        ("https://www.action1.com/blog?page=1", "action1.com/blog"),
+        ("https://action1.com/blog/?page=0&utm_source=x", "action1.com/blog"),
+        ("https://example.com/news?utm_source=a&offset=20&sort=new", "example.com/news?offset=20"),
+        ("https://example.com/list?start=0", "example.com/list"),
+        ("https://example.com/list?page=abc", "example.com/list"),
+        ("https://www.action1.com/?page_id=31963", "action1.com?page_id=31963"),
+        ("https://example.com/post?p=0042&ref=x", "example.com/post?p=42"),
+        (
+            "https://example.com/shop?product_id=SKU-9&page=3",
+            "example.com/shop?page=3&product_id=sku-9",
+        ),
+        ("https://example.com/news?announcement_pg=3", "example.com/news"),
+        ("https://example.com/blog/page/2/", "example.com/blog/page/2"),
+    ],
+)
+def test_only_pagination_and_document_ids_survive_in_the_query(url: str, key: str) -> None:
+    assert normalise_url(url) == key
+
+
+def test_tenant_rules_add_and_remove_parameters() -> None:
+    rules = UrlRules(keep_params={"Announcement_PG"}, drop_params={"p"})
+    with url_rules(rules):
+        assert (
+            normalise_url("https://example.com/news?announcement_pg=3")
+            == "example.com/news?announcement_pg=3"
+        )
+        assert normalise_url("https://example.com/x?p=5") == "example.com/x"
+        assert is_kept_param("announcement_pg")
+        assert not is_kept_param("p")
+    assert normalise_url("https://example.com/news?announcement_pg=3") == "example.com/news"
+    assert is_kept_param("p")
+
+
+def test_a_key_keeps_its_query_whatever_rules_are_active() -> None:
+    with url_rules(UrlRules(keep_params={"announcement_pg"})):
+        key = normalise_url("https://example.com/news?announcement_pg=3")
+    assert normalise_url(key) == key
+
+
+def test_host_of_a_key_with_a_query() -> None:
+    assert host_of("action1.com?page_id=31963") == "action1.com"

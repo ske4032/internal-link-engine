@@ -9,6 +9,7 @@ from linking_engine.errors import DatabaseAuthError, DatabaseReadError, Database
 from linking_engine.ingest.markdown_clean import body_hash
 from linking_engine.ingest.mongo_repo import INDEXES, CrawlSource, MongoRepo
 from linking_engine.models import Heading, LinkRecord, PageRecord
+from linking_engine.urls import UrlRules
 
 BASE = "example.com"
 SCRAPED = datetime(2026, 9, 19, 15, 40, 30, tzinfo=UTC)
@@ -250,3 +251,17 @@ async def test_crawl_source_reads_the_crawler_shape(mongo_uri: str) -> None:
     assert [str(p.url) for p in pages] == [f"https://{BASE}/c{i}" for i in range(3)]
     assert pages[0].scraped_at == datetime(2026, 9, 19, 15, 40, 30, tzinfo=UTC)
     assert pages[0].content == "# Hello"
+
+
+@pytest.mark.integration
+async def test_url_rules_round_trip_per_tenant(mongo: MongoRepo, tenant: str) -> None:
+    other = f"{tenant}-other"
+    assert await mongo.get_url_rules(tenant) == UrlRules()
+    rules = UrlRules(keep_params={"Announcement_PG"}, drop_params={"p"})
+    await mongo.set_url_rules(tenant, rules)
+    assert await mongo.get_url_rules(tenant) == UrlRules(
+        keep_params={"announcement_pg"}, drop_params={"p"}
+    )
+    assert await mongo.get_url_rules(other) == UrlRules()
+    await mongo.delete_tenant(tenant)
+    assert await mongo.get_url_rules(tenant) == UrlRules()

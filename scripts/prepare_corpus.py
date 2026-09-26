@@ -27,8 +27,9 @@ from linking_engine.ingest.markdown_clean import (
     line_shares,
 )
 from linking_engine.ingest.mongo_repo import CrawlSource, MongoRepo
+from linking_engine.ingest.url_params import query_param_evidence
 from linking_engine.models import CleanedPage, CrawlPage, Heading, LinkRecord, PageRecord
-from linking_engine.urls import normalise_url
+from linking_engine.urls import UrlRules, normalise_url, url_rules
 
 # Anything that should never survive cleaning.
 RESIDUE = {
@@ -69,9 +70,37 @@ async def main() -> None:
     if args.source_db == os.environ["MONGO_DB"]:
         ap.error("source and target database must differ: the source is read-only")
 
+    rules = UrlRules()
+    if args.tenant:
+        async with await MongoRepo.connect(os.environ["MONGO_URI"], os.environ["MONGO_DB"]) as repo:
+            rules = await repo.get_url_rules(args.tenant)
+    print(
+        f"url rules: keep {sorted(rules.keep_params) or 'built-in only'}, "
+        f"drop {sorted(rules.drop_params) or 'none'}"
+    )
+    with url_rules(rules):
+        await prepare(args)
+
+
+async def prepare(args: argparse.Namespace) -> None:
+
     uri = os.environ["MONGO_URI"]
     async with await CrawlSource.connect(uri, args.source_db, args.source_collection) as source:
         docs: list[CrawlPage] = [doc async for batch in source.iter_pages() for doc in batch]
+    evidence = query_param_evidence((str(doc.url), doc.content_hash) for doc in docs)
+    if evidence:
+        print("query parameters in crawled urls (pairs differing only in that parameter):")
+        for item in evidence:
+            if item.content_changed and not item.kept:
+                verdict = f"changes content: consider scripts/url_rules.py --keep {item.name}"
+            elif item.content_same and not item.content_changed and item.kept:
+                verdict = f"never changed content: consider scripts/url_rules.py --drop {item.name}"
+            else:
+                verdict = "kept" if item.kept else "stripped"
+            print(
+                f"  {item.name:24} urls {item.urls:4}  content changed {item.content_changed:4}  "
+                f"same {item.content_same:4}  {verdict}"
+            )
     skipped: Counter[str] = Counter()
     keep: list[CrawlPage] = []
     for doc in docs:

@@ -20,6 +20,7 @@ from linking_engine.models.corpus import (
     LinkRecord,
     PageRecord,
     PageSummary,
+    QueryParamEvidence,
 )
 from linking_engine.models.embedding import (
     EmbeddingBatch,
@@ -75,6 +76,7 @@ __all__ = [
     "PageText",
     "PageType",
     "PairFeatures",
+    "QueryParamEvidence",
     "Recommendation",
     "RecommendationStatus",
     "TenantConfig",

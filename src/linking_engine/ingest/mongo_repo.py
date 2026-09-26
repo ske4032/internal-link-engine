@@ -29,7 +29,7 @@ from linking_engine.errors import (
     SchemaError,
 )
 from linking_engine.models import CrawlPage, LinkRecord, PageRecord, PageSummary
-from linking_engine.urls import normalise_url
+from linking_engine.urls import UrlRules, normalise_url
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -205,6 +205,46 @@ class MongoRepo:
         written_links, _ = await self._bulk("links", link_ops, batch_size)
         _, deleted = await self._bulk("links", stale_ops, batch_size)
         return written_pages, written_links, deleted
+
+    async def get_url_rules(self, tenant_id: str) -> UrlRules:
+        """The tenant's query parameter overrides; none stored means the built-in rules."""
+        _require_tenant(tenant_id)
+        document = await _retrying(
+            partial(
+                self._db["tenant_config"].find_one,
+                {"tenantId": tenant_id},
+                {"_id": 0, "urlKeepParams": 1, "urlDropParams": 1},
+            ),
+            write=False,
+            what="read url rules",
+        )
+        if not document:
+            return UrlRules()
+        return UrlRules.model_validate(
+            {
+                "keep_params": document.get("urlKeepParams") or [],
+                "drop_params": document.get("urlDropParams") or [],
+            }
+        )
+
+    async def set_url_rules(self, tenant_id: str, rules: UrlRules) -> None:
+        _require_tenant(tenant_id)
+        await _retrying(
+            partial(
+                self._db["tenant_config"].update_one,
+                {"tenantId": tenant_id},
+                {
+                    "$set": {
+                        "urlKeepParams": sorted(rules.keep_params),
+                        "urlDropParams": sorted(rules.drop_params),
+                        "urlRulesUpdatedAt": datetime.now(UTC),
+                    }
+                },
+                upsert=True,
+            ),
+            write=True,
+            what="write url rules",
+        )
 
     async def delete_tenant(self, tenant_id: str) -> int:
         _require_tenant(tenant_id)

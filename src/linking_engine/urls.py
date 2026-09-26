@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import posixpath
 import re
-from typing import Annotated
-from urllib.parse import quote, unquote, urlsplit
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Annotated, Final
+from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
-from pydantic import AfterValidator
+from pydantic import AfterValidator, BaseModel, ConfigDict, field_validator
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 _WEB_SCHEMES = frozenset({"http", "https"})
 _WWW = re.compile(r"^www\d*\.(?=[^.]+\.)")  # keep a bare "www.com"
@@ -17,21 +22,73 @@ _PATH_PARAMS = re.compile(r";[^/]*")  # ;jsessionid=... and other matrix paramet
 _INDEX_DOCUMENT = re.compile(r"/(?:index|default)\.(?:html?|php|aspx?|jsp)$", re.IGNORECASE)
 _SLASHES = re.compile(r"/{2,}")
 _HOST = re.compile(r"^[a-z0-9_-]+(?:\.[a-z0-9_-]+)*$")
+_ID_VALUE = re.compile(r"^[\w.-]{1,64}$")
 # Characters a path may carry unescaped (RFC 3986 pchar plus '/').
 _PATH_SAFE = "/:@!$&'()*+,;=-._~"
 
+# Query parameters that select a different page; every other parameter is stripped.
+PAGE_NUMBER_PARAMS: Final = frozenset(
+    {
+        "page",
+        "paged",
+        "pg",
+        "pagenum",
+        "page_no",
+        "pagenumber",
+        "seite",
+        "pagina",
+        "sayfa",
+        "strona",
+    }
+)
+OFFSET_PARAMS: Final = frozenset({"start", "offset", "limitstart"})
+DOCUMENT_ID_PARAMS: Final = frozenset({"page_id", "p", "post", "id", "article", "product_id"})
+
+
+class UrlRules(BaseModel):
+    """Per-tenant additions to the built-in query parameter rules."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    keep_params: frozenset[str] = frozenset()
+    drop_params: frozenset[str] = frozenset()
+
+    @field_validator("keep_params", "drop_params", mode="before")
+    @classmethod
+    def _lowercase(cls, value: object) -> object:
+        if isinstance(value, list | tuple | set | frozenset):
+            return frozenset(str(item).strip().lower() for item in value if str(item).strip())
+        return value
+
+
+_NO_RULES: Final = UrlRules()
+_RULES: ContextVar[UrlRules] = ContextVar("url_rules")
+
+
+@contextmanager
+def url_rules(rules: UrlRules) -> Iterator[None]:
+    """Apply a tenant's rules to every absolute URL normalised in this context."""
+    token = _RULES.set(rules)
+    try:
+        yield
+    finally:
+        _RULES.reset(token)
+
 
 def normalise_url(url: str) -> str:
-    """Key for a web URL: no scheme, www, port 80/443, credentials, query or fragment;
+    """Key for a web URL: no scheme, www, port 80/443, credentials or fragment;
     lowercase host and path; dot segments, duplicate and trailing slashes, index
-    documents and path parameters removed; percent-encoding canonical.
+    documents and path parameters removed; percent-encoding canonical. Only
+    pagination and document-id query parameters survive (see ``_query``).
 
-    ``https://www.Example.com:443/Blog//a/../Post/index.html?utm=x#top`` -> ``example.com/blog/post``.
+    ``https://www.Example.com/Blog//a/../News/index.html?utm=x&page=2#top`` -> ``example.com/blog/news?page=2``.
+    A key (no scheme) keeps its query as is, so re-normalising a key never changes it.
     Raises ValueError for anything that is not an http(s) URL with a host.
     """
     text = url.strip()
     if not text:
         raise ValueError("url is empty")
+    is_key = "://" not in text and not text.startswith("//")
     if "://" not in text:
         if _OTHER_SCHEME.match(text):
             raise ValueError(f"not an http(s) url: {url!r}")
@@ -56,12 +113,41 @@ def normalise_url(url: str) -> str:
     path = _SLASHES.sub("/", _PATH_PARAMS.sub("", unquote(parts.path)))
     path = posixpath.normpath(path) if path else "/"
     path = _INDEX_DOCUMENT.sub("/", path).lower().rstrip("/")
-    return host + quote(path, safe=_PATH_SAFE)
+    query = _query(parts.query, keep_all=is_key)
+    return host + quote(path, safe=_PATH_SAFE) + (f"?{query}" if query else "")
+
+
+def _query(raw: str, *, keep_all: bool) -> str:
+    """Pagination with a page past the first, and document ids, sorted by name.
+    ``page=1`` and ``offset=0`` are the base page, so they are dropped."""
+    rules = _RULES.get(_NO_RULES)
+    kept: dict[str, str] = {}
+    for name, value in parse_qsl(raw):
+        name, value = name.strip().lower(), value.strip().lower()
+        if name in kept or (name in rules.drop_params and not keep_all):
+            continue
+        if keep_all:
+            kept[name] = value
+        elif name in PAGE_NUMBER_PARAMS or name in OFFSET_PARAMS:
+            first = 1 if name in PAGE_NUMBER_PARAMS else 0
+            if value.isdigit() and int(value) > first:
+                kept[name] = str(int(value))
+        elif (name in DOCUMENT_ID_PARAMS or name in rules.keep_params) and _ID_VALUE.match(value):
+            kept[name] = str(int(value)) if value.isdigit() else value
+    return "&".join(f"{name}={quote(value, safe='')}" for name, value in sorted(kept.items()))
+
+
+def is_kept_param(name: str) -> bool:
+    """Whether the active rules keep this query parameter in keys."""
+    rules, name = _RULES.get(_NO_RULES), name.strip().lower()
+    if name in rules.drop_params:
+        return False
+    return name in PAGE_NUMBER_PARAMS | OFFSET_PARAMS | DOCUMENT_ID_PARAMS | rules.keep_params
 
 
 def host_of(key: str) -> str:
     """The host part of a normalised key."""
-    return key.split("/", 1)[0]
+    return re.split(r"[/?]", key, maxsplit=1)[0]
 
 
 # A URL field that is normalised on validation, so stored keys never diverge.
