@@ -2,6 +2,8 @@
 
 Eleven stages. Stage 1 (audit) and Stage 2 (discovery) share the foundation and the anchor resolver.
 
+Walk it visually: [technical walkthrough](https://ske4032.github.io/internal-link-engine/diagrams/linking-engine-tech.html) covers these stages one by one, and [from vector to recommendation](https://ske4032.github.io/internal-link-engine/diagrams/pipeline-walkthrough.html) follows a single page through all of them.
+
 | Stage | Input | Output |
 |---|---|---|
 | 00 Ingestion | Site URL, GSC property, keyword CSV | Page + link records, metrics, `TARGETS_KEYWORD` edges |

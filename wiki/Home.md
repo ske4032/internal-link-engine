@@ -23,6 +23,22 @@ Multi-tenant SEO internal linking engine. Audits a site's existing internal link
 
 ---
 
+## Diagrams
+
+Rendered walkthroughs of the same system at four altitudes.
+
+| Diagram | What it covers |
+|---|---|
+| [The case for it](https://ske4032.github.io/internal-link-engine/diagrams/linking-engine-pitch.html) | Why the system exists, without the machinery |
+| [Technical walkthrough](https://ske4032.github.io/internal-link-engine/diagrams/linking-engine-tech.html) | The eleven stages — what each computes and runs on |
+| [Nine models deep](https://ske4032.github.io/internal-link-engine/diagrams/ml-stack.html) | Every ML layer, in the order text passes through it |
+| [From vector to recommendation](https://ske4032.github.io/internal-link-engine/diagrams/pipeline-walkthrough.html) | Embedding to ranked, anchored recommendation |
+
+`architecture-diagram.jsx` and `system-design.jsx` ship as React source and need
+a build step to view.
+
+---
+
 ## Scope note
 
 [[Core-Build-Plan]] is the current build: Voyage embedding through to a validated
