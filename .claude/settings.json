@@ -60,7 +60,12 @@
     ],
     "deny": [
       "Read(./.env)",
-      "Read(./.env.*)",
+      "Read(./.env.local)",
+      "Read(./.env.*.local)",
+      "Read(./.env.development)",
+      "Read(./.env.staging)",
+      "Read(./.env.production)",
+      "Read(./.env.test)",
       "Read(./files/linking-engine-docs/dev/.env)",
       "Read(./files/linking-engine-docs/dev/.env.*)"
     ]
