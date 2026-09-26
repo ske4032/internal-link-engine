@@ -47,7 +47,7 @@ def test_consecutive_batches_could_not_have_been_merged() -> None:
 
 
 def test_one_count_over_budget_raises() -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"outside 0\.\.120"):
         list(token_batches([10, 121, 10], budget=120, max_items=4))
 
 
@@ -86,5 +86,5 @@ def test_realistic_pages_fill_batches_to_the_budget() -> None:
 
 @pytest.mark.parametrize(("budget", "max_items"), [(0, 4), (120, 0)])
 def test_non_positive_limits_raise(budget: int, max_items: int) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="must be positive"):
         list(token_batches([1], budget=budget, max_items=max_items))

@@ -125,6 +125,12 @@ select = [
   "SIM",           # simplify
   "PTH",           # use pathlib
   "RUF",
+  "ASYNC",         # blocking calls inside async code
+  "S",             # bandit security checks
+  "BLE",           # blind except Exception
+  "PT",            # pytest style
+  "ERA",           # commented-out code
+  "FIX",           # TODO / FIXME / XXX / HACK
 ]
 ignore = [
   "E501",          # line length handled by the formatter
@@ -132,7 +138,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["ARG", "S101"]
+"tests/*" = ["ARG", "S101", "S105", "S106", "S311"]  # asserts, fake credentials, seeded RNG
 "scripts/*" = ["T201"]       # print() is fine in dev scripts
 
 [tool.ruff.lint.flake8-tidy-imports]
@@ -176,7 +182,7 @@ init_typed = true
 asyncio_mode = "auto"
 markers = ["integration: needs Docker; runs real Neo4j and MongoDB containers"]
 testpaths = ["tests"]
-addopts = "--cov=linking_engine --cov-report=term-missing --cov-fail-under=75"
+addopts = "--cov=linking_engine --cov-report=term-missing --cov-fail-under=90"
 
 [tool.deptry]
 known_first_party = ["linking_engine"]

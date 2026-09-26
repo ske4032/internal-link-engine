@@ -89,9 +89,10 @@ def isolated_settings_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
 def _docker_available() -> bool:
     try:
         import docker
+        from docker.errors import DockerException
 
         docker.from_env().ping()
-    except Exception:
+    except (ImportError, DockerException, OSError):
         return False
     return True
 
