@@ -8,12 +8,24 @@ failure and must not be papered over by the test harness.
 from __future__ import annotations
 
 import os
+import uuid
 from typing import TYPE_CHECKING
 
 import pytest
 
+from linking_engine.graph.repo import GraphRepo
+from linking_engine.ingest.mongo_repo import MongoRepo
+
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Iterator
     from pathlib import Path
+
+# Containers are stopped by the fixtures; Ryuk would only add an image pull.
+os.environ.setdefault("TESTCONTAINERS_RYUK_DISABLED", "true")
+
+NEO4J_IMAGE = "neo4j:5.26"
+MONGO_IMAGE = "mongo:8.0"
+NEO4J_PASSWORD = "test-password"
 
 # Fallback list for the window in which models/tenant.py does not exist yet: the suite
 # still has to isolate the environment for anything that does read it. Kept in sync with
@@ -72,3 +84,54 @@ def isolated_settings_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
                 monkeypatch.delenv(var, raising=False)
                 break
     monkeypatch.chdir(tmp_path)
+
+
+def _docker_available() -> bool:
+    try:
+        import docker
+
+        docker.from_env().ping()
+    except Exception:
+        return False
+    return True
+
+
+@pytest.fixture(scope="session")
+def neo4j_server() -> Iterator[tuple[str, str, str]]:
+    if not _docker_available():
+        pytest.skip("Docker is not available")
+    from testcontainers.community.neo4j import Neo4jContainer
+
+    with Neo4jContainer(NEO4J_IMAGE, password=NEO4J_PASSWORD) as container:
+        yield container.get_connection_url(), "neo4j", NEO4J_PASSWORD
+
+
+@pytest.fixture(scope="session")
+def mongo_uri() -> Iterator[str]:
+    if not _docker_available():
+        pytest.skip("Docker is not available")
+    from testcontainers.community.mongodb import MongoDbContainer
+
+    with MongoDbContainer(MONGO_IMAGE) as container:
+        yield container.get_connection_url()
+
+
+@pytest.fixture
+async def graph(neo4j_server: tuple[str, str, str]) -> AsyncIterator[GraphRepo]:
+    repo = await GraphRepo.connect(*neo4j_server)
+    await repo.migrate()
+    yield repo
+    await repo.close()
+
+
+@pytest.fixture
+async def mongo(mongo_uri: str) -> AsyncIterator[MongoRepo]:
+    repo = await MongoRepo.connect(mongo_uri, "linking_engine_test")
+    await repo.ensure_indexes()
+    yield repo
+    await repo.close()
+
+
+@pytest.fixture
+def tenant() -> str:
+    return f"test-{uuid.uuid4().hex[:12]}"

@@ -6,7 +6,9 @@ preparation extracts every link while it strips the markup, and the clean body
 keeps the anchor words in place.
 """
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from datetime import datetime
+
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, HttpUrl
 
 
 class ExtractedLink(BaseModel):
@@ -37,3 +39,84 @@ class CleanedPage(BaseModel):
     body_text: str
     links: tuple[ExtractedLink, ...] = ()
     removed: tuple[tuple[str, int], ...] = ()
+
+
+# MongoDB documents; stored keys are the camelCase form of these field names.
+
+
+class Heading(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    level: int = Field(ge=1, le=6)
+    text: str = Field(min_length=1)
+
+
+class PageRecord(BaseModel):
+    """``pages`` document, keyed by (tenantId, url)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    url: HttpUrl
+    status_code: int | None = Field(ge=100, le=599)
+    usable: bool | None
+    meta_title: str | None
+    meta_description: str | None
+    h1: str | None
+    headings: tuple[Heading, ...]
+    body_text: str
+    word_count: int = Field(ge=0)
+    link_count: int = Field(ge=0)
+    content_hash: str | None
+    scraped_at: AwareDatetime | None
+    source: str = Field(min_length=1)
+
+
+class CrawlPage(BaseModel):
+    """Crawler output (pages_v2)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    url: HttpUrl
+    title: str | None = None
+    description: str | None = None
+    content: str | None = None
+    status_code: int | None = Field(default=None, ge=100, le=599)
+    usable: bool | None = None
+    content_hash: str | None = None
+    scraped_at: AwareDatetime | None = None
+
+
+class PageSummary(BaseModel):
+    """``pages`` document without text."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    url: HttpUrl
+    status_code: int | None = Field(ge=100, le=599)
+    word_count: int = Field(ge=0)
+    content_hash: str | None
+
+
+class LinkRecord(BaseModel):
+    """``links`` document, keyed by (tenantId, sourceUrl, position)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source_url: HttpUrl
+    position: int = Field(ge=0)
+    target_url: HttpUrl
+    anchor_text: str = Field(min_length=1)
+    surrounding_text: str
+    is_internal: bool
+
+
+class GraphLoadReport(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    pages: int = Field(ge=0)
+    placeholders: int = Field(ge=0)
+    links: int = Field(ge=0)
+    external_links_skipped: int = Field(ge=0)
+    self_links_skipped: int = Field(ge=0)
+    stale_links_deleted: int = Field(ge=0)
+    finished_at: datetime

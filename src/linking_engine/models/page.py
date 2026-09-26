@@ -26,25 +26,25 @@ from linking_engine.models.enums import AnchorType, LifecycleStage, PageType
 class Page(BaseModel):
     """A crawled page, plus everything the pipeline computes about it.
 
-    A freshly ingested page carries only the crawl fields. Graph analytics fills
-    in `page_rank`, `betweenness` and the community ids; content clustering fills
-    in `hub_id`; the embedding stage fills in the vectors and the resume marker.
-    Everything computed downstream therefore defaults to ``None``.
+    Fields the crawler does not provide stay None. A placeholder is a link
+    target that was never crawled and carries only its url.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     # ── crawl ───────────────────────────────────────────────────────────────
     url: HttpUrl
-    page_type: PageType
-    is_indexable: bool
-    http_status: int = Field(ge=100, le=599)
-    word_count: int = Field(ge=0)
-    crawl_depth: int = Field(ge=0)
-    language: str
+    is_placeholder: bool = False
+    status_code: int | None = Field(default=None, ge=100, le=599)
+    content_hash: str | None = None
+    word_count: int | None = Field(default=None, ge=0)
+    page_type: PageType | None = None
+    is_indexable: bool | None = None
+    crawl_depth: int | None = Field(default=None, ge=0)
+    language: str | None = None
     freshness: float | None = Field(default=None, ge=0, le=1)
     published_at: datetime | None = None
-    lifecycle_stage: LifecycleStage
+    lifecycle_stage: LifecycleStage | None = None
 
     # ── graph analytics ─────────────────────────────────────────────────────
     # pageRank is over body links only; nav and footer links are never captured.
@@ -101,8 +101,10 @@ class Link(BaseModel):
 
     source_url: HttpUrl
     target_url: HttpUrl
+    # Ordinal in the source body; (source, position) identifies the edge.
+    position: int = Field(ge=0)
     anchor_text: str
-    anchor_type: AnchorType
+    anchor_type: AnchorType | None = None
     # A closed vocabulary of one, for the same reason ActionType has no
     # REPOSITION: the crawler discards nav, header, footer and sidebar links at
     # extraction, so "body" is the only value that can ever reach this model.
@@ -113,4 +115,12 @@ class Link(BaseModel):
     is_follow: bool = True
     surrounding_text: str
     surrounding_embedding: tuple[float, ...] | None = None
-    target_http_status: int | None = Field(default=None, ge=100, le=599)
+    target_status_code: int | None = Field(default=None, ge=100, le=599)
+
+
+class TenantGraphCounts(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    pages: int = Field(ge=0)
+    placeholders: int = Field(ge=0)
+    links: int = Field(ge=0)
