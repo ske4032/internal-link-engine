@@ -28,3 +28,30 @@ venv/
 mlruns/
 *.log
 .cache/
+
+# Claude Code personal overrides (project settings.json is shared)
+.claude/settings.local.json
+
+# cxpak index
+.cxpak/
+
+# ── Application stack (linking-engine) ──────────────────────────────────────
+# uv.lock is deliberately NOT ignored: the lockfile is committed so CI can
+# `uv sync --locked` against the exact resolution developers ran.
+
+# Coverage (pytest --cov, 75% floor)
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Tooling caches
+.import_linter_cache/
+.deptry_cache/
+
+# Build artefacts (hatchling)
+build/
+dist/
+
+# Prefect local state (SQLite backend when running `prefect server start`)
+.prefect/
