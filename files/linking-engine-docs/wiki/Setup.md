@@ -9,11 +9,12 @@ Everything needed to go from empty repo to a passing `uv run pytest`.
 ```
 Python 3.12 or 3.13     3.14 not yet supported by the ML tree
 uv                      curl -LsSf https://astral.sh/uv/install.sh | sh
-Docker Desktop          8 GB memory minimum
+Docker Desktop          testcontainers only; 8 GB memory minimum
 ```
 
 Neo4j must be **5.18 or later** — the audit uses `vector.similarity.cosine()`,
-which does not exist before that. The Compose file pins 5.26.
+which does not exist before that. The deployed instance runs 5.26, and the test
+containers pin the same image.
 
 ---
 
@@ -21,15 +22,14 @@ which does not exist before that. The Compose file pins 5.26.
 
 ```bash
 git clone <repo> && cd linking-engine
-uv sync --all-extras
-cp .env.example .env          # add VOYAGE_API_KEY
-make up                       # neo4j + mongo, schema applied
-make seed                     # 614-page synthetic corpus
-make sanity                   # confirm it looks right
+uv sync                       # base + dev group; extras are deferred
+cp .env.example .env          # endpoints and credentials, plus VOYAGE_API_KEY
 uv run pytest
 ```
 
-Browser at http://localhost:7474, `neo4j` / `localdevpassword`.
+Neo4j, MongoDB, Prefect and MLflow are hosted outside this repository
+(ADR-014), and `.env` points at them. There is no compose file to start. Load
+`.env` for any command with `uv run --env-file .env <command>`.
 
 ---
 
@@ -40,9 +40,9 @@ Full manifest is in `pyproject.toml`. The decisions worth knowing:
 | Package | Why this one |
 |---|---|
 | `pydantic` | The **only** contract crossing module boundaries. Bare dicts between modules are a lint failure |
-| `python-igraph` + `leidenalg` | Reference implementations. Not GDS: no 4-core cap, no projection limit, no JVM cache misses on BFS. `leidenalg` is a separate package |
+| `igraph` + `leidenalg` | Reference implementations, and the only ones: GDS is not installed anywhere (ADR-002). No 4-core cap, no projection limit, no JVM cache misses on BFS. `leidenalg` is a separate package |
 | `tokenizers` | Required for `count_tokens`. Voyage batching is by **tokens**, not list length |
-| `motor` | Async Mongo. Direct `pymongo` import is banned — it is transitive and will vanish on an upgrade |
+| `pymongo` | Async Mongo through the native `AsyncMongoClient` (ADR-012). `motor` was deprecated in May 2026 and is now the banned import |
 | `tenacity` | Per-call backoff *inside* a task. Prefect retries whole tasks; different granularity |
 | `structlog` | Binds `tenant_id` / `run_id` / `stage` to log context, propagates through async |
 | `prefect` | Engine is Apache 2.0; the `/server` directory is Prefect Community License — free for any use except competing with Prefect. Fine here, but a conscious choice |
@@ -92,7 +92,7 @@ uv run pytest                  # tests, 75% coverage floor
 ### What each catches that the others don't
 
 **`deptry`** finds dependency drift. The one that bites is DEP003 — importing a
-transitive package directly. `motor` pulls `pymongo`, `mlflow` pulls a large tree.
+transitive package directly. `mlflow` and `prefect` each pull a large tree.
 Import those directly and it works until someone upgrades.
 
 **`lint-imports`** enforces boundaries between *our own* modules. Different problem
@@ -103,7 +103,7 @@ layers                 api → pipeline → discovery → anchor → audit
                        → graph → embedding → models
 domain-independence    audit, discovery, anchor talk through models/, never
                        to each other
-algorithms-are-pure    graph.algorithms may not import neo4j, motor or pymongo
+algorithms-are-pure    graph.algorithms may not import neo4j or pymongo
 api-excludes-ml        api may not import lightgbm, hdbscan, mlflow, sklearn
 models-are-leaves      models import nothing from the app
 ```
@@ -119,8 +119,9 @@ means either a refactor or a pile of exemptions that defeat the purpose.
 ### Banned imports
 
 ```toml
-"requests" → use httpx, the codebase is async
-"pymongo"  → use motor, direct import is transitive
+"requests"         → use httpx, the codebase is async
+"motor"            → deprecated May 2026, use pymongo.AsyncMongoClient (ADR-012)
+"graphdatascience" → GDS is not installed anywhere, use igraph / leidenalg (ADR-002)
 ```
 
 ### mypy is stricter in the core
@@ -200,29 +201,17 @@ Never log page bodies, embeddings, or credentials.
 
 ## Prefect
 
-Local runs need no server — flows execute in-process. Start the server only when
-you want run history and the UI.
+Flows execute in-process; the Prefect server supplies run history and the UI.
+That server, and its database, run outside this project (ADR-014), so the
+project carries only the client and points it at the server with
+`PREFECT_API_URL` in `.env`.
 
 ```bash
-uvx prefect server start        # SQLite, ephemeral
+uv run --env-file .env prefect work-pool ls    # confirms the client reaches the server
 ```
 
-For anything persistent, point it at the Postgres already running alongside
-MLflow, using a **separate database** on the same instance:
-
-```sql
-CREATE DATABASE prefect;
-```
-
-```bash
-PREFECT_API_DATABASE_CONNECTION_URL="postgresql+asyncpg://prefect:pass@host:5432/prefect"
-```
-
-Note `+asyncpg`. Prefect's server uses async SQLAlchemy and fails with a plain
-`postgresql://` URL — the most common setup mistake.
-
-Sharing one database between MLflow and Prefect means two tools issuing DDL
-against the same schema. Separate databases cost nothing.
+The client is pinned `prefect>=3.8,<3.9` so it never outruns the deployed 3.8
+server. Raise the pin in the same change that upgrades the server.
 
 ---
 
@@ -231,7 +220,7 @@ against the same schema. Separate databases cost nothing.
 | Layer | Tool | Rule |
 |---|---|---|
 | Unit | pytest | Pure functions: extraction ladder, scoring, verdict mapping |
-| Repo | testcontainers | Real Neo4j and Mongo. Never mocked — graph logic is not unit-testable against a fake |
+| Repo | testcontainers | Real Neo4j and Mongo, images pinned to the deployed versions: `neo4j:5.26-community` without GDS, `mongo:8.0` standalone. Never mocked — graph logic is not unit-testable against a fake |
 | Contract | schemathesis | OpenAPI fuzzing against the live app |
 | Pipeline | Prefect test harness | Task retry and skip behaviour |
 

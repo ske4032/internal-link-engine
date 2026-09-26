@@ -113,7 +113,7 @@ cross-attention  trained jointly with the ranker
 LambdaMART       lambdarank on graded labels, NDCG@10
 
 promotion gate   new version ships only if it beats production
-                 on holdout NDCG@10 (MLflow stage transition)
+                 on holdout NDCG@10 (MLflow alias move)
 ```
 
 This is the structural argument for shipping the audit first: it needs none of them, and it produces their labels.

@@ -33,7 +33,7 @@ discovery first means months of models with nothing to learn from.
 | #2 | Pydantic domain models: `Page`, `Link`, `Keyword`, `Recommendation`, `TenantConfig` | 2 | #1 |
 | #3 | Neo4j async repo + connection pooling + migration runner | 2 | #2 |
 | #4 | Neo4j schema migrations: constraints, HNSW vector indexes @2048d | 1 | #3 |
-| #5 | MongoDB repo (motor) + collection indexes | 1 | #2 |
+| #5 | MongoDB repo (PyMongo async) + collection indexes | 1 | #2 |
 | #6 | Valkey cache layer with tenant key prefixing | 1 | #2 |
 | #7 | `structlog` → JSON stdout, `tenant_id`/`run_id`/`stage` binding (existing Promtail/Loki picks it up — see ADR-009) | 1 | #1 |
 | #8 | Helm chart: Neo4j StatefulSet, Mongo, Valkey, app | 3 | #1 |
@@ -78,7 +78,7 @@ discovery first means months of models with nothing to learn from.
 | #23 | Leiden via `leidenalg` — link graph → `linkCommunityId` | 1 | #21 |
 | #24 | Bipartite keyword projection + Leiden → `keywordCommunityId` | 3 | #23 #16 |
 | #25 | **HDBSCAN** over content embeddings → `hubId`, noise label | 3 | #19 |
-| #26 | Correctness harness: igraph vs GDS output diff | 1 | #22 |
+| #26 | Correctness harness: closed-form fixtures and networkx reference | 1 | #22 |
 | #27 | Parallel scheduling: Step ② concurrent with Step ① | 1 | #22 |
 
 **Subtotal: 20 days**
@@ -107,11 +107,13 @@ discovery first means months of models with nothing to learn from.
 >
 > **#25** — HDBSCAN clusters content embeddings, which is a different question from
 > either Leiden pass. Its unique output is the `-1` noise label: a page belonging to
-> no coherent topic. Neither Leiden pass can express that. Run `make eval` on the
+> no coherent topic. Neither Leiden pass can express that. Run the clustering evaluation on the
 > synthetic corpus before building — the decision rule is in Measurement Backlog §1.
 >
-> **#26** — correctness before speed. Spearman between igraph and GDS PageRank should
-> exceed 0.99. A fast wrong PageRank is worse than a slow right one.
+> **#26** — correctness before speed. Closed-form fixture graphs on every CI run,
+> plus an independent networkx reference compared by URL after write-back; the
+> thresholds are in the ADR-002 amendment. A fast wrong PageRank is worse than a
+> slow right one.
 >
 > **#27** — Step ② touches no embeddings, so it can start the moment the crawl ends.
 > With igraph the whole stage fits inside the first 5% of the embedding run.
@@ -228,7 +230,7 @@ discovery first means months of models with nothing to learn from.
 | #54 | MLflow tracking server + MinIO backend, Helm-deployed | 2 | #8 |
 | #55 | Training data assembly from `anchor_feedback` with graded labels | 2 | #47 |
 | #56 | LightGBM `lambdarank` training, grouped by source page | 3 | #55 |
-| #57 | MLflow registry + promotion gate as stage transition | 2 | #54 #56 |
+| #57 | MLflow registry + promotion gate as alias move | 2 | #54 #56 |
 | #58 | Chunked inference (~50k pairs) with memory ceiling | 3 | #56 |
 
 **Subtotal: 12 days**

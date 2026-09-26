@@ -1,0 +1,240 @@
+[project]
+name = "linking-engine"
+version = "0.1.0"
+description = "SEO internal linking intelligence engine"
+requires-python = ">=3.12,<3.14"
+
+dependencies = [
+  # ── contracts ───────────────────────────────────────────────────────────
+  # Pydantic models are the ONLY thing crossing module boundaries.
+  # Bare dicts between modules are a lint failure.
+  "pydantic>=2.9",
+  "pydantic-settings>=2.5",
+
+  # ── api ─────────────────────────────────────────────────────────────────
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "httpx>=0.28",
+
+  # ── data stores ─────────────────────────────────────────────────────────
+  "neo4j>=5.26",            # driver; the SERVER must be 5.18+ for vector.similarity.cosine
+  "pymongo>=4.13",          # native AsyncMongoClient (ADR-012)
+  "redis>=5.2",             # valkey-compatible; serving layer, later
+
+  # ── embeddings ──────────────────────────────────────────────────────────
+  "voyageai>=0.3",
+  "tokenizers>=0.20",       # count_tokens — batching is by TOKENS not count
+
+  # ── graph algorithms ────────────────────────────────────────────────────
+  # Reference implementations, run in-process. NOT Neo4j GDS: no 4-core cap,
+  # no 3-projection limit, no JVM cache misses on BFS.
+  "igraph>=1.0",
+  "leidenalg>=0.10",        # separate package — not bundled with igraph
+
+  # ── clustering, ranking ─────────────────────────────────────────────────
+  "numpy>=2.0,<3",          # pin major: hdbscan/umap/lightgbm lag on NumPy bumps
+  "scikit-learn>=1.5",
+  "hdbscan>=0.8.38",
+  "lightgbm>=4.5",
+  "pandas>=2.2",
+  "pyarrow>=18.0",          # cache feature matrices between experiment runs
+
+  # ── text processing ─────────────────────────────────────────────────────
+  "nltk>=3.9",              # SnowballStemmer — key off page.language, ~15 langs
+
+  # ── orchestration ───────────────────────────────────────────────────────
+  # Engine is Apache 2.0. The /server directory is Prefect Community License:
+  # free for any use EXCEPT competing with Prefect. Fine here — worth knowing.
+  "prefect>=3.8,<3.9",      # never newer than the deployed server (ADR-014)
+
+  # ── observability ───────────────────────────────────────────────────────
+  # MVP: structlog JSON to stdout, picked up by the server's existing
+  # Promtail -> Loki. No collector to deploy. OpenTelemetry (collector, Tempo,
+  # Prometheus) is deferred to production scope — see ADR-009 and Decisions.md.
+  "structlog>=24.4",        # binds tenant_id / run_id / stage to log context
+
+  # ── ml tracking ─────────────────────────────────────────────────────────
+  "mlflow>=3.16,<3.17",     # never newer than the deployed server (ADR-014)
+
+  # ── utilities ───────────────────────────────────────────────────────────
+  "tenacity>=9.0",          # per-call backoff INSIDE a task; Prefect retries tasks
+  "orjson>=3.10",
+  "rich>=13.9",             # verdict tables during threshold tuning
+]
+
+[project.optional-dependencies]
+# Only if `make eval` shows HDBSCAN underperforming at raw 2048d.
+# Pulls numba — a common source of build friction on Apple Silicon.
+umap = ["umap-learn>=0.5.6"]
+
+# Noun-phrase extraction for extraction ladder rung 3. ~500MB with the model.
+# Check the rung 1-2.5 hit rate before installing: if they handle most cases,
+# this is deferrable.
+nlp = ["spacy>=3.8"]
+
+# Production observability. Not installed for MVP — see ADR-009.
+otel = [
+  "opentelemetry-sdk>=1.28",
+  "opentelemetry-exporter-otlp>=1.28",
+  "opentelemetry-instrumentation-fastapi>=0.49",
+  "opentelemetry-instrumentation-httpx>=0.49",
+]
+
+[dependency-groups]
+dev = [
+  "ruff>=0.8",
+  "mypy>=1.13",
+  "deptry>=0.21",           # declared-vs-imported dependency drift
+  "import-linter>=2.1",     # architectural boundaries between OUR modules
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "pytest-cov>=6.0",
+  "testcontainers[neo4j,mongodb]>=4.8",
+  "pre-commit>=4.0",
+  "ipykernel>=6.29",        # label review, eval notebooks
+  "prefect-client>=3.8",    # minimal, pure Apache 2.0 — for worker images
+]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# tooling
+# ═══════════════════════════════════════════════════════════════════════════
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+# files/ is the documentation export and local scratch — the wiki, the ADRs and
+# the pre-existing dev tooling, all owned upstream — not application source.
+# Excluding it is what makes the bare `ruff check` and `ruff format --check`
+# from issue #1 step (e) meaningful: without it the gate lints eight vendored
+# dev scripts and reformats the Python blocks inside four wiki markdown pages,
+# corrupting the export. `files/linking-engine-docs/dev/pyproject.toml` has no
+# [tool.ruff] table of its own, so those files fall back to this config and the
+# exclusion here is the only lever.
+extend-exclude = ["files"]
+
+[tool.ruff.lint]
+select = [
+  "E", "F", "W",   # pycodestyle, pyflakes
+  "I",             # isort
+  "UP",            # pyupgrade
+  "B",             # bugbear
+  "TID",           # tidy-imports
+  "TC",            # type-checking imports
+  "ARG",           # unused arguments
+  "SIM",           # simplify
+  "PTH",           # use pathlib
+  "RUF",
+]
+ignore = [
+  "E501",          # line length handled by the formatter
+  "B008",          # FastAPI Depends() in defaults is idiomatic
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ARG", "S101"]
+"scripts/*" = ["T201"]       # print() is fine in dev scripts
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"requests".msg = "Use httpx — the codebase is async."
+"motor".msg = "Motor was deprecated in May 2026. Use pymongo.AsyncMongoClient (ADR-012)."
+"graphdatascience".msg = "GDS is not installed anywhere (ADR-002). Use igraph / leidenalg."
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+# No stubs published for these.
+module = ["igraph.*", "leidenalg.*", "hdbscan.*", "umap.*", "lightgbm.*", "voyageai.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# No exemptions in the domain core. This is where a renamed Pydantic field
+# silently drops data at a boundary.
+module = ["linking_engine.models.*", "linking_engine.audit.*", "linking_engine.anchor.*"]
+disallow_any_explicit = true
+
+[tool.pydantic-mypy]
+# Required for the override above to mean what it says. By default the plugin
+# synthesizes `__init__(self, **data: Any)` for every model, and
+# disallow_any_explicit reports that Any against the `class X(BaseModel)`
+# statement itself — nine errors in files containing no hand-written Any.
+# init_typed makes the synthesized __init__ carry the real field types, which
+# removes the Any at its source instead of suppressing the report, so the domain
+# core needs no per-class exemptions. Strictly stricter, not weaker: constructor
+# keyword arguments are now type-checked too, and a hand-written `Any` anywhere
+# in models/, audit/ or anchor/ still fails on its own line.
+init_typed = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--cov=linking_engine --cov-report=term-missing --cov-fail-under=75"
+
+[tool.deptry]
+known_first_party = ["linking_engine"]
+
+[tool.deptry.per_rule_ignores]
+# DEP002 is "declared but never imported". Added by issue #1, when the only
+# imported dependencies are pydantic and pydantic-settings. THIS LIST IS
+# TEMPORARY: delete an entry in the same PR as the issue that first imports it,
+# so the list shrinks to nothing as the build plan lands. Deleting a dependency
+# instead of listing it here is wrong — the pins are deliberate.
+#
+# The exceptions are marked "runtime only": those are invoked as a process or
+# pulled in by another tool rather than imported by our code, so they stay.
+DEP002 = [
+  # optional extras, imported conditionally behind a feature check
+  "spacy",
+  "umap-learn",
+  # production observability extra, out of MVP scope per ADR-009
+  "opentelemetry-sdk",
+  "opentelemetry-exporter-otlp",
+  "opentelemetry-instrumentation-fastapi",
+  "opentelemetry-instrumentation-httpx",
+  # api/
+  "fastapi",
+  "uvicorn",             # runtime only: launched as an ASGI server process
+  # ingest/
+  "httpx",
+  # graph/repo.py
+  "neo4j",
+  "pymongo",
+  # embedding/
+  "voyageai",
+  "tokenizers",
+  # graph/algorithms.py
+  "igraph",
+  "leidenalg",
+  "numpy",
+  "scikit-learn",
+  "hdbscan",
+  # ml/
+  "lightgbm",
+  "pandas",
+  "pyarrow",
+  "mlflow",
+  # anchor/
+  "nltk",
+  # pipeline/
+  "prefect",
+  "tenacity",
+  # serving and cross-cutting
+  "redis",
+  "structlog",
+  "orjson",
+  "rich",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/linking_engine"]

@@ -1,0 +1,39 @@
+# Fast gates on staged files only.
+#
+# deptry and lint-imports are deliberately absent: both need the whole tree to
+# say anything true, so they run in CI rather than per commit.
+#
+# Every hook is `repo: local` running through `uv run`, so the tool versions
+# come from uv.lock and there is no second pinned copy of ruff or mypy to drift
+# against the dev dependency group.
+#
+# `files/` is excluded throughout. It is a vendored export of the wiki and the
+# pre-existing dev tooling, not application source, and reformatting it would
+# rewrite documentation.
+
+default_install_hook_types: [pre-commit]
+exclude: ^files/
+
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --force-exclude --fix
+        language: system
+        types_or: [python, pyi]
+
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format --force-exclude
+        language: system
+        types_or: [python, pyi]
+
+      - id: mypy
+        name: mypy --strict
+        entry: uv run mypy --strict
+        language: system
+        types_or: [python, pyi]
+        # mypy needs a coherent module graph, so it is given every staged file
+        # in one invocation rather than one process per file.
+        require_serial: true

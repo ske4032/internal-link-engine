@@ -28,7 +28,7 @@ accepted, since they were already independent systems.
 
 ## ADR-002: Graph algorithms run outside Neo4j (igraph/leidenalg, not GDS)
 
-**Status:** Accepted
+**Status:** Accepted, amended 2026-09-26 — see amendment below
 
 **Context.** Neo4j GDS Community Edition caps concurrency at 4 cores regardless
 of host hardware and limits projections to 3 in memory per instance. Measured:
@@ -46,6 +46,86 @@ Removes the 4-core cap and the 3-projection limit entirely. Requires a
 correctness gate (Spearman vs GDS output > 0.99) before trusting the swap —
 implemented as PR #26/Phase-2 task #8. Neo4j internal ids are not stable across
 restarts, so the id mapping must be rebuilt every run, never cached.
+
+*The correctness gate in this paragraph is superseded; see the 2026-09-26 amendment below.*
+
+### Amendment — 2026-09-26: GDS removed from every environment; the correctness gate is replaced
+
+**Trigger.** Neo4j GDS is no longer installed anywhere. The deployed Neo4j is
+5.26.30 Community with APOC only and zero `gds.*` procedures. igraph and
+`leidenalg` are now the only implementations of PageRank, Leiden and betweenness
+in every environment, not the preferred of two. The correctness gate in the
+original consequences — Spearman vs GDS output > 0.99, assigned to PR-Roadmap
+#26 and issue #8 — has nothing left to compare against.
+
+**What the old gate was actually protecting.** igraph and `leidenalg` are the
+reference implementations; the algorithms are not where the risk sits. The risk
+is this project's code around them: the edge pull, the Neo4j-id-to-vertex-index
+mapping rebuilt every run, edge orientation (PageRank directed, betweenness
+undirected), and the write-back. A GDS comparison exercised those only
+incidentally. The replacement targets them directly.
+
+**Amended decision.** Two checks replace the GDS comparison, each covering what
+the other cannot.
+
+*Fixture graphs with closed-form expected values* — unit layer, every CI run.
+Path graph P_n: betweenness of vertex i is i·(n−1−i). Star S_n: centre
+betweenness (n−1)(n−2)/2, leaves 0. Directed cycle C_n: PageRank 1/n everywhere.
+One small directed graph with a dangling node, hand-computed once with the
+derivation committed beside it. Two cliques joined by a single edge: Leiden
+returns exactly the two cliques, identically across two runs with a fixed seed.
+Every fixture also runs with Neo4j ids shuffled, so the id mapping — not fixture
+ordering — is what produces the answer. Tolerance: relative error ≤ 1e-9.
+
+*An independent networkx reference* — repo layer (testcontainers), 600-page
+synthetic corpus, at #8 and #9 acceptance and on any change under `graph/`. The
+reference graph is built from a separate URL-keyed Cypher read, not from the
+pipeline's id mapping, and compared by URL after the pipeline has written back
+to Neo4j — so pull, mapping and write-back are covered end to end.
+- PageRank (damping 0.85, unweighted, networkx run to `tol=1e-12`): Spearman
+  ≥ 0.999 and max absolute difference ≤ 1e-6.
+- Exact betweenness (networkx `normalized=False`, undirected): max absolute
+  difference ≤ 1e-9 × max value. Issue #8 stores betweenness as a percentile
+  rank, so this raw comparison runs on the igraph output before conversion,
+  and the written-back ranks must equal the percentile ranks of the networkx
+  values computed with the same function, ties aside.
+- Leiden has no cross-implementation equivalent. networkx `modularity()`,
+  recomputed on the written-back `linkCommunityId` labels, must match
+  the `leidenalg` partition's `modularity` within 1e-9. Compare against
+  `modularity`, not `quality()`: for `RBConfigurationVertexPartition`,
+  `quality()` is unnormalised and equals modularity × 2m (verified 2026-09-26). Partition quality against planted
+  topics remains gate #11's job, unchanged.
+
+The thresholds are tighter than the old 0.99 deliberately: that allowance
+absorbed a different implementation's iteration defaults. Two implementations of
+the same definition, run to convergence on the same graph, agree to rounding;
+anything looser hides a real bug. `networkx` is a dev-only dependency and `src/`
+may not import it. `graphdatascience` joins the banned imports, and no `gds.*`
+call is permitted anywhere, dev scripts included.
+
+**What still holds.** The original decision and its reasoning are unchanged.
+Neo4j remains an edge and vector store; internal ids are still rebuilt every
+run, never cached. APOC is present on the server, nothing in the core build
+depends on it, and its presence is not a route back to in-database graph
+algorithms.
+
+**Consequences of the amendment.** Issue #8's step e and its first acceptance
+criterion ("Spearman vs GDS > 0.99") are replaced by the two checks above; issue
+#9's acceptance gains the modularity cross-check. PR-Roadmap #26 becomes
+"Correctness harness: closed-form fixtures and networkx reference" (PR-Roadmap
+numbering — unrelated to Core Build Plan issue #26, the NDCG@10 harness).
+Measurement Backlog §4 is settled by environment rather than measurement: its
+current position, measurement snippet and decision rule are rewritten, and its
+priority-order entry becomes "igraph vs networkx correctness"; the speed half
+survives as #8's per-algorithm timings. `dev/scripts/eval_clustering.py` runs
+Leiden through `graphdatascience`, so `make eval` — and therefore gate #11 — is
+broken until `run_leiden()` moves to `leidenalg`, which also removes its silent
+Louvain fallback; that fix blocks #11. `02-verify.cypher`,
+`04-clustering-bench.cypher` and the Makefile targets `verify-db`,
+`projections`, `drop-projections` and `bench` all call `gds.*` and are deleted
+rather than ported: projection hygiene has no meaning without projections, and
+Leiden vs Louvain is already decided. The one non-GDS check in `02-verify.cypher`,
+`vector.similarity.cosine()`, already lives in issue #3's startup health check.
 
 ---
 
@@ -248,7 +328,7 @@ score, never a hard filter that drops or reorders candidates ahead of it.
 
 ## ADR-008: Orchestration — Prefect deployed for MVP
 
-**Status:** Superseded (original decision reversed)
+**Status:** Superseded (original decision reversed); Postgres consequence revised by ADR-014 (2026-09-26)
 
 **Context.** Prefect 3 was originally selected as the orchestrator (self-hosted,
 Apache 2.0 engine with a Community-licensed server component) to replace Spring
@@ -269,6 +349,10 @@ dependency footprint that the deferral was meant to avoid — accepted, since th
 deployment has already happened. Setup.md's Prefect section (Postgres database
 setup, `+asyncpg` connection string, `@task` retry pattern) reflects the current,
 deployed state and needs no further change on this account.
+
+*Revised 2026-09-26 by ADR-014: the Prefect server and its Postgres run outside
+this project, so Setup.md's Prefect section no longer describes anything the
+project does.*
 
 ## ADR-009: No dedicated observability stack for the MVP; existing Promtail/Loki
 
@@ -346,3 +430,134 @@ gate proposed on eligibility (as opposed to priority) should be treated as
 presumptively wrong unless it excludes something genuinely never actionable
 (e.g. `isIndexable = false`), not something merely currently unattractive by one
 signal.
+
+---
+
+## ADR-012: PyMongo native async replaces Motor
+
+**Status:** Accepted (supersedes the `motor` choice on Stack, Setup and PR-Roadmap #5)
+
+**Context.** `motor` was chosen as the async MongoDB client, with a ruff rule
+banning direct `pymongo` imports on the grounds that `pymongo` was a transitive
+dependency. PyMongo's native async API went GA in 4.13, and Motor 3.7.1 was
+deprecated on 14 May 2026, a year later. Motor wraps synchronous PyMongo and
+dispatches each call to a thread pool; `AsyncMongoClient` is native asyncio.
+Compared directly, the two collection classes share 41 identically named
+methods — the migration is the import line and the client class name. No Mongo
+application code exists yet.
+
+**Decision.** `pymongo>=4.13` with `AsyncMongoClient` is the async MongoDB
+client. `motor` leaves the dependency manifest and becomes the banned import; the
+ruff rule is inverted.
+
+**Consequences.** Switching now costs an import line; switching after issue #3
+would mean touching every repository method. One fewer package and no thread-pool
+hop per call. `pymongo` is now a direct dependency, so the DEP003 argument that
+justified the old ban now applies to `motor` instead. Import-linter contracts
+must forbid `pymongo` wherever they forbid `motor` — `models-are-leaves`
+currently forbids `motor` but not `pymongo`, which after this change would leave
+the models free to import the real driver. The dev scripts' synchronous
+`MongoClient` comes from the same package and is unaffected.
+
+---
+
+## ADR-013: MongoDB runs standalone, with no replica set
+
+**Status:** Accepted
+
+**Context.** The deployed MongoDB 8.0.32 is a standalone `mongod`, shared with an
+unrelated `action1` database. The project's compose file assumed an `rs0`
+single-node replica set, and issue #3 says `directConnection=true` is required
+because "Mongo needs the replica set for transactions". An audit of every
+existing Mongo call found `insert_many` and `replace_one` only — no sessions, no
+transactions, no change streams. Every "same transaction" reference in the build
+plan (issue #5, Core Build Plan, PR-Roadmap #19) is the Neo4j write that sets
+`embeddedContentHash`, not Mongo.
+
+**Decision.** MongoDB stays standalone. Every Mongo write is single-document
+atomic **and idempotent**: a re-run after partial failure converges to the same
+state. In practice that means keyed upserts (`replace_one` / `update_one` with
+`upsert=True`, or `bulk_write` of them) on a deterministic key backed by a unique
+index leading with `tenantId`, never a bare `insert_many` into a collection a
+re-run does not first clear. A multi-document change that must appear atomic —
+publishing a run's recommendations — is written under its `runId` and made
+visible by flipping one pointer document, which is a single-document write.
+`directConnection=true` is dropped from connection strings. The project touches
+only its own `linking_engine` database, named by `MONGO_DB` and never enumerated
+or dropped by code. At MVP scope it connects with the instance's root
+credentials, decided 2026-09-26 for a single-operator test build. A read-write
+user scoped to `linking_engine` is the step to take before any second operator
+or deployment shares this instance.
+
+**Consequences.** No multi-document transactions, no change streams, no
+`majority` read concern. Retryable writes are silently disabled — the driver does
+not retry a failed write against a standalone — so `tenacity` at the repository
+call is the retry, and that is safe only because of the idempotency rule. Crash
+resume already rests on Neo4j's `embeddedContentHash`, not on Mongo. Stage 08
+writes Neo4j edges and a Mongo payload together; no Mongo transaction could span
+that anyway, so the `runId` pointer pattern is needed on any topology. Code
+written to this rule runs unchanged on a replica set, which makes standalone the
+reversible direction. Revisit when a feature on the plan needs multi-document
+atomicity the pointer pattern cannot express, or change streams (e.g.
+event-driven cache invalidation — out of scope until after #30); the first PR
+that opens a session or calls `watch()` reopens this ADR rather than landing.
+Converting then means restarting the shared `mongod` with `--replSet`, which
+interrupts `action1`; a `keyFile` if authorization is on; and a member hostname
+every client can resolve — the reason the old compose needed
+`directConnection=true` was that it advertised `localhost:27017`. A dedicated
+`mongod` for this project is the alternative to weigh at that point, not a
+default conversion of the shared one.
+
+---
+
+## ADR-014: Runtime services are hosted outside this repository
+
+**Status:** Accepted (revises ADR-008's consequence on the Prefect Postgres footprint)
+
+**Context.** Neo4j (5.26.30 Community, APOC only), MongoDB (8.0.32 standalone,
+shared — ADR-013) and the Prefect 3.8.6 server run in Docker from the user's own
+compose project, outside this repository. The project's
+`dev/docker-compose.yml` cannot start beside them: ports 7474, 7687 and 27017
+are already bound, as is 4200 for the `prefect server start` that Development
+tells readers to run, and the Makefile `docker exec`s into containers named
+`neo4j` and `mongo` that do not exist. MLflow 3.16.1 runs on the user's k3s
+server with built-in basic auth; its backend store and auth database are in
+Postgres, and it proxies artifacts to MinIO (`mlflow-artifacts:/`). The client
+therefore needs neither `boto3` nor MinIO credentials, and no Postgres
+credentials exist on the workstation. The Prefect server's database likewise
+lives outside the project.
+
+**Decision.** The project runs no services of its own. It connects to
+externally hosted Neo4j, MongoDB, Prefect and MLflow through endpoints and
+credentials in `.env`, every one listed in `.env.example`. Client library
+versions track the deployed server versions and never outrun them:
+`mlflow>=3.16,<3.17` and `prefect>=3.8,<3.9`, raised only in the change that
+records a server upgrade, with the startup health check (issue #3, step f)
+asserting each client is no newer than its server so the rule fails loudly
+rather than by memory. `asyncpg` and `boto3` are removed. The dev compose file,
+`dev/mongo-init/`, and every Makefile target that shells into a container are
+deleted once the collection indexes in `01-collections.js` are ported into issue
+#3's Mongo repository as idempotent index creation at startup; `make schema` is
+replaced by #3's migration runner, and `make sanity` survives rewritten to run
+through the driver. Repo tests keep testcontainers, with images pinned to the
+deployed versions: `neo4j:5.26-community` without GDS, `mongo:8.0` standalone.
+
+**Consequences.** ADR-008's Postgres footprint still exists but is owned and
+operated outside this project; the project carries only the Prefect client, and
+Setup's Prefect section (database creation, `+asyncpg` URL) no longer describes
+anything this project does. The MLflow client authenticates with
+`MLFLOW_TRACKING_USERNAME` / `MLFLOW_TRACKING_PASSWORD`; `MLFLOW_S3_ENDPOINT_URL`
+and the boto3 failure mode in issue #27 no longer apply. At a 3.16 floor, model
+registry stages are deprecated in favour of aliases (deprecated since MLflow
+2.9.0, verified against the installed 3.16.1 client), so the promotion gate
+becomes an alias move rather than a stage transition — same gate, holdout
+NDCG@10, different mechanism. Nobody without access to the user's services can
+run the pipeline end to end; testcontainers still covers the repo layer —
+accepted at single-operator MVP scope. Neo4j heap and page-cache sizing are no
+longer declared in this repository, so the memory ceiling for chunked inference
+must be measured against the deployed settings. PR-Roadmap #8 (Helm-deployed
+Neo4j and Mongo) and #54 (MLflow and MinIO, Helm-deployed) describe services
+that now exist outside the project; both stay out of scope until #30 and are
+rewritten when the roadmap reopens, not now. Deletion is reversible through git
+history; if a second developer or CI ever needs the full stack, the replacement
+mirrors the deployed topology rather than restoring the old file.

@@ -13,7 +13,7 @@ PyTorch Geometric, LightGBM, and every embedding client are Python. A Java pipel
 Needed step-level retry, skip policies, and persistent run history. Prefect gives all three in-process with typed Python objects between steps. Argo Workflows is container-DAG shaped, which fits the deployment but not the data flow.
 
 **MLflow over hand-rolled MinIO versioning.**
-Earlier specs versioned `gnn_encoder_vN.pt` by filename. MLflow makes the promotion gate a registry stage transition rather than application logic, and rollback a transition rather than a file copy.
+Earlier specs versioned `gnn_encoder_vN.pt` by filename. MLflow makes the promotion gate a registry alias move rather than application logic, and rollback moving the alias back rather than a file copy. Registry stages were deprecated in MLflow 2.9; see ADR-014.
 
 **No dedicated observability stack for MVP.** `structlog` JSON to stdout, picked up by the server's existing Promtail → Loki. OpenTelemetry and the Splunk-vs-Loki question are both deferred to production scope, where multiple concurrent tenants or a distributed call graph would justify the cost. See [[ADRs]] ADR-009.
 
@@ -70,7 +70,7 @@ reversible direction. voyage-context-4 supports manual chunking
 (`enable_auto_chunking=False`, nested lists), so the threshold approach remains
 available — it is deferred, not blocked.
 
-**Neo4j Community, one instance per tenant.** Enterprise multi-database is $10k–$50k+/year for the same isolation. All required GDS algorithms are in the open-source tier.
+**Neo4j Community, one instance per tenant.** Enterprise multi-database is $10k–$50k+/year for the same isolation. No graph algorithms run inside Neo4j at all (ADR-002), so nothing edition-gated is needed.
 
 **Valkey over Redis.** Redis moved to SSPL in 2024 — licence risk for commercial SaaS. Valkey is the BSD fork, API-identical.
 
