@@ -8,10 +8,12 @@ list.
 import pytest
 
 from linking_engine.ingest.markdown_clean import (
+    clean_meta,
     clean_page,
     find_boilerplate,
     is_navigation,
     line_shares,
+    template_key,
 )
 
 PAGE = "https://www.example.com/blog/post/"
@@ -239,8 +241,8 @@ def test_navigation_lines_need_only_the_lower_share_but_sentences_need_the_highe
     docs = [f"{nav}\n{sentence}\nunique body {i}" for i in range(5)]
     docs += [f"other page number {i} with its own text" for i in range(95)]
     found = find_boilerplate(docs, min_share=0.2, nav_min_share=0.02)
-    assert nav in found
-    assert sentence not in found
+    assert template_key(nav) in found
+    assert template_key(sentence) not in found
 
 
 @pytest.mark.parametrize(
@@ -256,3 +258,70 @@ def test_navigation_lines_need_only_the_lower_share_but_sentences_need_the_highe
 )
 def test_is_navigation(line: str, expected: bool) -> None:
     assert is_navigation(line) is expected
+
+
+# ── outline ──────────────────────────────────────────────────────────────────
+
+
+def test_headings_outline_covers_setext_and_atx_levels_in_order() -> None:
+    page = clean(
+        "Report\n======\n\nIntro text.\n\nWhat is inside\n--------------\n\n### Detail\n\nBody."
+    )
+    assert page.headings == ((1, "Report"), (2, "What is inside"), (3, "Detail"))
+    assert page.h1 == "Report"
+
+
+def test_a_rule_after_a_blank_line_is_not_a_heading() -> None:
+    page = clean("Paragraph text.\n\n---\n\nMore text.")
+    assert page.headings == ()
+    assert page.body_text == "Paragraph text.\n\nMore text."
+
+
+# ── measured after the first write ──────────────────────────────────────────
+
+
+def test_glyph_bullets_are_stripped() -> None:
+    page = clean(
+        "^ Automate patching\n\u2022 Enhanced security\n\u2610 Role count ok\n\u2013 Real-time view"
+    )
+    assert page.body_text == "Automate patching\nEnhanced security\nRole count ok\nReal-time view"
+
+
+def test_replacement_characters_are_removed() -> None:
+    assert clean("\ufffd 10 hours saved each month").body_text == "10 hours saved each month"
+
+
+def test_a_punctuation_fragment_is_joined_to_the_line_it_continues() -> None:
+    page = clean("See the [2024 report](/r/)\n, identifying a 61% increase.")
+    assert page.body_text == "See the 2024 report, identifying a 61% increase."
+
+
+def test_template_lines_that_differ_only_in_urls_are_detected_and_removed() -> None:
+    docs = [f"[Previous Post](/p/{i}/) [Next Post](/n/{i}/)\nbody {i}" for i in range(10)]
+    found = find_boilerplate(docs, min_share=0.5)
+    assert template_key("[Previous Post](/p/1/) [Next Post](/n/1/)") in found
+    page = clean("[Previous Post](/p/7/) [Next Post](/n/7/)\nReal text.", boilerplate=found)
+    assert page.body_text == "Real text."
+    assert page.links == ()
+
+
+def test_meta_fields_are_cleaned() -> None:
+    assert clean_meta("\u200bTitle &amp; More  ") == "Title & More"
+    assert clean_meta("  ") is None
+    assert clean_meta(None) is None
+    assert clean("x", title="\u200bTitle").title == "Title"
+
+
+def test_a_glyph_behind_wrapped_emphasis_is_stripped() -> None:
+    page = clean("*   **IT Asset\n    ** \u2013 Real-time visibility")
+    assert page.body_text.splitlines()[-1] == "Real-time visibility"
+
+
+def test_punctuation_only_lines_are_dropped() -> None:
+    assert clean("Heading text\n;\n.\nBody.").body_text == "Heading text\nBody."
+
+
+def test_a_leading_dot_word_is_not_a_continuation() -> None:
+    assert clean("Patched in the test environment.\n.NET Framework fix").body_text == (
+        "Patched in the test environment.\n.NET Framework fix"
+    )

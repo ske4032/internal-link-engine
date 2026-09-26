@@ -23,8 +23,9 @@ class ExtractedLink(BaseModel):
 class CleanedPage(BaseModel):
     """A page's text, ready for storage and for embedding.
 
-    ``removed`` counts what cleaning took out, by kind, as sorted
-    ``(kind, count)`` pairs rather than a dict so the model stays hashable.
+    ``headings`` is the page outline as ``(level, text)`` pairs in document
+    order, levels 1 to 6. ``removed`` counts what cleaning took out, by kind, as
+    sorted ``(kind, count)`` pairs rather than a dict so the model stays hashable.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -32,6 +33,7 @@ class CleanedPage(BaseModel):
     url: HttpUrl
     title: str | None = None
     h1: str | None = None
+    headings: tuple[tuple[int, str], ...] = ()
     body_text: str
     links: tuple[ExtractedLink, ...] = ()
     removed: tuple[tuple[str, int], ...] = ()
