@@ -129,3 +129,15 @@ class GraphLoadReport(BaseModel):
     self_links_skipped: int = Field(ge=0)
     stale_links_deleted: int = Field(ge=0)
     finished_at: datetime
+
+
+class QueryParamEvidence(BaseModel):
+    """How changing one query parameter alone changed crawled content."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str = Field(min_length=1)
+    urls: int = Field(ge=0)
+    content_changed: int = Field(ge=0)
+    content_same: int = Field(ge=0)
+    kept: bool
