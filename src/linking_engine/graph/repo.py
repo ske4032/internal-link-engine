@@ -27,7 +27,7 @@ from linking_engine.errors import (
     DatabaseWriteError,
     SchemaError,
 )
-from linking_engine.models import Link, Page, TenantGraphCounts
+from linking_engine.models import IssueFlag, Link, Page, TenantGraphCounts
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping, Sequence
@@ -84,28 +84,56 @@ LINK_PROPERTIES: Final = {
     "weight": "weight",
     "surrounding_embedding": "surroundingEmbedding",
     "target_status_code": "targetStatusCode",
+    "issue_flags": "issueFlags",
+    "verdict": "verdict",
 }
 
-_UPSERT_PAGES: Final = """
+# Status flags and the FIX verdict on edge r, derived from its target t. Other audit flags are kept.
+_EDGE_STATUS: Final = """
+    r.targetStatusCode = t.statusCode,
+    r.issueFlags = [f IN coalesce(r.issueFlags, []) WHERE NOT f IN ['BROKEN', 'REDIRECTED']]
+        + CASE WHEN t.statusIssue IS NULL THEN [] ELSE [t.statusIssue] END,
+    r.verdict = CASE
+        WHEN t.statusIssue IS NOT NULL THEN 'FIX'
+        WHEN r.verdict = 'FIX' THEN null
+        ELSE r.verdict
+    END"""
+
+# Inbound edges are re-flagged in the same statement, so a status change never leaves stale verdicts.
+_UPSERT_PAGES: Final = (
+    """
 UNWIND $rows AS row
 MERGE (p:Page {tenantId: $tenant, url: row.url})
-SET p += row.props, p.isPlaceholder = false
+SET p += row.props, p.isPlaceholder = false, p.statusIssue = row.statusIssue
+WITH p
+CALL (p) {
+  MATCH (:Page)-[r:LINKS_TO]->(p)
+  WITH r, p AS t
+  SET"""
+    + _EDGE_STATUS
+    + """
+}
 RETURN count(p) AS n
 """
+)
 _UPSERT_PLACEHOLDERS: Final = """
 UNWIND $urls AS url
 MERGE (p:Page {tenantId: $tenant, url: url})
 ON CREATE SET p.isPlaceholder = true
 RETURN count(p) AS n
 """
-_UPSERT_LINKS: Final = """
+_UPSERT_LINKS: Final = (
+    """
 UNWIND $rows AS row
 MATCH (s:Page {tenantId: $tenant, url: row.source})
 MATCH (t:Page {tenantId: $tenant, url: row.target})
 MERGE (s)-[r:LINKS_TO {position: row.position}]->(t)
-SET r += row.props, r.targetStatusCode = t.statusCode
+SET r += row.props,"""
+    + _EDGE_STATUS
+    + """
 RETURN count(r) AS n
 """
+)
 _PRUNE_LINKS: Final = """
 UNWIND $sources AS src
 MATCH (s:Page {tenantId: $tenant, url: src.url})-[r:LINKS_TO]->(t:Page)
@@ -139,9 +167,13 @@ ORDER BY source, props.position
 """
 _COUNTS: Final = """
 MATCH (p:Page {tenantId: $tenant})
-WITH count(p) AS total, sum(CASE WHEN coalesce(p.isPlaceholder, false) THEN 1 ELSE 0 END) AS ph
+WITH count(p) AS total,
+     sum(CASE WHEN coalesce(p.isPlaceholder, false) THEN 1 ELSE 0 END) AS ph,
+     sum(CASE WHEN p.statusIssue = 'REDIRECTED' THEN 1 ELSE 0 END) AS redirected,
+     sum(CASE WHEN p.statusIssue = 'BROKEN' THEN 1 ELSE 0 END) AS broken
 OPTIONAL MATCH (:Page {tenantId: $tenant})-[r:LINKS_TO]->()
-RETURN total - ph AS pages, ph AS placeholders, count(r) AS links
+RETURN total - ph AS pages, ph AS placeholders, redirected, broken, count(r) AS links,
+       sum(CASE WHEN r.verdict = 'FIX' THEN 1 ELSE 0 END) AS fix
 """
 _DELETE_TENANT: Final = """
 MATCH (n) WHERE n.tenantId = $tenant
@@ -306,6 +338,7 @@ class GraphRepo:
             rows = [
                 {
                     "url": str(page.url),
+                    "statusIssue": _to_property(status_issue(page.status_code)),
                     "props": {
                         prop: _to_property(getattr(page, field))
                         for field, prop in _CRAWL_PROPERTIES.items()
@@ -423,6 +456,9 @@ class GraphRepo:
             pages=_int_row(row, "pages"),
             placeholders=_int_row(row, "placeholders"),
             links=_int_row(row, "links"),
+            redirected_pages=_int_row(row, "redirected"),
+            broken_pages=_int_row(row, "broken"),
+            fix_links=_int_row(row, "fix"),
         )
 
     # ── transport ────────────────────────────────────────────────────────────
@@ -474,6 +510,13 @@ def _translate(error: Neo4jError | DriverError, *, write: bool) -> DatabaseError
         return DatabaseUnavailableError("neo4j", f"server unavailable: {error}")
     kind = DatabaseWriteError if write else DatabaseReadError
     return kind("neo4j", f"{type(error).__name__}: {error}")
+
+
+def status_issue(status_code: int | None) -> IssueFlag | None:
+    """3xx is REDIRECTED, 4xx and 5xx are BROKEN; 2xx and unknown (placeholders) are None."""
+    if status_code is None or status_code < 300:
+        return None
+    return IssueFlag.REDIRECTED if status_code < 400 else IssueFlag.BROKEN
 
 
 def _require_tenant(tenant_id: str) -> None:

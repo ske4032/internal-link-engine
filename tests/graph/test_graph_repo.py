@@ -16,14 +16,17 @@ from linking_engine.graph.repo import (
     GraphRepo,
     load_migrations,
     split_statements,
+    status_issue,
 )
-from linking_engine.models import Link, Page, TenantGraphCounts
+from linking_engine.models import ActionType, IssueFlag, Link, Page, TenantGraphCounts
 
 BASE = "https://example.com"
 
 
 def page(path: str, **fields: object) -> Page:
-    return Page(url=HttpUrl(f"{BASE}{path}"), status_code=200, word_count=100, **fields)  # type: ignore[arg-type]
+    return Page.model_validate(
+        {"url": f"{BASE}{path}", "status_code": 200, "word_count": 100, **fields}
+    )
 
 
 def link(source: str, target: str, position: int, anchor: str = "anchor") -> Link:
@@ -261,3 +264,73 @@ async def test_node_that_does_not_fit_the_model_raises_read_error(
 async def test_empty_tenant_id_is_rejected(graph: GraphRepo) -> None:
     with pytest.raises(ValueError, match="tenant_id"):
         await graph.counts(" ")
+
+
+@pytest.mark.parametrize(
+    ("code", "flag"),
+    [
+        (None, None),
+        (200, None),
+        (204, None),
+        (301, IssueFlag.REDIRECTED),
+        (308, IssueFlag.REDIRECTED),
+        (404, IssueFlag.BROKEN),
+        (429, IssueFlag.BROKEN),
+        (503, IssueFlag.BROKEN),
+    ],
+)
+def test_status_issue(code: int | None, flag: IssueFlag | None) -> None:
+    assert status_issue(code) is flag
+
+
+@pytest.mark.integration
+async def test_links_to_non_2xx_pages_are_flagged_fix(graph: GraphRepo, tenant: str) -> None:
+    await graph.upsert_pages(
+        tenant,
+        [
+            page("/src"),
+            page("/ok"),
+            page("/moved", status_code=301),
+            page("/gone", status_code=404),
+        ],
+    )
+    await graph.upsert_placeholders(tenant, [url("/ghost")])
+    links = [
+        link("/src", target, i) for i, target in enumerate(["/ok", "/moved", "/gone", "/ghost"])
+    ]
+    await graph.replace_links(tenant, [url("/src")], links)
+
+    stored = {str(lk.target_url): lk for lk in await graph.links_from(tenant, [url("/src")])}
+    assert stored[url("/moved")].issue_flags == {IssueFlag.REDIRECTED}
+    assert stored[url("/moved")].verdict is ActionType.FIX
+    assert stored[url("/gone")].issue_flags == {IssueFlag.BROKEN}
+    assert stored[url("/gone")].verdict is ActionType.FIX
+    for healthy in ("/ok", "/ghost"):
+        assert stored[url(healthy)].issue_flags == frozenset()
+        assert stored[url(healthy)].verdict is None
+    counts = await graph.counts(tenant)
+    assert (counts.redirected_pages, counts.broken_pages, counts.fix_links) == (1, 1, 2)
+
+
+@pytest.mark.integration
+async def test_status_change_reflags_inbound_links_and_keeps_audit_flags(
+    graph: GraphRepo, tenant: str
+) -> None:
+    await graph.upsert_pages(tenant, [page("/src"), page("/t", status_code=503)])
+    await graph.replace_links(tenant, [url("/src")], [link("/src", "/t", 0)])
+    await graph._auto(
+        "MATCH (:Page {tenantId: $t})-[r:LINKS_TO]->() SET r.issueFlags = r.issueFlags + 'GENERIC'",
+        t=tenant,
+    )
+
+    await graph.upsert_pages(tenant, [page("/t")])
+    [recovered] = await graph.links_from(tenant, [url("/src")])
+    assert recovered.issue_flags == {IssueFlag.GENERIC}
+    assert recovered.verdict is None
+    assert recovered.target_status_code == 200
+
+    await graph.upsert_pages(tenant, [page("/t", status_code=410)])
+    [broken] = await graph.links_from(tenant, [url("/src")])
+    assert broken.issue_flags == {IssueFlag.GENERIC, IssueFlag.BROKEN}
+    assert broken.verdict is ActionType.FIX
+    assert (await graph.counts(tenant)).fix_links == 1
