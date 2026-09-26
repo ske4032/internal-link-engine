@@ -21,6 +21,7 @@ from linking_engine.models.corpus import (
     PageRecord,
     PageSummary,
 )
+from linking_engine.models.embedding import PageEmbedding, PageText
 from linking_engine.models.enums import (
     ActionType,
     AnchorType,
@@ -55,8 +56,10 @@ __all__ = [
     "LinkAuditResult",
     "LinkRecord",
     "Page",
+    "PageEmbedding",
     "PageRecord",
     "PageSummary",
+    "PageText",
     "PageType",
     "PairFeatures",
     "Recommendation",

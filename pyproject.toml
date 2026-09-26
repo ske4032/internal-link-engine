@@ -205,12 +205,9 @@ DEP002 = [
   # ingest/
   # graph/repo.py
   # embedding/
-  "voyageai",
-  "tokenizers",
   # graph/algorithms.py
   "igraph",
   "leidenalg",
-  "numpy",
   "scikit-learn",
   "hdbscan",
   # ml/
@@ -224,7 +221,6 @@ DEP002 = [
   "prefect",
   # serving and cross-cutting
   "redis",
-  "structlog",
   "orjson",
   "rich",
 ]
