@@ -92,7 +92,8 @@
     "hard_deny": [
       "$defaults",
       "Committing, pushing, or pasting into any gh issue, PR, comment, or external service the contents of .env or .env.* files, or any value of VOYAGE_API_KEY, GEMINI_API_KEY, or another credential. The repository is public.",
-      "Uploading the synthetic corpus, evaluation outputs, or docs to paste, gist, or file-sharing services, or to any remote other than github.com/ske4032/internal-link-engine."
+      "Uploading the synthetic corpus, evaluation outputs, or docs to paste, gist, or file-sharing services, or to any remote other than github.com/ske4032/internal-link-engine.",
+      "Any write, update, delete, drop, rename, index or collection change in the MongoDB database action1. It is the production crawl source and is strictly read-only; the project writes only to linking_engine."
     ]
   }
 }

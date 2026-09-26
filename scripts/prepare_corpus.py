@@ -1,13 +1,25 @@
-"""Prepare a scraped corpus for the link engine: clean the markdown, extract links.
+"""Transform a scraped crawl (the pages_v2 shape) into the link engine schema.
 
 Dry run by default: reports what cleaning produces and writes nothing.
 
     uv run --env-file .env python scripts/prepare_corpus.py
-    uv run --env-file .env python scripts/prepare_corpus.py --tenant <id> --write
+    uv run --env-file .env python scripts/prepare_corpus.py --tenant action1 --write
 
-With ``--write`` each prepared page is upserted into the project database's
-``pages`` collection, keyed on ``(tenantId, url)`` so re-runs converge
-(ADR-013). Only pages with HTTP 200 and ``usable`` set are prepared.
+The source database is read-only: it is only ever queried with ``find``, and the
+script refuses to run if source and target are the same database.
+
+With ``--write`` two collections in the project database are upserted, keyed so
+re-runs converge (ADR-013):
+
+* ``pages``, one per source page, keyed ``(tenantId, url)``: status and usable
+  flag as crawled, meta title, meta description, h1, heading outline, clean
+  body text, word count, link count, content hash, scrape time.
+* ``links``, one per body link, keyed ``(tenantId, sourceUrl, position)``:
+  target url, anchor text, surrounding sentence, internal flag. Positions past a
+  page's current link count are deleted, so a page that lost links converges.
+
+Every source page is written; downstream stages use ``statusCode`` and
+``usable`` to decide what to embed.
 """
 
 from __future__ import annotations
@@ -19,9 +31,14 @@ import statistics
 from collections import Counter
 from datetime import UTC, datetime
 
-from pymongo import MongoClient, UpdateOne
+from pymongo import DeleteMany, MongoClient, UpdateOne
 
-from linking_engine.ingest.markdown_clean import clean_page, find_boilerplate, line_shares
+from linking_engine.ingest.markdown_clean import (
+    clean_meta,
+    clean_page,
+    find_boilerplate,
+    line_shares,
+)
 
 # Anything that should never survive cleaning.
 RESIDUE = {
@@ -53,6 +70,8 @@ def main() -> None:
     args = ap.parse_args()
     if args.write and not args.tenant:
         ap.error("--write needs --tenant")
+    if args.source_db == os.environ["MONGO_DB"]:
+        ap.error("source and target database must differ: the source is read-only")
 
     client = MongoClient(os.environ["MONGO_URI"])
     source = client[args.source_db][args.source_collection]
@@ -193,34 +212,86 @@ def main() -> None:
     if not args.write:
         print("\ndry run: nothing written")
         return
-    target = client[os.environ["MONGO_DB"]]["pages"]
+    db = client[os.environ["MONGO_DB"]]
     now = datetime.now(UTC)
-    ops = [
-        UpdateOne(
-            {"tenantId": args.tenant, "url": str(page.url)},
-            {
-                "$set": {
-                    "tenantId": args.tenant,
-                    "url": str(page.url),
-                    "title": page.title,
-                    "h1": page.h1,
-                    "meta": doc.get("description"),
-                    "bodyText": page.body_text,
-                    "links": [link.model_dump(mode="json") for link in page.links],
-                    "contentHash": doc.get("contentHash"),
-                    "crawledAt": doc.get("scrapedAt"),
-                    "source": f"{args.source_db}.{args.source_collection}",
-                    "preparedAt": now,
-                }
-            },
-            upsert=True,
+    source_name = f"{args.source_db}.{args.source_collection}"
+    written = [
+        (
+            doc,
+            clean_page(
+                doc.get("content") or "",
+                doc["url"],
+                title=doc.get("title"),
+                boilerplate=boilerplate,
+            ),
         )
-        for doc, page in pages
+        for doc in docs
     ]
-    result = target.bulk_write(ops, ordered=False)
+    page_ops = []
+    link_ops: list[UpdateOne | DeleteMany] = []
+    for doc, page in written:
+        url = str(page.url)
+        description = clean_meta(doc.get("description"))
+        page_ops.append(
+            UpdateOne(
+                {"tenantId": args.tenant, "url": url},
+                {
+                    "$set": {
+                        "tenantId": args.tenant,
+                        "url": url,
+                        "statusCode": doc.get("statusCode"),
+                        "usable": doc.get("usable"),
+                        "metaTitle": page.title,
+                        "metaDescription": description,
+                        "h1": page.h1,
+                        "headings": [{"level": lvl, "text": txt} for lvl, txt in page.headings],
+                        "bodyText": page.body_text,
+                        "wordCount": len(page.body_text.split()),
+                        "linkCount": len(page.links),
+                        "contentHash": doc.get("contentHash"),
+                        "scrapedAt": doc.get("scrapedAt"),
+                        "source": source_name,
+                        "preparedAt": now,
+                    }
+                },
+                upsert=True,
+            )
+        )
+        for position, link in enumerate(page.links):
+            link_ops.append(
+                UpdateOne(
+                    {"tenantId": args.tenant, "sourceUrl": url, "position": position},
+                    {
+                        "$set": {
+                            "tenantId": args.tenant,
+                            "sourceUrl": url,
+                            "position": position,
+                            "targetUrl": str(link.target_url),
+                            "anchorText": link.anchor_text,
+                            "surroundingText": link.surrounding_text,
+                            "isInternal": link.is_internal,
+                            "preparedAt": now,
+                        }
+                    },
+                    upsert=True,
+                )
+            )
+        link_ops.append(
+            DeleteMany(
+                {
+                    "tenantId": args.tenant,
+                    "sourceUrl": url,
+                    "position": {"$gte": len(page.links)},
+                }
+            )
+        )
+    pages_result = db["pages"].bulk_write(page_ops, ordered=False)
+    links_result = db["links"].bulk_write(link_ops, ordered=False)
     print(
-        f"\nwritten to {os.environ['MONGO_DB']}.pages under tenant {args.tenant!r}: "
-        f"{result.upserted_count} inserted, {result.modified_count} updated"
+        f"\nwritten to {os.environ['MONGO_DB']} under tenant {args.tenant!r}:\n"
+        f"  pages: {pages_result.upserted_count} inserted, {pages_result.modified_count} updated\n"
+        f"  links: {links_result.upserted_count} inserted, {links_result.modified_count} updated, "
+        f"{links_result.deleted_count} stale deleted"
     )
 
 

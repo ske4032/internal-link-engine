@@ -72,6 +72,19 @@ _BREADCRUMB_CONTINUATION = re.compile(r"^(?:[\u203a\u00bb]|5)\s+\S")
 _WRAPPED_LINK_TEXT = re.compile(r"\[[^\[\]\n]*(?:\n[^\[\]\n]*){1,3}\]\(")
 _ORPHAN_LINK_TAIL = re.compile(r"\]\(\s*[^)\s]*\s*\)")
 _ORPHAN_STRONG = re.compile(r"\*\*")
+# Icon-font glyphs a scraper renders in place of bullets, at line start.
+_GLYPH_BULLET = re.compile(
+    r"^\s*[\^\u2022\u00b7\u25aa\u25e6\u2610\u2611\u2713\u2714\u2013\u2014\u2192]\s+"
+)
+_REPLACEMENT_CHAR = re.compile(r"\ufffd")
+# A fragment the source wrapped right after a link: ", identifying ...". The
+# space keeps ".NET" and ".action1.com" from counting.
+_CONTINUATION = re.compile(r"^[,.;:](?:\s|$)")
+# What an image-only table row or a stripped separator leaves behind: ";".
+_PUNCTUATION_ONLY = re.compile(r"[^\w]+")
+# A link or image target, blanked so template lines that differ only in their
+# urls (per-post "Previous / Next" links) compare equal.
+_LINK_TARGET = re.compile(r"\]" + _DEST.format(name="target"))
 # Navigation candidates: a line that is only a link (optionally behind list or
 # breadcrumb markers), or a list item or heading.
 _LINK_ONLY = re.compile(
@@ -84,14 +97,18 @@ _NON_WEB_SCHEMES = ("mailto:", "tel:", "javascript:", "data:", "sms:", "ftp:")
 
 
 def line_shares(documents: Iterable[str], min_length: int = 20) -> list[tuple[str, float]]:
-    """Every stripped line of at least ``min_length`` characters, with the share
-    of documents it appears in, most widespread first."""
+    """Every line of at least ``min_length`` characters, as its template key,
+    with the share of documents it appears in, most widespread first."""
     counts: Counter[str] = Counter()
     total = 0
     for document in documents:
         total += 1
         counts.update(
-            {line.strip() for line in document.splitlines() if len(line.strip()) >= min_length}
+            {
+                template_key(line)
+                for line in document.splitlines()
+                if len(line.strip()) >= min_length
+            }
         )
     if total == 0:
         return []
@@ -104,11 +121,12 @@ def find_boilerplate(
     nav_min_share: float = 0.02,
     min_length: int = 20,
 ) -> frozenset[str]:
-    """Site template, found by repetition across documents.
+    """Site template, found by repetition across documents, as template keys
+    (see ``template_key``: lines differing only in link targets are one line).
 
     Two tiers, because one threshold cannot separate template from content:
 
-    * any line repeated verbatim on at least ``min_share`` of documents
+    * any line repeated on at least ``min_share`` of documents
       (banners, calls to action);
     * a navigation line (link-only, list item or heading) repeated on at least
       ``nav_min_share`` (a section sidebar, tag lists, bylines).
@@ -126,6 +144,20 @@ def find_boilerplate(
         for line, share in line_shares(documents, min_length)
         if share >= min_share or (share >= nav_min_share and is_navigation(line))
     )
+
+
+def template_key(line: str) -> str:
+    """A line with link and image targets blanked: the identity used to compare
+    template lines across pages."""
+    return _LINK_TARGET.sub("]()", line.strip())
+
+
+def clean_meta(text: str | None) -> str | None:
+    """Clean a plain-text meta field such as a title or description."""
+    if text is None:
+        return None
+    text = _REPLACEMENT_CHAR.sub("", _ZERO_WIDTH.sub("", text))
+    return _SPACES.sub(" ", html.unescape(text)).strip() or None
 
 
 def is_navigation(line: str) -> bool:
@@ -148,18 +180,24 @@ def clean_page(
     removed: Counter[str] = Counter()
     links: list[ExtractedLink] = []
     out: list[str] = []
+    headings: list[tuple[int, str]] = []
     h1: str | None = None
+    # The cleaned text of the line directly above, for setext underlines. Reset
+    # by anything that is not a kept text line.
+    last_line: str | None = None
 
     text = _ZERO_WIDTH.sub("", markdown.replace("\r\n", "\n").replace("\r", "\n"))
     text = _WRAPPED_LINK_TEXT.sub(lambda m: m.group(0).replace("\n", " "), text)
+    template = frozenset(template_key(line) for line in boilerplate)
     in_breadcrumb = False
     for raw in text.split("\n"):
         stripped = raw.strip()
+        underlined, last_line = last_line, None
         if not stripped:
             in_breadcrumb = False
             out.append("")
             continue
-        if stripped in boilerplate:
+        if template_key(stripped) in template:
             removed["boilerplate_line"] += 1
             in_breadcrumb = True
             continue
@@ -173,8 +211,13 @@ def clean_page(
             continue
         in_breadcrumb = False
         if _RULE.match(raw):
-            if stripped.startswith("=") and h1 is None:
-                h1 = _last_text(out)
+            # Directly under a text line, "===" and "---" are setext h1 and h2
+            # underlines; anywhere else they are horizontal rules.
+            if underlined and stripped[0] in "=-":
+                level = 1 if stripped[0] == "=" else 2
+                headings.append((level, underlined))
+                if level == 1 and h1 is None:
+                    h1 = underlined
             removed["rule_or_underline"] += 1
             continue
         if _TABLE_RULE.match(raw):
@@ -192,18 +235,30 @@ def clean_page(
             removed["table_row"] += 1
 
         line = _strip_block_markers(line, removed)
-        is_h1 = False
+        level = 0
         heading = _ATX.match(line)
         if heading:
             line = heading.group(2)
-            is_h1 = heading.group(1) == "#"
+            level = len(heading.group(1))
             removed["heading_marker"] += 1
 
         cleaned, found = _clean_inline(line, page_url, host, removed)
+        # A glyph can surface only once inline markup is gone: "** \u2013 text".
+        unglyphed = _GLYPH_BULLET.sub("", cleaned, count=1)
+        if unglyphed != cleaned:
+            removed["glyph_bullet"] += 1
+            cleaned = unglyphed
+        if not found and _PUNCTUATION_ONLY.fullmatch(cleaned):
+            removed["punctuation_line"] += 1
+            continue
         if not cleaned:
             continue
-        if is_h1 and h1 is None:
-            h1 = cleaned
+        if level:
+            headings.append((level, cleaned))
+            if level == 1 and h1 is None:
+                h1 = cleaned
+        else:
+            last_line = cleaned
         for anchor, target, internal in found:
             try:
                 links.append(
@@ -220,8 +275,9 @@ def clean_page(
 
     return CleanedPage(
         url=HttpUrl(page_url),
-        title=title.strip() if title and title.strip() else None,
+        title=clean_meta(title),
         h1=h1,
+        headings=tuple(headings),
         body_text=_join(out),
         links=tuple(links),
         removed=tuple(sorted(removed.items())),
@@ -229,17 +285,22 @@ def clean_page(
 
 
 def _strip_block_markers(line: str, removed: Counter[str]) -> str:
-    """Strip blockquote and list markers, which can nest: ``> * * text``."""
+    """Strip blockquote, list and glyph-bullet markers, which nest: ``> * ^ text``."""
+    markers = (
+        (_BLOCKQUOTE, "blockquote_marker"),
+        (_LIST_MARKER, "list_marker"),
+        (_GLYPH_BULLET, "glyph_bullet"),
+    )
     while True:
-        new = _BLOCKQUOTE.sub("", line, count=1)
-        if new != line:
-            removed["blockquote_marker"] += 1
-        after = _LIST_MARKER.sub("", new, count=1)
-        if after != new:
-            removed["list_marker"] += 1
-        if after == line:
+        new = line
+        for pattern, kind in markers:
+            stripped = pattern.sub("", new, count=1)
+            if stripped != new:
+                removed[kind] += 1
+                new = stripped
+        if new == line:
             return line
-        line = after
+        line = new
 
 
 def _clean_inline(
@@ -279,6 +340,7 @@ def _clean_inline(
 
 
 def _clean_text(text: str) -> str:
+    text = _REPLACEMENT_CHAR.sub("", text)
     text = _INLINE_CODE.sub(r"\1", text)
     text = _STRONG.sub(r"\2", text)
     text = _EM_STAR.sub(r"\1", text)
@@ -319,18 +381,15 @@ def _sentence_containing(text: str, anchor: str) -> str:
     return text
 
 
-def _last_text(lines: list[str]) -> str | None:
-    for line in reversed(lines):
-        if line:
-            return line
-    return None
-
-
 def _join(lines: list[str]) -> str:
-    """Join cleaned lines, keeping one blank line between paragraphs."""
+    """Join cleaned lines, keeping one blank line between paragraphs and gluing
+    a punctuation fragment back onto the line it continues."""
     result: list[str] = []
     for line in lines:
         if not line and (not result or not result[-1]):
+            continue
+        if line and _CONTINUATION.match(line) and result and result[-1]:
+            result[-1] += line
             continue
         result.append(line)
     while result and not result[-1]:
