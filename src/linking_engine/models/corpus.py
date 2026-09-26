@@ -42,6 +42,9 @@ class CleanedPage(BaseModel):
 
 
 # MongoDB documents; stored keys are the camelCase form of these field names.
+# body_hash is required so a document written without one fails on read.
+
+_SHA256_HEX = r"^[0-9a-f]{64}$"
 
 
 class Heading(BaseModel):
@@ -67,6 +70,7 @@ class PageRecord(BaseModel):
     word_count: int = Field(ge=0)
     link_count: int = Field(ge=0)
     content_hash: str | None
+    body_hash: str = Field(pattern=_SHA256_HEX)
     scraped_at: AwareDatetime | None
     source: str = Field(min_length=1)
 
@@ -95,6 +99,7 @@ class PageSummary(BaseModel):
     status_code: int | None = Field(ge=100, le=599)
     word_count: int = Field(ge=0)
     content_hash: str | None
+    body_hash: str = Field(pattern=_SHA256_HEX)
 
 
 class LinkRecord(BaseModel):

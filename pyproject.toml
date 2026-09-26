@@ -223,8 +223,6 @@ DEP002 = [
   "mlflow",
   # anchor/
   "nltk",
-  # pipeline/
-  "prefect",
   # serving and cross-cutting
   "redis",
   "orjson",

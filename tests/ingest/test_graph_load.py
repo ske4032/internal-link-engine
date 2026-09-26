@@ -2,11 +2,20 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pytest
 from pydantic import HttpUrl
 
 from linking_engine.ingest.graph_load import TargetResolver, canonical_key, load_tenant_graph
-from linking_engine.models import Heading, LinkRecord, PageRecord, TenantGraphCounts
+from linking_engine.ingest.markdown_clean import body_hash
+from linking_engine.models import (
+    EmbeddingSelection,
+    EmbeddingTarget,
+    Heading,
+    LinkRecord,
+    PageRecord,
+    TenantGraphCounts,
+)
 
 if TYPE_CHECKING:
     from linking_engine.graph.repo import GraphRepo
@@ -41,7 +50,7 @@ def test_resolver_prefers_exact_then_canonical_then_one_placeholder_per_key() ->
     assert resolver.resolve("https://example.com/new") == ("https://www.example.com/new/", True)
 
 
-def page(path: str, links: int) -> PageRecord:
+def page(path: str, links: int, body: str = "text") -> PageRecord:
     return PageRecord(
         url=HttpUrl(f"{BASE}{path}"),
         status_code=200,
@@ -50,10 +59,11 @@ def page(path: str, links: int) -> PageRecord:
         meta_description=None,
         h1=None,
         headings=(Heading(level=1, text="H"),),
-        body_text="text",
-        word_count=1,
+        body_text=body,
+        word_count=len(body.split()),
         link_count=links,
         content_hash="h",
+        body_hash=body_hash(body),
         scraped_at=None,
         source="test",
     )
@@ -98,3 +108,68 @@ async def test_load_builds_the_graph_with_placeholders_and_converges(
     shrunk = await load_tenant_graph(mongo, graph, tenant)
     assert (shrunk.links, shrunk.stale_links_deleted) == (1, 2)
     assert (await graph.counts(tenant)).links == 1
+
+
+async def graph_body_hashes(graph: GraphRepo, tenant: str) -> dict[str, object]:
+    rows = await graph._auto(
+        "MATCH (p:Page {tenantId: $t}) WHERE NOT coalesce(p.isPlaceholder, false) "
+        "RETURN p.url AS url, p.bodyHash AS hash",
+        t=tenant,
+    )
+    return {str(row["url"]): row["hash"] for row in rows}
+
+
+async def mongo_body_hashes(mongo: MongoRepo, tenant: str) -> dict[str, str]:
+    return {
+        str(s.url): s.body_hash async for batch in mongo.iter_page_summaries(tenant) for s in batch
+    }
+
+
+@pytest.mark.integration
+async def test_load_carries_body_hash_and_follows_a_body_edit(
+    mongo: MongoRepo, graph: GraphRepo, tenant: str
+) -> None:
+    await mongo.write_pages(tenant, [page("/a", 0, "first body"), page("/b", 0, "other body")], [])
+    await load_tenant_graph(mongo, graph, tenant)
+    loaded = await graph_body_hashes(graph, tenant)
+    assert loaded == await mongo_body_hashes(mongo, tenant)
+    assert loaded == {f"{BASE}/a": body_hash("first body"), f"{BASE}/b": body_hash("other body")}
+
+    await mongo.write_pages(tenant, [page("/a", 0, "first body, edited")], [])
+    await load_tenant_graph(mongo, graph, tenant)
+    reloaded = await graph_body_hashes(graph, tenant)
+    assert reloaded == await mongo_body_hashes(mongo, tenant)
+    assert reloaded[f"{BASE}/a"] == body_hash("first body, edited") != loaded[f"{BASE}/a"]
+    assert reloaded[f"{BASE}/b"] == loaded[f"{BASE}/b"]
+
+
+@pytest.mark.integration
+async def test_a_body_edit_makes_exactly_that_page_a_target_again(
+    mongo: MongoRepo, graph: GraphRepo, tenant: str
+) -> None:
+    bodies = {"/a": "alpha body", "/b": "beta body", "/c": "gamma body"}
+    await mongo.write_pages(tenant, [page(path, 0, text) for path, text in bodies.items()], [])
+    await load_tenant_graph(mongo, graph, tenant)
+    urls = [f"{BASE}{path}" for path in bodies]
+    vectors = np.random.default_rng(0).standard_normal((3, 2048)).astype(np.float32)
+    await graph.write_embeddings(
+        tenant,
+        urls,
+        [body_hash(text) for text in bodies.values()],
+        vectors,
+        model="voyage-4-large",
+        dimensions=2048,
+    )
+    assert await graph.embedding_selection(tenant) == EmbeddingSelection(
+        targets=(), up_to_date=3, placeholders=0, non_2xx=0
+    )
+
+    await mongo.write_pages(tenant, [page("/b", 0, "beta body, edited")], [])
+    await load_tenant_graph(mongo, graph, tenant)
+
+    assert await graph.embedding_selection(tenant) == EmbeddingSelection(
+        targets=(EmbeddingTarget(url=f"{BASE}/b", body_hash=body_hash("beta body, edited")),),
+        up_to_date=2,
+        placeholders=0,
+        non_2xx=0,
+    )

@@ -32,10 +32,10 @@ from linking_engine.errors import (
     EmbeddingResponseError,
     EmbeddingUnavailableError,
 )
-from linking_engine.models import PageEmbedding, PageText
+from linking_engine.models import EmbeddingBatch, PageEmbedding, PageText
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import AsyncGenerator, Iterator, Sequence
 
     from tenacity import RetryCallState
     from tokenizers import Encoding
@@ -164,39 +164,38 @@ class VoyageClient:
         self._sdk = sdk
         self._tokenizer = tokenizer
 
+    @property
+    def model(self) -> str:
+        return self._model
+
+    @property
+    def dimension(self) -> int:
+        return self._dimension
+
     def count_tokens(self, texts: Sequence[str]) -> list[int]:
         """Token count per text with the model's own tokenizer."""
         return [len(encoding) for encoding in self._encode(texts)]
 
     async def embed(self, pages: Sequence[PageText]) -> list[PageEmbedding]:
         """One unit-norm vector per page, in input order."""
+        return [item async for batch in self.iter_embed(pages) for item in batch.embeddings]
+
+    async def iter_embed(self, pages: Sequence[PageText]) -> AsyncGenerator[EmbeddingBatch]:
+        """One batch of unit-norm vectors per Voyage request, in input order."""
         if not pages:
-            return []
+            return
         encodings = await asyncio.to_thread(self._encode, [page.text for page in pages])
         prepared = [
             self._fit(page, encoding) for page, encoding in zip(pages, encodings, strict=True)
         ]
         # Release token/offset arrays before the network-bound batches.
         del encodings
-        results: list[PageEmbedding] = []
         for span in token_batches(
             [item.tokens for item in prepared],
             budget=self._settings.request_token_budget,
             max_items=self._settings.max_batch_items,
         ):
-            batch = prepared[span.start : span.stop]
-            vectors = await self._embed_batch(batch)
-            results.extend(
-                PageEmbedding(
-                    url=item.url,
-                    vector=vector,
-                    tokens=item.tokens,
-                    original_tokens=item.original_tokens,
-                    truncated=item.truncated,
-                )
-                for item, vector in zip(batch, vectors, strict=True)
-            )
-        return results
+            yield await self._embed_batch(prepared[span.start : span.stop])
 
     def _encode(self, texts: Sequence[str]) -> list[Encoding]:
         return self._load_tokenizer().encode_batch(list(texts))
@@ -227,7 +226,7 @@ class VoyageClient:
         log.warning("embedding.truncated", url=page.url, original_tokens=original, limit=limit)
         return _Prepared(page.url, page.text[:cut], sent, original)
 
-    async def _embed_batch(self, batch: Sequence[_Prepared]) -> list[tuple[float, ...]]:
+    async def _embed_batch(self, batch: Sequence[_Prepared]) -> EmbeddingBatch:
         texts = [item.text for item in batch]
         started = time.perf_counter()
         result, retries = await self._call(texts)
@@ -242,7 +241,19 @@ class VoyageClient:
             retries=retries,
             truncated=sum(item.truncated for item in batch),
         )
-        return vectors
+        return EmbeddingBatch(
+            embeddings=tuple(
+                PageEmbedding(
+                    url=item.url,
+                    vector=vector,
+                    tokens=item.tokens,
+                    original_tokens=item.original_tokens,
+                    truncated=item.truncated,
+                )
+                for item, vector in zip(batch, vectors, strict=True)
+            ),
+            api_tokens=result.total_tokens,
+        )
 
     async def _call(self, texts: list[str]) -> tuple[VoyageEmbedResult, int]:
         what = f"embed {len(texts)} texts"
@@ -292,6 +303,10 @@ class VoyageClient:
                 raise EmbeddingResponseError(
                     f"vector {index} has dimension {len(vector)}, expected {self._dimension}"
                 )
+        # Typed as int by the SDK; checked because it becomes a validated count.
+        total_tokens: object = result.total_tokens
+        if isinstance(total_tokens, bool) or not isinstance(total_tokens, int) or total_tokens < 0:
+            raise EmbeddingResponseError(f"total_tokens {total_tokens!r} is not a count")
         matrix = np.asarray(embeddings, dtype=np.float64)
         norms = np.linalg.norm(matrix, axis=1)
         unusable = ~np.isfinite(norms) | (norms == 0)

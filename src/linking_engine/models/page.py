@@ -37,6 +37,8 @@ class Page(BaseModel):
     is_placeholder: bool = False
     status_code: int | None = Field(default=None, ge=100, le=599)
     content_hash: str | None = None
+    # sha256 of the embedded body text; content_hash is the crawler's raw-page hash.
+    body_hash: str | None = None
     word_count: int | None = Field(default=None, ge=0)
     page_type: PageType | None = None
     is_indexable: bool | None = None
@@ -61,9 +63,9 @@ class Page(BaseModel):
     is_chunked: bool = False
     embedding_model: str | None = None
     embedding_dimensions: int | None = Field(default=None, ge=1)
-    # Resume marker. Written in the same transaction as the vector it describes,
-    # so an interrupted run never re-embeds content it already paid for.
-    embedded_content_hash: str | None = None
+    # Resume marker: body_hash of the stored vector, written in the same transaction.
+    embedded_body_hash: str | None = None
+    embedded_at: datetime | None = None
     content_embedding: tuple[float, ...] | None = None
     gnn_embedding: tuple[float, ...] | None = None
 

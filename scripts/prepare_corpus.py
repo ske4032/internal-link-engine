@@ -19,6 +19,7 @@ import statistics
 from collections import Counter
 
 from linking_engine.ingest.markdown_clean import (
+    body_hash,
     clean_meta,
     clean_page,
     find_boilerplate,
@@ -202,6 +203,7 @@ async def main() -> None:
                 word_count=len(page.body_text.split()),
                 link_count=len(page.links),
                 content_hash=doc.content_hash,
+                body_hash=body_hash(page.body_text),
                 scraped_at=doc.scraped_at,
                 source=f"{args.source_db}.{args.source_collection}",
             )

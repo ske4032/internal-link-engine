@@ -8,6 +8,7 @@ from importlib.resources import files
 from itertools import batched
 from typing import TYPE_CHECKING, Final, LiteralString, Self
 
+import numpy as np
 from neo4j import READ_ACCESS, WRITE_ACCESS, AsyncGraphDatabase
 from neo4j.exceptions import (
     AuthError,
@@ -27,12 +28,21 @@ from linking_engine.errors import (
     DatabaseWriteError,
     SchemaError,
 )
-from linking_engine.models import IssueFlag, Link, Page, TenantGraphCounts
+from linking_engine.models import (
+    EmbeddingModelCount,
+    EmbeddingSelection,
+    EmbeddingTarget,
+    IssueFlag,
+    Link,
+    Page,
+    TenantGraphCounts,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping, Sequence
     from types import TracebackType
 
+    import numpy.typing as npt
     from neo4j import AsyncDriver, AsyncManagedTransaction
 
 VECTOR_DIMENSIONS: Final = 2048
@@ -46,6 +56,7 @@ Row = dict[str, object]
 _CRAWL_PROPERTIES: Final = {
     "status_code": "statusCode",
     "content_hash": "contentHash",
+    "body_hash": "bodyHash",
     "word_count": "wordCount",
     "page_type": "pageType",
     "is_indexable": "isIndexable",
@@ -67,7 +78,8 @@ PAGE_PROPERTIES: Final = {
     "is_chunked": "isChunked",
     "embedding_model": "embeddingModel",
     "embedding_dimensions": "embeddingDimensions",
-    "embedded_content_hash": "embeddedContentHash",
+    "embedded_body_hash": "embeddedBodyHash",
+    "embedded_at": "embeddedAt",
     "content_embedding": "content_embedding",
     "gnn_embedding": "gnn_embedding",
 }
@@ -175,6 +187,43 @@ OPTIONAL MATCH (:Page {tenantId: $tenant})-[r:LINKS_TO]->()
 RETURN total - ph AS pages, ph AS placeholders, redirected, broken, count(r) AS links,
        sum(CASE WHEN r.verdict = 'FIX' THEN 1 ELSE 0 END) AS fix
 """
+# A target is a crawled 2xx page whose vector is missing or was computed from another body.
+_EMBEDDING_SELECTION: Final = """
+MATCH (p:Page {tenantId: $tenant})
+WITH p, CASE
+    WHEN coalesce(p.isPlaceholder, false) THEN 'placeholder'
+    WHEN p.statusCode IS NULL OR p.statusCode < 200 OR p.statusCode > 299 THEN 'non_2xx'
+    WHEN p.embeddedBodyHash IS NOT NULL AND p.embeddedBodyHash = p.bodyHash
+         AND p.content_embedding IS NOT NULL THEN 'up_to_date'
+    ELSE 'target'
+  END AS state
+ORDER BY p.url
+RETURN count(CASE state WHEN 'placeholder' THEN 1 END) AS placeholders,
+       count(CASE state WHEN 'non_2xx' THEN 1 END) AS non_2xx,
+       count(CASE state WHEN 'up_to_date' THEN 1 END) AS up_to_date,
+       collect(CASE state WHEN 'target' THEN {url: p.url, body_hash: p.bodyHash} END) AS targets
+"""
+_EMBEDDING_MODELS: Final = """
+MATCH (p:Page {tenantId: $tenant})
+WHERE p.content_embedding IS NOT NULL
+RETURN p.embeddingModel AS embedding_model, count(p) AS vectors
+ORDER BY embedding_model
+"""
+# setNodeVectorProperty stores float32, half the size of a plain SET of the same list.
+_WRITE_EMBEDDINGS: Final = """
+UNWIND $rows AS row
+MATCH (p:Page {tenantId: $tenant, url: row.url})
+WHERE p.bodyHash = row.hash AND NOT coalesce(p.isPlaceholder, false)
+CALL db.create.setNodeVectorProperty(p, 'content_embedding', row.vec)
+SET p.embeddedBodyHash = row.hash,
+    p.embeddingModel = $model,
+    p.embeddingDimensions = $dimensions,
+    p.embeddedAt = datetime()
+RETURN count(p) AS n
+"""
+_DROPPED_EMBEDDINGS: Final = (
+    "rows whose page is missing, is a placeholder or has a changed bodyHash are dropped"
+)
 _DELETE_TENANT: Final = """
 MATCH (n) WHERE n.tenantId = $tenant
 CALL (n) { DETACH DELETE n } IN TRANSACTIONS OF $batch ROWS
@@ -403,6 +452,33 @@ class GraphRepo:
             deleted += _int(await self._write(_PRUNE_LINKS, tenant=tenant_id, sources=rows))
         return written, deleted
 
+    async def write_embeddings(
+        self,
+        tenant_id: str,
+        urls: Sequence[str],
+        body_hashes: Sequence[str],
+        vectors: npt.NDArray[np.float32],
+        *,
+        model: str,
+        dimensions: int,
+    ) -> int:
+        """Write one flush of content vectors in one transaction: every row is written or none."""
+        _require_tenant(tenant_id)
+        _check_embeddings(urls, body_hashes, vectors, model=model, dimensions=dimensions)
+        rows = [
+            {"url": url, "hash": body_hash, "vec": vector}
+            for url, body_hash, vector in zip(urls, body_hashes, vectors.tolist(), strict=True)
+        ]
+        return await self._write_exactly(
+            _WRITE_EMBEDDINGS,
+            len(rows),
+            _DROPPED_EMBEDDINGS,
+            tenant=tenant_id,
+            rows=rows,
+            model=model,
+            dimensions=dimensions,
+        )
+
     async def delete_tenant(self, tenant_id: str, *, batch_size: int = 1000) -> int:
         _require_tenant(tenant_id)
         return _int(await self._auto(_DELETE_TENANT, tenant=tenant_id, batch=batch_size))
@@ -461,6 +537,38 @@ class GraphRepo:
             fix_links=_int_row(row, "fix"),
         )
 
+    async def embedding_selection(self, tenant_id: str) -> EmbeddingSelection:
+        """Classify the tenant's pages for embedding; targets are ordered by url."""
+        _require_tenant(tenant_id)
+        row = (await self._read(_EMBEDDING_SELECTION, tenant=tenant_id))[0]
+        targets = row["targets"]
+        if not isinstance(targets, list):
+            raise DatabaseReadError(
+                "neo4j", f"expected a target list, got {type(targets).__name__}"
+            )
+        try:
+            return EmbeddingSelection(
+                targets=tuple(EmbeddingTarget.model_validate(target) for target in targets),
+                up_to_date=_int_row(row, "up_to_date"),
+                placeholders=_int_row(row, "placeholders"),
+                non_2xx=_int_row(row, "non_2xx"),
+            )
+        except ValidationError as error:
+            raise DatabaseReadError(
+                "neo4j", f"embedding targets do not fit the model: {error}"
+            ) from error
+
+    async def embedding_models(self, tenant_id: str) -> tuple[EmbeddingModelCount, ...]:
+        """Stored content vectors per embeddingModel, ordered by model with None last."""
+        _require_tenant(tenant_id)
+        rows = await self._read(_EMBEDDING_MODELS, tenant=tenant_id)
+        try:
+            return tuple(EmbeddingModelCount.model_validate(row) for row in rows)
+        except ValidationError as error:
+            raise DatabaseReadError(
+                "neo4j", f"embedding model counts do not fit the model: {error}"
+            ) from error
+
     # ── transport ────────────────────────────────────────────────────────────
 
     async def _read(self, query: LiteralString, **params: object) -> list[Row]:
@@ -495,12 +603,37 @@ class GraphRepo:
             )
         return written
 
+    async def _write_exactly(
+        self, query: LiteralString, expected: int, dropped: str, **params: object
+    ) -> int:
+        # The count is checked before commit, so a short write rolls back whole.
+        try:
+            async with self._driver.session(default_access_mode=WRITE_ACCESS) as session:
+                return await session.execute_write(_count_exactly, query, params, expected, dropped)
+        except (Neo4jError, DriverError) as error:
+            raise _translate(error, write=True) from error
+
 
 async def _collect(
     tx: AsyncManagedTransaction, query: LiteralString, params: Mapping[str, object]
 ) -> list[Row]:
     result = await tx.run(query, dict(params))
     return [record.data() async for record in result]
+
+
+async def _count_exactly(
+    tx: AsyncManagedTransaction,
+    query: LiteralString,
+    params: Mapping[str, object],
+    expected: int,
+    dropped: str,
+) -> int:
+    written = _int(await _collect(tx, query, params))
+    if written != expected:
+        raise DatabaseWriteError(
+            "neo4j", f"wrote {written} of {expected} rows, rolled back; {dropped}"
+        )
+    return written
 
 
 def _translate(error: Neo4jError | DriverError, *, write: bool) -> DatabaseError:
@@ -522,6 +655,38 @@ def status_issue(status_code: int | None) -> IssueFlag | None:
 def _require_tenant(tenant_id: str) -> None:
     if not tenant_id.strip():
         raise ValueError("tenant_id must be a non-empty string")
+
+
+def _check_embeddings(
+    urls: Sequence[str],
+    body_hashes: Sequence[str],
+    vectors: npt.NDArray[np.float32],
+    *,
+    model: str,
+    dimensions: int,
+) -> None:
+    if not model.strip():
+        raise ValueError("model must be a non-empty string")
+    # Neo4j accepts a vector of another size but leaves it out of the index.
+    if dimensions != VECTOR_DIMENSIONS:
+        raise ValueError(
+            f"dimensions {dimensions} does not match the {VECTOR_DIMENSIONS}d vector index"
+        )
+    if not urls:
+        raise ValueError("no embeddings to write")
+    if vectors.dtype != np.float32 or vectors.ndim != 2 or vectors.shape[1] != dimensions:
+        raise ValueError(
+            f"vectors must be a float32 matrix with {dimensions} columns, "
+            f"got {vectors.dtype} {vectors.shape}"
+        )
+    if not len(urls) == len(body_hashes) == vectors.shape[0]:
+        raise ValueError(
+            f"got {len(urls)} urls, {len(body_hashes)} body hashes and {vectors.shape[0]} vectors"
+        )
+    if len(set(urls)) != len(urls):
+        raise ValueError("duplicate urls in one flush")
+    if not np.isfinite(vectors).all():
+        raise ValueError("vectors contain NaN or infinite values")
 
 
 def _to_property(value: object) -> object:

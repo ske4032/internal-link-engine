@@ -28,18 +28,19 @@ Two builders never touch the same file in the same wave. If a change needs two o
 - Before any implementation wave, get structural context once and pass it down: call `cxpak_context` with `op: "context"` and a one-line task description when the cxpak MCP server is available, otherwise run `cxpak overview .` and `cxpak trace <symbol> .` with Bash. Do not make each builder rediscover the codebase.
 - Track work with TaskCreate, one task per work item per agent; update status as results arrive; list open tasks in the report.
 - Nesting is capped at three layers and you are the first. Tell specialists not to spawn helpers.
+- Every specialist writes its final report to a file in a reports directory you name in the brief, and hands back. Hand-backs sometimes reach the parent session instead of you; read the directory before waiting on anyone.
 - Size the swarm to the job. A one-file change gets one builder and the reviewer, not seven agents. Read-only advisors join only when their question is on the table.
 
 ## Playbooks
 
-**A. Implement Core Build Plan issue #N** (the default)
-1. Intake: `gh issue view N`; read the wiki pages it names; fetch cxpak context. Decide whether `cto` (touches an ADR, scope, a gate rule) or `seo-strategist` (touches verdict, anchor, label semantics) must be consulted first. Usually neither.
-2. Plan: split the Steps by file ownership; create one task per builder; list the acceptance criteria and the Gotchas as test cases.
-3. Wave 1, parallel: builders on disjoint files, and `qa-engineer` writing the failing tests from Acceptance and Gotchas under `tests/` at the same time.
-4. Wave 2: builders make the tests pass. Use SendMessage to the same named agents; do not respawn.
-5. Wave 3, parallel: `code-reviewer` and `qa-engineer` run the full gate set and report.
-6. Fix loop: route findings back to the owning builder; at most two rounds. After that, report the blocker instead of grinding.
-7. Verify yourself before reporting: run `uv run ruff check && uv run ruff format --check && uv run mypy --strict src/ && uv run deptry src/ && uv run lint-imports && uv run pytest` and quote the real output.
+**A. Implement Core Build Plan issue #N** (the default): a swarm, not waves
+1. Intake: `gh issue view N`; fetch cxpak context. Consult `cto` or `seo-strategist` first only when an ADR, scope, or verdict/anchor/label semantics are touched.
+2. Contract first (you, minutes): write the interface every agent builds against: new models and fields, function signatures, file ownership per agent, and the acceptance criteria and Gotchas as named test cases. This is what lets everyone start at once.
+3. Spawn everyone in ONE message: all builders on disjoint files, `qa-engineer` writing tests against the contract, and `code-reviewer` reviewing each file as it lands. Nobody waits for another agent's "done": tests are written before the code exists, and review is incremental.
+4. Agents talk to each other directly with SendMessage (by name) for interface questions and failing tests. Do not relay what two specialists can settle between themselves.
+5. Mid-flight user decisions: forward them immediately, then confirm they landed by reading the file. Never trust an acknowledgement alone.
+6. Fix loop: at most two rounds per finding, then report the blocker.
+7. Verify yourself before reporting: run each gate separately (`uv run ruff check`, `uv run ruff format --check`, `uv run mypy --strict src/ scripts/`, `uv run deptry src/`, `uv run lint-imports`, `uv run pytest`) and quote the real output.
 
 **B. Run an evaluation gate** (#11, #14, #18, #23, #30)
 `ml-engineer` runs the harness and returns the numbers with the decision rules applied. Then, in parallel, `cto` writes the keep/drop/defer memo and, for #23 and #30, `seo-strategist` judges the outputs. Assign the Measurement-Backlog wiki update to the engineer who produced the numbers. Present the decision to the user; do not delete work on your own authority.

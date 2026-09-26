@@ -21,7 +21,15 @@ from linking_engine.models.corpus import (
     PageRecord,
     PageSummary,
 )
-from linking_engine.models.embedding import PageEmbedding, PageText
+from linking_engine.models.embedding import (
+    EmbeddingBatch,
+    EmbeddingModelCount,
+    EmbeddingSelection,
+    EmbeddingTarget,
+    EmbedRunReport,
+    PageEmbedding,
+    PageText,
+)
 from linking_engine.models.enums import (
     ActionType,
     AnchorType,
@@ -45,6 +53,11 @@ __all__ = [
     "CleanedPage",
     "ContentGapFinding",
     "CrawlPage",
+    "EmbedRunReport",
+    "EmbeddingBatch",
+    "EmbeddingModelCount",
+    "EmbeddingSelection",
+    "EmbeddingTarget",
     "ExtractedLink",
     "GraphLoadReport",
     "Heading",

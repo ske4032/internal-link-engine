@@ -7,6 +7,7 @@ from pydantic import HttpUrl
 from pymongo import AsyncMongoClient
 
 from linking_engine.errors import DatabaseAuthError, DatabaseReadError, DatabaseUnavailableError
+from linking_engine.ingest.markdown_clean import body_hash
 from linking_engine.ingest.mongo_repo import INDEXES, CrawlSource, MongoRepo
 from linking_engine.models import Heading, LinkRecord, PageRecord
 
@@ -34,7 +35,9 @@ def record(path: str, links: int = 0, **fields: object) -> PageRecord:
         "scraped_at": SCRAPED,
         "source": "crawl.pages_v2",
     }
-    return PageRecord.model_validate({**data, **fields})
+    data.update(fields)
+    data.setdefault("body_hash", body_hash(str(data["body_text"])))
+    return PageRecord.model_validate(data)
 
 
 def link_record(source: str, position: int, target: str, *, internal: bool = True) -> LinkRecord:
@@ -100,6 +103,60 @@ async def test_write_and_read_pages_and_links(
     assert stored["headings"] == [{"level": 1, "text": "Heading"}]
     assert {"metaTitle", "bodyText", "linkCount", "preparedAt", "tenantId"} <= set(stored)
     await client.close()
+
+
+@pytest.mark.integration
+async def test_body_hash_round_trips_through_every_read(
+    mongo: MongoRepo, tenant: str, mongo_uri: str
+) -> None:
+    bodies = {"/a": "Body text.", "/b": "Caf\u00e9 body, \u65e5\u672c."}
+    await mongo.write_pages(
+        tenant, [record(path, body_text=text) for path, text in bodies.items()], []
+    )
+    expected = {url(path): body_hash(text) for path, text in bodies.items()}
+    assert len(set(expected.values())) == 2
+
+    records = await mongo.get_pages(tenant, list(expected))
+    assert {str(r.url): r.body_hash for r in records} == expected
+    summaries = [s async for batch in mongo.iter_page_summaries(tenant) for s in batch]
+    assert {str(s.url): s.body_hash for s in summaries} == expected
+
+    client: AsyncMongoClient[dict[str, object]] = AsyncMongoClient(mongo_uri)
+    stored = await client["linking_engine_test"]["pages"].find_one(
+        {"tenantId": tenant, "url": url("/b")}
+    )
+    await client.close()
+    assert stored is not None
+    assert stored["bodyHash"] == expected[url("/b")]
+
+
+@pytest.mark.integration
+async def test_document_without_body_hash_fails_on_read(
+    mongo: MongoRepo, tenant: str, mongo_uri: str
+) -> None:
+    document = {
+        "tenantId": tenant,
+        "url": url("/legacy"),
+        "statusCode": 200,
+        "usable": True,
+        "metaTitle": None,
+        "metaDescription": None,
+        "h1": None,
+        "headings": [],
+        "bodyText": "Body text.",
+        "wordCount": 2,
+        "linkCount": 0,
+        "contentHash": None,
+        "scrapedAt": None,
+        "source": "crawl.pages_v2",
+    }
+    client: AsyncMongoClient[dict[str, object]] = AsyncMongoClient(mongo_uri)
+    await client["linking_engine_test"]["pages"].insert_one(document)
+    await client.close()
+    with pytest.raises(DatabaseReadError, match=r"does not fit PageSummary(.|\n)*body_hash"):
+        _ = [b async for b in mongo.iter_page_summaries(tenant)]
+    with pytest.raises(DatabaseReadError, match=r"does not fit PageRecord(.|\n)*body_hash"):
+        await mongo.get_pages(tenant, [url("/legacy")])
 
 
 @pytest.mark.integration
