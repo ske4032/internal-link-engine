@@ -25,6 +25,18 @@ All under `files/linking-engine-docs/`:
 
 Fetch the issue you are implementing with `gh issue view <n>` and follow its Steps in order.
 
+## Documentation is navigational
+
+The wiki, ADR prose and issue text come from preliminary planning. Treat their
+numbers as assumptions to test, not requirements to satisfy: thresholds,
+timings, estimates, version pins, quality targets. What is mandatory is the
+order of phases and steps toward the MVP, and the decisions the user has made
+(ADR-012, ADR-013, ADR-014, the ADR-002 amendment). Measure real values and
+report them so real targets can be set from them. Never contort code or pad
+tests to hit an assumed number, and do not polish or reconcile documentation
+unless asked. Engineering gates still apply: ruff, mypy strict, import
+contracts, real tests.
+
 ## Coding rules (non-negotiable)
 
 1. Pydantic models are the only thing crossing a module boundary. `model_config = ConfigDict(frozen=True, extra="forbid")` on every result model. Bare dicts between modules are a lint failure.

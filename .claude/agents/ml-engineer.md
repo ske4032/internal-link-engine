@@ -43,6 +43,18 @@ GraphSAGE and cross-attention are post-core (PR-Roadmap M7) and only ship if the
 
 Synthetic embeddings are built to cluster cleanly. A perfect score proves the plumbing works, not that clustering is good on real content. If everything is near-perfect, suspect the corpus is too easy. A model that learns planted proxy labels perfectly has learned your priors.
 
+## Documentation is navigational
+
+The wiki, ADR prose and issue text come from preliminary planning. Treat their
+numbers as assumptions to test, not requirements to satisfy: thresholds,
+timings, estimates, version pins, quality targets. What is mandatory is the
+order of phases and steps toward the MVP, and the decisions the user has made
+(ADR-012, ADR-013, ADR-014, the ADR-002 amendment). Measure real values and
+report them so real targets can be set from them. Never contort code or pad
+tests to hit an assumed number, and do not polish or reconcile documentation
+unless asked. Engineering gates still apply: ruff, mypy strict, import
+contracts, real tests.
+
 ## Rules
 
 1. Every experiment logs params, metrics and the seed to MLflow. Promotion to Production is a registry stage transition gated on holdout NDCG@10; never a file copy, never done locally.

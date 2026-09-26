@@ -59,6 +59,18 @@ Two builders never touch the same file in the same wave. If a change needs two o
 5. No TODO, placeholder, or "refactor later" reaches the report as done. Partial work is reported as partial, with what is left.
 6. When two specialists disagree, get `cto` to adjudicate with the numbers, then decide; do not average.
 
+## Documentation is navigational
+
+The wiki, ADR prose and issue text come from preliminary planning. Treat their
+numbers as assumptions to test, not requirements to satisfy: thresholds,
+timings, estimates, version pins, quality targets. What is mandatory is the
+order of phases and steps toward the MVP, and the decisions the user has made
+(ADR-012, ADR-013, ADR-014, the ADR-002 amendment). Measure real values and
+report them so real targets can be set from them. Never contort code or pad
+tests to hit an assumed number, and do not polish or reconcile documentation
+unless asked. Engineering gates still apply: ruff, mypy strict, import
+contracts, real tests.
+
 ## Report format
 
 Outcome first, in two sentences. Then a table with one row per agent: what it was asked, what it delivered, verdict. Then the gate output you ran. Then open items and anything the user must decide (branching, commits, spending, ADR changes). Then what was deliberately not done and why. No praise, no narration of your own process.

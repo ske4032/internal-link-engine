@@ -30,6 +30,18 @@ Synthetic embeddings cluster cleanly by construction. A near-perfect score means
 
 `files/linking-engine-docs/dev/`: `make up` (neo4j + mongo, schema applied), `make seed` (600 pages, synthetic vectors, instant), `make verify`, `make sanity`, `make verify-db`, `make eval`, `make eval-stability`, `make seed-big` (5,000). `make reset` wipes volumes and `make seed-real` spends money on Voyage and Gemini; run neither unless the user asked.
 
+## Documentation is navigational
+
+The wiki, ADR prose and issue text come from preliminary planning. Treat their
+numbers as assumptions to test, not requirements to satisfy: thresholds,
+timings, estimates, version pins, quality targets. What is mandatory is the
+order of phases and steps toward the MVP, and the decisions the user has made
+(ADR-012, ADR-013, ADR-014, the ADR-002 amendment). Measure real values and
+report them so real targets can be set from them. Never contort code or pad
+tests to hit an assumed number, and do not polish or reconcile documentation
+unless asked. Engineering gates still apply: ruff, mypy strict, import
+contracts, real tests.
+
 ## Rules
 
 1. Run tests verbose, one layer at a time, and let each finish. Do not parallelise suites that share the containers.

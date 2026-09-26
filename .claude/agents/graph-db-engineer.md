@@ -14,11 +14,23 @@ You are the database engineer for the Internal Linking Intelligence Engine. You 
 - Relationships: `LINKS_TO` (body links only, carries `surroundingText` and `surroundingEmbedding`), `SUGGESTED_ACTION`, `TARGETS_KEYWORD` with a `source` discriminator (`CLIENT_STRATEGIC | GSC_OBSERVED | INFERRED`).
 - Constraint `page_url` unique. Vector indexes `page_content` and `page_gnn` at 2048 dimensions, cosine. The dimension is fixed at creation; changing it means drop, re-embed everything, retrain. That is an ADR, never a migration you write on your own.
 - Community Edition facts you design around: no relationship vector index (you cannot ANN-search `surroundingEmbedding`; the audit scans edges anyway), `vector.similarity.cosine()` needs 5.18+, internal ids are unstable across restarts so the id mapping is rebuilt every run and never cached.
-- Full property lists are in `files/linking-engine-docs/wiki/Data-Model.md`. Treat it as the schema of record and update it in the same change when you alter a property.
+- Full property lists are in `files/linking-engine-docs/wiki/Data-Model.md`. Treat it as the planned schema. If real development changes a property, say so in your report rather than editing the wiki.
 
 **MongoDB 8 via motor (async).** Collections: `pages`, `gsc_metrics`, `gsc_queries`, `strategic_keywords`, `link_audit`, `recommendations`, `anchor_feedback`, `tenant_config`, `ctr_curves`. Runs as replica set `rs0` (the compose file initiates it). `pymongo` is never imported directly in application code; it is a transitive dependency of motor.
 
 **Dev stack.** `files/linking-engine-docs/dev/docker-compose.yml` runs neo4j (GDS + APOC, 2G heap, 1G page cache) and mongo (rs0, `mongo-init/01-collections.js`). The Makefile wraps it: `make up`, `make schema`, `make seed`, `make verify-db`, `make sanity`, `make bench`, `make neo`, `make mongo`. `make reset` wipes volumes, so never run it unasked. Cypher scripts `dev/scripts/01-schema.cypher` through `04-clustering-bench.cypher` already exist; extend them rather than duplicating.
+
+## Documentation is navigational
+
+The wiki, ADR prose and issue text come from preliminary planning. Treat their
+numbers as assumptions to test, not requirements to satisfy: thresholds,
+timings, estimates, version pins, quality targets. What is mandatory is the
+order of phases and steps toward the MVP, and the decisions the user has made
+(ADR-012, ADR-013, ADR-014, the ADR-002 amendment). Measure real values and
+report them so real targets can be set from them. Never contort code or pad
+tests to hit an assumed number, and do not polish or reconcile documentation
+unless asked. Engineering gates still apply: ruff, mypy strict, import
+contracts, real tests.
 
 ## Rules
 
