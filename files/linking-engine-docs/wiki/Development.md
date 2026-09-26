@@ -5,7 +5,7 @@
 ```
 Python 3.13
 uv
-Docker + Docker Compose
+Docker               (testcontainers only)
 Neo4j 5.18+          (vector.similarity.cosine is required)
 Ollama               (CONTENT_GAP verdicts only)
 ```
@@ -15,18 +15,20 @@ Ollama               (CONTENT_GAP verdicts only)
 ```bash
 git clone git@github.com:<org>/linking-engine.git
 cd linking-engine
-uv sync --all-extras
-cp .env.example .env          # add VOYAGE_API_KEY, GSC creds
-docker compose up -d          # neo4j, mongo, valkey, minio, mlflow
-uv run alembic-neo4j upgrade  # constraints + vector indexes
+uv sync
+cp .env.example .env          # service endpoints and credentials, VOYAGE_API_KEY
 uv run pytest
 ```
+
+Neo4j, MongoDB, Prefect and MLflow are hosted outside this repository (ADR-014).
+Neo4j constraints and vector indexes are applied by the project's own migration
+runner (issue #3). There is no separate migration tool.
 
 ## Running a pipeline locally
 
 ```bash
-uv run prefect server start                    # UI on :4200
-uv run python -m linking_engine.pipeline.run \
+# PREFECT_API_URL in .env points at the hosted Prefect server and its UI
+uv run --env-file .env python -m linking_engine.pipeline.run \
     --tenant demo --mode initial --limit 200
 ```
 
@@ -92,11 +94,10 @@ Event names are dotted and stable — Loki/LogQL queries depend on them. Never l
 
 ## Local model work
 
-MLflow UI runs at `:5000` from Docker Compose. Training scripts log to it by default:
+The MLflow tracking server is hosted (ADR-014). `MLFLOW_TRACKING_URI` and its basic-auth credentials in `.env` point training scripts at it, and its web UI is where runs are compared:
 
 ```bash
-uv run python -m linking_engine.ml.train_ranker --tenant demo
-mlflow ui   # compare NDCG@10 across runs
+uv run --env-file .env python -m linking_engine.ml.train_ranker --tenant demo
 ```
 
-Promotion to `Production` is blocked locally. Only CI can transition registry stages.
+Promotion is blocked locally. Only CI may move the `production` alias.

@@ -54,10 +54,10 @@ Argo Workflows was the alternative — already K8s-native given ArgoCD. Rejected
 
 | Store | Client | Purpose |
 |---|---|---|
-| Neo4j 5.18+ | `neo4j` async driver + `graphdatascience` | Graph, vectors, GDS algorithms |
-| MongoDB | `motor` (async) | Page text, metrics, recommendations, feedback |
+| Neo4j 5.18+ | `neo4j` async driver | Graph and vectors. Algorithms run in igraph (ADR-002) |
+| MongoDB | `pymongo` `AsyncMongoClient` | Page text, metrics, recommendations, feedback |
 | Valkey | `redis-py` (Valkey-compatible) | Recommendation cache, 24h TTL |
-| MinIO | `boto3` | MLflow artefact backend |
+| MinIO | none on the client | MLflow artefact store, reached only through the tracking server's artifact proxy (ADR-014) |
 
 Neo4j **5.18 or later is required** — `vector.similarity.cosine()` is used in the audit query. On older 5.x you would pull both vectors per edge and compute in Python, which is materially slower at 250k edges.
 
@@ -116,18 +116,18 @@ Replaces hand-rolled MinIO artefact versioning from the earlier spec.
 ```
 Tracking     every training run: params, metrics, NDCG@10 over time
 Registry     gnn-encoder, lambdamart-ranker, anchor-weights
-Stages       Staging → Production, with the promotion gate as a
-             registry transition rather than application logic
-Artifacts    MinIO as backing store (S3-compatible)
+Aliases      a `production` alias marks the serving version; the
+             promotion gate moves it rather than application logic
+Artifacts    proxied through the tracking server to MinIO; the client
+             never talks to MinIO and needs no S3 credentials
 ```
 
-The promotion gate becomes a first-class concept: a model version only transitions to `Production` if its holdout NDCG@10 exceeds the current `Production` version. Rollback is a registry transition, not a file copy.
+The promotion gate becomes a first-class concept: a model version only takes the `production` alias if its holdout NDCG@10 exceeds that of the version currently holding it. Rollback moves the alias back, not a file copy. Registry stages have been deprecated since MLflow 2.9, which is why the gate uses an alias (ADR-014).
 
 ```python
 if candidate_ndcg > production_ndcg:
-    client.transition_model_version_stage(
-        name="lambdamart-ranker", version=v,
-        stage="Production", archive_existing_versions=True,
+    client.set_registered_model_alias(
+        name="lambdamart-ranker", alias="production", version=v,
     )
 ```
 
@@ -171,7 +171,7 @@ linking-engine/
 │   ├── api/              FastAPI routers, dependencies
 │   ├── models/           Pydantic — the only cross-module contract
 │   ├── ingest/           crawler, GSC, keyword upload
-│   ├── graph/            Neo4j repo, GDS calls, Cypher
+│   ├── graph/            Neo4j repo (Cypher), igraph algorithms
 │   ├── embedding/        Voyage client, local fallback, caching
 │   ├── audit/            Stage 1 scoring and verdicts
 │   ├── anchor/           keyword resolution, extraction ladder

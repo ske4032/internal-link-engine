@@ -34,8 +34,9 @@ transforms rather than design work.
 | 2 | Pydantic domain models: `Page`, `Link`, `Keyword`, `PairFeatures`, `Recommendation` | 1 |
 | 3 | Neo4j async repo, Mongo repo, schema migrations, vector indexes @2048d | 0.5 |
 
-Compose file, Mongo init and corpus generator already exist. `make up && make seed`
-should be minutes, not a task.
+Neo4j, MongoDB, Prefect and MLflow already run outside this repository
+(ADR-014), so there is no stack to stand up. Schema, vector indexes and Mongo
+collection indexes all come from task 3.
 
 > **Vector index dimension is fixed at creation.** 2048 because MRL makes
 > downgrading to 1024 a truncation of data already held, while upgrading needs a
@@ -105,12 +106,11 @@ betweenness pages are utility pages. Clustering is unaffected either way.
 
 
 
-**Gate — run this before writing Phase 3:**
-
-```bash
-make eval              # ARI/NMI vs planted topics, noise P/R, purity
-make eval-stability    # label churn across runs
-```
+**Gate — run this before writing Phase 3.** Measure ARI/NMI against planted
+topics, noise precision and recall, per-topic purity, and label churn across
+runs. The evaluation runs Leiden through `leidenalg`, exactly as the pipeline
+does. The earlier GDS-based `make eval` harness is retired by the ADR-002
+amendment.
 
 ```
 ARI(leiden, hdbscan) 0.3-0.7    keep both, they disagree usefully

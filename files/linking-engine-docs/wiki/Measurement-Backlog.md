@@ -23,12 +23,11 @@ becomes a product output.
 
 **How to measure.**
 
-```bash
-make seed
-make eval              # ARI/NMI vs topic and subtopic, noise P/R, purity
-make eval-umap         # HDBSCAN after UMAP to 10d
-make eval-stability    # label reproducibility across 4 runs
-```
+Seed the synthetic corpus, then measure ARI/NMI against topic and subtopic,
+noise precision and recall, and purity; repeat with HDBSCAN after UMAP to 10d;
+and measure label reproducibility across 4 runs. The evaluation runs Leiden
+through `leidenalg`. The earlier GDS-based `make eval` harness is retired by
+the ADR-002 amendment.
 
 The synthetic corpus plants five structures specifically to discriminate:
 
@@ -149,39 +148,20 @@ cross-run magnitude drift and matches how trees use the feature anyway.
 
 ---
 
-## 4. In-process algorithms vs GDS `TUNING`
+## 4. In-process algorithms vs GDS `SETTLED`
 
-**Current position.** GDS for PageRank, Leiden, betweenness. Neo4j Community
-caps GDS at 4 cores and 3 in-memory projections per instance.
+**Settled by environment, 2026-09-26.** GDS is not installed anywhere; igraph
+and `leidenalg` are the only implementations (ADR-002 amendment). There is no
+longer a comparison to run for speed, so issue #8 records per-algorithm timings
+instead.
 
-**The case for moving.** `leidenalg` and `igraph` are the reference
-implementations — Neo4j's are ports. In-process removes the core cap, the
-projection lifecycle, and JVM GC pauses mid-computation. Expect 5–20× on graph
-analytics, though that is ~50 min of a ~5 h run.
-
-**The cost.** Materialising 250k edges over Bolt into an igraph object, roughly
-10–30s per run, amortised across all three algorithms. And you lose GDS's
-guardrails on weighted PageRank, orientation, and disconnected components.
-
-**How to measure.**
-
-```python
-# same graph, both paths, diff the outputs
-gds_pr    = gds.pageRank.stream(g)
-igraph_pr = ig_graph.pagerank(damping=0.85, weights=w)
-spearman(gds_pr, igraph_pr)          # should be > 0.99
-
-log.info("graph.backend.bench",
-    backend=..., algorithm=..., nodes=n, edges=m,
-    seconds=elapsed, cores_used=...)
-```
-
-Run on both the 600-page and 5000-page corpora — the gap should widen with
-size as the core cap bites harder.
-
-**Decision rule.** Move if outputs agree (Spearman > 0.99) and the speedup
-holds at 5000 pages. Correctness first: a fast wrong PageRank is worse than a
-slow right one.
+**What replaces the correctness check.** Spearman against GDS is gone. Two
+checks take its place: closed-form fixture graphs on every CI run, and an
+independent networkx reference on the 600-page corpus, compared by URL after
+write-back. PageRank Spearman ≥ 0.999 with max difference ≤ 1e-6; exact
+betweenness within 1e-9 of the largest value; networkx modularity of the
+written-back Leiden labels within 1e-9 of the `leidenalg` partition's
+`modularity`. Details and rationale are in the ADR-002 amendment.
 
 ---
 
@@ -470,10 +450,10 @@ complete-bipartite. It does not.
 ```
 Settle now, on the synthetic corpus
   16 Template handling                  SETTLED by design change
-  1  Leiden vs HDBSCAN                  make eval
+  1  Leiden vs HDBSCAN                  leidenalg eval harness
   2  Betweenness redundancy             spearman vs pagerank
   3  Sampled betweenness knee            sweep k
-  4  igraph vs GDS correctness           spearman > 0.99
+  4  igraph vs networkx correctness     fixtures + networkx, at #8
 
 Settle on the first real corpus
   5  Extraction hit rate
