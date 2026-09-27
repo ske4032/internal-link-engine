@@ -48,12 +48,13 @@ if TYPE_CHECKING:
     import numpy.typing as npt
     from neo4j import AsyncDriver, AsyncManagedTransaction
 
-    from linking_engine.models import AnchorKeyUpdate, EdgeRef, SentenceTarget
+    from linking_engine.models import AnchorKeyUpdate, EdgeRef, PageCentrality, SentenceTarget
 
 VECTOR_DIMENSIONS: Final = 2048
 VECTOR_INDEXES: Final = ("page_content", "page_gnn")
 PAGE_BATCH: Final = 500
 LINK_BATCH: Final = 1000
+CENTRALITY_BATCH: Final = 5000
 # anchor_tenant_text rejects index entries over ~8 KB (an 8149-byte text failed at 8150 on 5.26);
 # half of that leaves room for tenantId. A longer key would fail its flush on every run.
 ANCHOR_KEY_MAX_BYTES: Final = 4096
@@ -79,7 +80,9 @@ PAGE_PROPERTIES: Final = {
     "is_placeholder": "isPlaceholder",
     **_CRAWL_PROPERTIES,
     "page_rank": "pageRank",
+    "page_rank_percentile": "pageRankPercentile",
     "betweenness": "betweenness",
+    "betweenness_percentile": "betweennessPercentile",
     "link_community_id": "linkCommunityId",
     "keyword_community_id": "keywordCommunityId",
     "hub_id": "hubId",
@@ -278,8 +281,23 @@ SET a.embeddingModel = $model,
 RETURN count(a) AS n
 """
 _DROPPED_ANCHORS: Final = "every key must merge exactly one Anchor"
-# Each vector is sent once per unique sentence and fanned out to its edges server-side.
-# Tenant-scoped: a vector is only ever reused within the tenant that paid for it.
+_WRITE_CENTRALITY: Final = """
+UNWIND $rows AS row
+MATCH (p:Page {tenantId: $tenant, url: row.url})
+WHERE NOT coalesce(p.isPlaceholder, false)
+SET p.pageRank = row.pageRank,
+    p.pageRankPercentile = row.pageRankPercentile,
+    p.betweenness = row.betweenness,
+    p.betweennessPercentile = row.betweennessPercentile
+RETURN count(p) AS n
+"""
+# A page that was crawled before and is now only a link target keeps no stale scores.
+_CLEAR_PLACEHOLDER_CENTRALITY: Final = """
+MATCH (p:Page {tenantId: $tenant, isPlaceholder: true})
+WHERE p.pageRank IS NOT NULL OR p.betweenness IS NOT NULL
+REMOVE p.pageRank, p.pageRankPercentile, p.betweenness, p.betweennessPercentile
+RETURN count(p) AS n
+"""
 _SNAPSHOT_PAGES: Final = """
 MATCH (p:Page {tenantId: $tenant})
 RETURN p.url AS url, coalesce(p.isPlaceholder, false) AS placeholder
@@ -289,6 +307,8 @@ _SNAPSHOT_LINKS: Final = """
 MATCH (a:Page {tenantId: $tenant})-[:LINKS_TO]->(b:Page {tenantId: $tenant})
 RETURN a.url AS source, b.url AS target
 """
+# Each vector is sent once per unique sentence and fanned out to its edges server-side.
+# Tenant-scoped: a vector is only ever reused within the tenant that paid for it.
 _SURROUNDING_VECTORS: Final = """
 UNWIND $hashes AS h
 MATCH (:Page {tenantId: $tenant})-[r:LINKS_TO {surroundingEmbeddedHash: h}]->()
@@ -721,6 +741,40 @@ class GraphRepo:
             )
         return cleared
 
+    async def write_centrality(
+        self,
+        tenant_id: str,
+        scores: Sequence[PageCentrality],
+        *,
+        batch_size: int = CENTRALITY_BATCH,
+    ) -> int:
+        """Write every crawled page's scores in one transaction; a row that matches no crawled
+        page rolls the whole write back. Placeholders lose any scores they had."""
+        _require_tenant(tenant_id)
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        urls = [score.url for score in scores]
+        if len(set(urls)) != len(urls):
+            raise ValueError("one score per page: duplicate urls")
+        chunks = [
+            [
+                {
+                    "url": score.url,
+                    "pageRank": score.page_rank,
+                    "pageRankPercentile": score.page_rank_percentile,
+                    "betweenness": score.betweenness,
+                    "betweennessPercentile": score.betweenness_percentile,
+                }
+                for score in chunk
+            ]
+            for chunk in batched(scores, batch_size)
+        ]
+        try:
+            async with self._driver.session(default_access_mode=WRITE_ACCESS) as session:
+                return await session.execute_write(_write_centrality, tenant_id, chunks)
+        except (Neo4jError, DriverError) as error:
+            raise _translate(error, write=True) from error
+
     async def delete_tenant(self, tenant_id: str, *, batch_size: int = 1000) -> int:
         _require_tenant(tenant_id)
         return _int(await self._auto(_DELETE_TENANT, tenant=tenant_id, batch=batch_size))
@@ -939,6 +993,23 @@ async def _snapshot(
     pages = await (await tx.run(_SNAPSHOT_PAGES, tenant=tenant_id)).values()
     links = await (await tx.run(_SNAPSHOT_LINKS, tenant=tenant_id)).values()
     return pages, links
+
+
+async def _write_centrality(
+    tx: AsyncManagedTransaction, tenant_id: str, chunks: list[list[Row]]
+) -> int:
+    written = 0
+    for rows in chunks:
+        written += _int(await _collect(tx, _WRITE_CENTRALITY, {"tenant": tenant_id, "rows": rows}))
+    expected = sum(len(rows) for rows in chunks)
+    if written != expected:
+        raise DatabaseWriteError(
+            "neo4j",
+            f"wrote {written} of {expected} rows, rolled back; "
+            "rows whose page is missing or a placeholder are dropped",
+        )
+    await _collect(tx, _CLEAR_PLACEHOLDER_CENTRALITY, {"tenant": tenant_id})
+    return written
 
 
 async def _collect(

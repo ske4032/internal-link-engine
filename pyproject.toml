@@ -93,6 +93,8 @@ dev = [
   "pre-commit>=4.0",
   "ipykernel>=6.29",        # label review, eval notebooks
   "prefect-client>=3.8",    # minimal, pure Apache 2.0 — for worker images
+  "networkx>=3.7",          # independent PageRank/betweenness reference; src/ must not import it
+  "scipy>=1.18",
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════
