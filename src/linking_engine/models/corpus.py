@@ -146,6 +146,31 @@ class LinkRecord(BaseModel):
     is_internal: bool
 
 
+class PrepareReport(BaseModel):
+    """Outcome of preparing one tenant's crawl; the written counts are 0 on a dry run."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    tenant_id: str = Field(min_length=1)
+    source: str = Field(min_length=1)
+    documents: int = Field(ge=0)
+    # 200, usable pages with content: the pages template detection runs over.
+    cleaned: int = Field(ge=0)
+    skipped: dict[str, int]
+    template_lines: int = Field(ge=0)
+    # One page per url key; crawled urls that share a key are merged.
+    pages: int = Field(ge=0)
+    links: int = Field(ge=0)
+    merged_urls: int = Field(ge=0)
+    menu_inlink_pages: int = Field(ge=0)
+    footer_inlink_pages: int = Field(ge=0)
+    both_inlink_pages: int = Field(ge=0)
+    pages_written: int = Field(ge=0)
+    links_written: int = Field(ge=0)
+    stale_links_deleted: int = Field(ge=0)
+    finished_at: AwareDatetime
+
+
 class GraphLoadReport(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 

@@ -1,14 +1,14 @@
 """Transform a scraped crawl into the link engine schema.
 
-Dry run by default: reports what cleaning produces and writes nothing.
+Dry run by default: a review report of what cleaning produces, nothing written.
+With --write it runs the prepare-corpus Prefect flow, which upserts every page (with its
+menu and footer inlinks) and link into MONGO_DB under --tenant.
 
-    uv run --env-file .env python scripts/prepare_corpus.py
-    uv run --env-file .env python scripts/prepare_corpus.py --tenant <tenant> --write
+    uv run --env-file .env python scripts/prepare_corpus.py --source-db <db> --source-collection <c>
+    uv run --env-file .env python scripts/prepare_corpus.py --tenant <tenant> --source-db <db> \
+        --source-collection <c> --write
 
-The source is read through CrawlSource, which has no write methods. With
---write, pages and links are upserted into MONGO_DB under --tenant, each page
-with its menu and footer inlinks: distinct other crawled pages linking to it
-from template lines.
+The source is read through CrawlSource, which has no write methods.
 """
 
 from __future__ import annotations
@@ -19,20 +19,16 @@ import os
 import re
 import statistics
 from collections import Counter
-from urllib.parse import urlsplit
+from typing import TYPE_CHECKING
 
-from linking_engine.ingest.markdown_clean import (
-    body_hash,
-    clean_meta,
-    clean_page,
-    find_boilerplate,
-    line_shares,
-)
 from linking_engine.ingest.mongo_repo import CrawlSource, MongoRepo
-from linking_engine.ingest.template_links import count_template_inlinks
+from linking_engine.ingest.prepare import BOILERPLATE_SHARE, NAV_SHARE, prepare_corpus
 from linking_engine.ingest.url_params import query_param_evidence
-from linking_engine.models import CleanedPage, CrawlPage, Heading, LinkRecord, PageRecord
+from linking_engine.pipeline.flows import prepare_corpus_flow
 from linking_engine.urls import UrlRules, normalise_url, url_rules
+
+if TYPE_CHECKING:
+    from linking_engine.models import CrawlPage
 
 # Anything that should never survive cleaning.
 RESIDUE = {
@@ -50,29 +46,38 @@ def pct(values: list[int], q: float) -> int:
     return sorted(values)[min(len(values) - 1, int(len(values) * q))]
 
 
-def _rank(doc: CrawlPage) -> tuple[bool, bool, int, str]:
-    """Which of several crawled urls with one key to keep: 200, then https, then shortest."""
-    url = str(doc.url)
-    return (doc.status_code != 200, urlsplit(url).scheme != "https", len(url), url)
-
-
-async def main() -> None:
+def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--source-db", required=True, help="crawl database (read-only)")
     ap.add_argument("--source-collection", required=True, help="crawl collection")
-    ap.add_argument("--boilerplate-share", type=float, default=0.2)
-    ap.add_argument("--nav-share", type=float, default=0.02)
+    ap.add_argument("--boilerplate-share", type=float, default=BOILERPLATE_SHARE)
+    ap.add_argument("--nav-share", type=float, default=NAV_SHARE)
     ap.add_argument("--tenant", help="tenant id the pages are written under")
-    ap.add_argument("--write", action="store_true", help="upsert into the project pages collection")
+    ap.add_argument("--write", action="store_true", help="run the prepare-corpus flow")
     ap.add_argument("--sample", help="url to show before and after (default: median-length page)")
     args = ap.parse_args()
     if args.write and not args.tenant:
         ap.error("--write needs --tenant")
     if args.source_db == os.environ["MONGO_DB"]:
         ap.error("source and target database must differ: the source is read-only")
+    if args.write:
+        report = asyncio.run(
+            prepare_corpus_flow(
+                args.tenant,
+                args.source_db,
+                args.source_collection,
+                args.boilerplate_share,
+                args.nav_share,
+            )
+        )
+        print(report.model_dump_json(indent=2))
+    else:
+        asyncio.run(review(args))
 
+
+async def review(args: argparse.Namespace) -> None:
     rules = UrlRules()
     if args.tenant:
         async with await MongoRepo.connect(os.environ["MONGO_URI"], os.environ["MONGO_DB"]) as repo:
@@ -81,15 +86,15 @@ async def main() -> None:
         f"url rules: keep {sorted(rules.keep_params) or 'built-in only'}, "
         f"drop {sorted(rules.drop_params) or 'none'}"
     )
+    async with await CrawlSource.connect(
+        os.environ["MONGO_URI"], args.source_db, args.source_collection
+    ) as source:
+        docs = [doc async for batch in source.iter_pages() for doc in batch]
     with url_rules(rules):
-        await prepare(args)
+        report(args, docs)
 
 
-async def prepare(args: argparse.Namespace) -> None:
-
-    uri = os.environ["MONGO_URI"]
-    async with await CrawlSource.connect(uri, args.source_db, args.source_collection) as source:
-        docs: list[CrawlPage] = [doc async for batch in source.iter_pages() for doc in batch]
+def report(args: argparse.Namespace, docs: list[CrawlPage]) -> None:
     evidence = query_param_evidence((str(doc.url), doc.content_hash) for doc in docs)
     if evidence:
         print("query parameters in crawled urls (pairs differing only in that parameter):")
@@ -104,35 +109,16 @@ async def prepare(args: argparse.Namespace) -> None:
                 f"  {item.name:24} urls {item.urls:4}  content changed {item.content_changed:4}  "
                 f"same {item.content_same:4}  {verdict}"
             )
-    skipped: Counter[str] = Counter()
-    keep: list[CrawlPage] = []
-    for doc in docs:
-        if doc.status_code != 200:
-            skipped[f"status {doc.status_code}"] += 1
-        elif not doc.usable:
-            skipped["not usable"] += 1
-        elif not doc.content:
-            skipped["no content"] += 1
-        else:
-            keep.append(doc)
-
-    shares = line_shares(doc.content or "" for doc in keep)
-    boilerplate = find_boilerplate(
-        (doc.content or "" for doc in keep),
-        min_share=args.boilerplate_share,
-        nav_min_share=args.nav_share,
+    corpus = prepare_corpus(
+        docs,
+        source=f"{args.source_db}.{args.source_collection}",
+        boilerplate_share=args.boilerplate_share,
+        nav_share=args.nav_share,
     )
-    pages = [
-        (
-            doc,
-            clean_page(doc.content or "", str(doc.url), title=doc.title, boilerplate=boilerplate),
-        )
-        for doc in keep
-    ]
-
+    pages, shares, boilerplate = corpus.cleaned, corpus.shares, corpus.boilerplate
     print(
         f"source {args.source_db}.{args.source_collection}: {len(docs)} documents, "
-        f"{len(keep)} prepared, skipped {dict(skipped) or 'none'}\n"
+        f"{len(pages)} prepared, skipped {corpus.skipped or 'none'}\n"
     )
 
     template = [(line, share) for line, share in shares if line in boilerplate]
@@ -214,85 +200,21 @@ async def prepare(args: argparse.Namespace) -> None:
     print("---- after (first 500 chars) ----")
     print(sample.body_text[:500])
 
-    chosen: dict[str, tuple[CrawlPage, CleanedPage]] = {}
-    merged: list[str] = []
-    for doc in docs:
-        page = clean_page(doc.content or "", str(doc.url), title=doc.title, boilerplate=boilerplate)
-        key = normalise_url(str(doc.url))
-        current = chosen.get(key)
-        if current is None or _rank(doc) < _rank(current[0]):
-            if current is not None:
-                merged.append(str(current[0].url))
-            chosen[key] = (doc, page)
-        else:
-            merged.append(str(doc.url))
-    if merged:
+    if corpus.merged:
         print(
-            f"\n{len(merged)} crawled urls share a normalised key with a kept page, e.g. {merged[:5]}"
+            f"\n{len(corpus.merged)} crawled urls share a normalised key with a kept page, "
+            f"e.g. {list(corpus.merged[:5])}"
         )
-
-    inlinks = {
-        item.url: item
-        for item in count_template_inlinks((key, page) for key, (_, page) in chosen.items())
-        if item.url in chosen
-    }
-    menu = sum(1 for item in inlinks.values() if item.menu_inlinks)
-    footer = sum(1 for item in inlinks.values() if item.footer_inlinks)
-    both = sum(1 for item in inlinks.values() if item.menu_inlinks and item.footer_inlinks)
+    counts = corpus.inlinks.values()
+    menu = sum(1 for item in counts if item.menu_inlinks)
+    footer = sum(1 for item in counts if item.footer_inlinks)
+    both = sum(1 for item in counts if item.menu_inlinks and item.footer_inlinks)
     print(
         f"\npages linked from template lines of other pages: {menu} from menus, "
-        f"{footer} from footers, {both} from both, of {len(chosen)}"
+        f"{footer} from footers, {both} from both, of {len(corpus.records)}"
     )
-
-    if not args.write:
-        print("\ndry run: nothing written")
-        return
-    records: list[PageRecord] = []
-    link_records: list[LinkRecord] = []
-    for key, (doc, page) in chosen.items():
-        found = inlinks.get(key)
-        records.append(
-            PageRecord(
-                url=key,
-                crawl_url=str(doc.url),
-                status_code=doc.status_code,
-                usable=doc.usable,
-                meta_title=page.title,
-                meta_description=clean_meta(doc.description),
-                h1=page.h1,
-                headings=tuple(Heading(level=lvl, text=txt) for lvl, txt in page.headings),
-                body_text=page.body_text,
-                word_count=len(page.body_text.split()),
-                link_count=len(page.links),
-                content_hash=doc.content_hash,
-                body_hash=body_hash(page.body_text),
-                scraped_at=doc.scraped_at,
-                source=f"{args.source_db}.{args.source_collection}",
-                menu_inlinks=found.menu_inlinks if found else 0,
-                footer_inlinks=found.footer_inlinks if found else 0,
-            )
-        )
-        link_records.extend(
-            LinkRecord(
-                source_url=key,
-                position=position,
-                target_url=str(link.target_url),
-                anchor_text=link.anchor_text,
-                surrounding_text=link.surrounding_text,
-                is_internal=link.is_internal,
-            )
-            for position, link in enumerate(page.links)
-        )
-    async with await MongoRepo.connect(uri, os.environ["MONGO_DB"]) as repo:
-        await repo.ensure_indexes()
-        written_pages, written_links, deleted = await repo.write_pages(
-            args.tenant, records, link_records
-        )
-    print(
-        f"\nwritten to {os.environ['MONGO_DB']} under tenant {args.tenant!r}: "
-        f"{written_pages} pages, {written_links} links, {deleted} stale links deleted"
-    )
+    print("\ndry run: nothing written")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
