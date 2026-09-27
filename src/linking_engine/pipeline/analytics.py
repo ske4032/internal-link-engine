@@ -10,6 +10,7 @@ import numpy as np
 import structlog
 
 from linking_engine.graph.algorithms import (
+    NOISE,
     LinkGraphs,
     Partition,
     agreement,
@@ -17,9 +18,12 @@ from linking_engine.graph.algorithms import (
     content_pass_graph,
     crawled_betweenness,
     disconnected_communities,
+    find_hubs,
+    hub_centroids,
     keyword_pass_graph,
     link_pass_graph,
     link_states,
+    match_hubs,
     page_rank,
     partition,
     percentile_rank,
@@ -29,9 +33,12 @@ from linking_engine.graph.algorithms import (
 from linking_engine.models import (
     CentralityReport,
     CommunityReport,
+    HubCentroid,
+    HubReport,
     OrphanLabel,
     PageCentrality,
     PageCommunities,
+    PageHub,
     PassReport,
 )
 
@@ -264,7 +271,121 @@ def _run_pass(
     return found, report, chosen
 
 
-def summarise(centrality: CentralityReport, communities: CommunityReport) -> str:
+def singleton_noise(labels: Mapping[int, int]) -> dict[int, int]:
+    """Noise as one-page clusters, so a noise page never agrees with anything."""
+    fresh = max((label for label in labels.values() if label != NOISE), default=-1) + 1
+    out: dict[int, int] = {}
+    for vertex, label in sorted(labels.items()):
+        if label == NOISE:
+            out[vertex] = fresh
+            fresh += 1
+        else:
+            out[vertex] = label
+    return out
+
+
+def url_section(url: str) -> str:
+    """First path segment of a url key, "/" for the home page."""
+    path = url.partition("/")[2]
+    return "/" + path.split("/", 1)[0] if path else "/"
+
+
+async def compute_hubs(
+    graph: GraphRepo, tenant_id: str, graphs: LinkGraphs | None = None
+) -> HubReport:
+    """HDBSCAN hubs over the crawled pages' content vectors, ids kept stable across runs by
+    centroid matching, a pillar page per hub; pages, Hub nodes and retirements written back."""
+    graphs = graphs or await load_link_graphs(graph, tenant_id)
+    vertex_of = {graphs.url_of(v): v for v in graphs.crawled}
+    stored = await graph.content_vectors(tenant_id)
+    urls = sorted(url for url in stored if url in vertex_of)
+    context = {c.url: c for c in await graph.community_context(tenant_id)}
+    previous, next_id = await graph.stored_hubs(tenant_id)
+
+    started = time.perf_counter()
+    vectors = np.stack([stored[url] for url in urls]) if urls else np.empty((0, 1))
+    found = find_hubs(vectors)
+    centroids = hub_centroids(found.labels, vectors) if urls else {}
+    ids = match_hubs(previous, centroids, next_id)
+    label_of = {
+        url: NOISE if label == NOISE else ids[label]
+        for url, label in zip(urls, found.labels, strict=True)
+    }
+    runtime = time.perf_counter() - started
+
+    clustered = [url for url in urls if label_of[url] != NOISE]
+    members = Partition(
+        tuple(vertex_of[url] for url in clustered),
+        tuple(label_of[url] for url in clustered),
+        0.0,
+        0,
+    )
+    chosen = pillars(members, {vertex_of[url]: stored[url] for url in urls}, page_rank(graphs))
+    pillar_of = {label_of[graphs.url_of(v)]: graphs.url_of(v) for v in chosen}
+    sizes = Counter(label_of[url] for url in clustered)
+    hubs = [
+        HubCentroid(
+            hub_id=ids[label],
+            size=sizes[ids[label]],
+            centroid=tuple(float(x) for x in centroid),
+            pillar_url=pillar_of.get(ids[label]),
+        )
+        for label, centroid in sorted(centroids.items())
+    ]
+    rows = [
+        PageHub(
+            url=graphs.url_of(v),
+            hub_id=label_of.get(graphs.url_of(v)),
+            is_hub_pillar=v in chosen,
+        )
+        for v in graphs.crawled
+    ]
+    writing = time.perf_counter()
+    await graph.write_hubs(tenant_id, rows, hubs)
+    write_s = time.perf_counter() - writing
+
+    def stored_labels(field: str) -> dict[int, int]:
+        return {
+            vertex_of[url]: value
+            for url, item in context.items()
+            if url in vertex_of and (value := getattr(item, field)) is not None
+        }
+
+    current = singleton_noise({vertex_of[url]: label for url, label in label_of.items()})
+    counts = sorted(sizes.values(), reverse=True)
+    persistence = np.asarray(found.persistence)
+    weights = np.array([sizes[ids[label]] for label in sorted(centroids)])
+    noise = len(urls) - len(clustered)
+    report = HubReport(
+        tenant_id=tenant_id,
+        pages=len(urls),
+        hubs=len(hubs),
+        noise=noise,
+        noise_pct=noise / len(urls) if urls else 0.0,
+        largest_hub_pct=counts[0] / len(urls) if counts else 0.0,
+        median_hub_size=float(np.median(counts)) if counts else 0.0,
+        relative_validity=found.relative_validity,
+        persistence_mean=float(persistence.mean()) if len(persistence) else None,
+        persistence_min=float(persistence.min()) if len(persistence) else None,
+        persistence_weighted=(
+            float((persistence * weights).sum() / weights.sum()) if len(persistence) else None
+        ),
+        matched_hubs=sum(1 for hub in ids.values() if hub in previous),
+        new_hubs=sum(1 for hub in ids.values() if hub not in previous),
+        retired_hubs=len(set(previous) - set(ids.values())),
+        drift_ari=agreement(singleton_noise(stored_labels("hub_id")), current),
+        agreement_link=agreement(stored_labels("link_community_id"), current),
+        agreement_content=agreement(stored_labels("content_community_id"), current),
+        section_pages=dict(Counter(url_section(url) for url in urls)),
+        section_noise=dict(Counter(url_section(url) for url in urls if label_of[url] == NOISE)),
+        runtime_s=round(runtime, 3),
+        write_s=round(write_s, 3),
+    )
+    log.info("graph.hubs", **report.model_dump(exclude={"section_pages", "section_noise"}))
+    return report
+
+
+def summarise(centrality: CentralityReport, communities: CommunityReport, hubs: HubReport) -> str:
     """A short prose record of one analytics run, for the MLflow run description."""
 
     def described(name: str, found: PassReport) -> str:
@@ -306,5 +427,8 @@ def summarise(centrality: CentralityReport, communities: CommunityReport) -> str
             f"Orphans (no body link in): {communities.orphans}"
             + (f" ({labels})." if labels else ".")
             + f" Dead ends (no body link out): {communities.dead_ends}.",
+            f"Hubs (HDBSCAN): {hubs.hubs} over {hubs.pages} pages, {hubs.noise_pct:.0%} noise, "
+            f"largest {hubs.largest_hub_pct:.0%}; {hubs.matched_hubs} kept their id, "
+            f"{hubs.new_hubs} new, {hubs.retired_hubs} retired.",
         ]
     )

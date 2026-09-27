@@ -17,8 +17,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--tenant", required=True)
     args = ap.parse_args()
-    centrality, communities, mlflow_run = asyncio.run(graph_analytics_flow(args.tenant))
-    print(summarise(centrality, communities))
+    centrality, communities, hubs, mlflow_run = asyncio.run(graph_analytics_flow(args.tenant))
+    print(summarise(centrality, communities, hubs))
     print(f"mlflow run {mlflow_run}")
 
 

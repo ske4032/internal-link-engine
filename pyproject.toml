@@ -213,8 +213,6 @@ DEP002 = [
   # ingest/
   # graph/repo.py
   # embedding/
-  # graph/algorithms.py
-  "hdbscan",
   # ml/
   "lightgbm",
   "pandas",

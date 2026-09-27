@@ -27,12 +27,18 @@ from linking_engine.models import (
     CommunityReport,
     EmbedRunReport,
     GraphLoadReport,
+    HubReport,
     LinkEmbedReport,
     PrepareReport,
     TenantConfig,
     TenantGraphCounts,
 )
-from linking_engine.pipeline.analytics import compute_centrality, compute_communities, summarise
+from linking_engine.pipeline.analytics import (
+    compute_centrality,
+    compute_communities,
+    compute_hubs,
+    summarise,
+)
 from linking_engine.pipeline.embed import FLUSH_SIZE, embed_tenant
 from linking_engine.pipeline.embed_links import embed_links
 
@@ -183,32 +189,54 @@ async def communities_task(tenant_id: str) -> CommunityReport:
         return await compute_communities(graph, tenant_id)
 
 
+# Hub ids are matched to the previous run's hubs, so a retry keeps the same ids.
+@task(
+    name="graph-hubs",
+    retries=1,
+    retry_delay_seconds=30,
+    retry_condition_fn=is_transient,
+    cache_policy=NONE,
+)
+async def hubs_task(tenant_id: str) -> HubReport:
+    async with await neo4j() as graph:
+        await graph.check_server()
+        return await compute_hubs(graph, tenant_id)
+
+
 @task(name="mlflow-log", cache_policy=NONE)
-def log_analytics_task(centrality: CentralityReport, communities: CommunityReport) -> str:
-    return log_analytics(centrality, communities, summarise(centrality, communities))
+def log_analytics_task(
+    centrality: CentralityReport, communities: CommunityReport, hubs: HubReport
+) -> str:
+    return log_analytics(centrality, communities, hubs, summarise(centrality, communities, hubs))
 
 
 @flow(name="graph-analytics")
-async def graph_analytics_flow(tenant_id: str) -> tuple[CentralityReport, CommunityReport, str]:
-    """PageRank, betweenness and communities written to Neo4j, then the run logged to MLflow."""
+async def graph_analytics_flow(
+    tenant_id: str,
+) -> tuple[CentralityReport, CommunityReport, HubReport, str]:
+    """PageRank, betweenness, communities and hubs written to Neo4j, then the run logged to
+    MLflow. Hubs run after communities so their agreement uses this run's communities."""
     logger = get_run_logger()
     with bound_contextvars(run_id=str(flow_run.id)):
         logger.info("graph analytics of tenant %s", tenant_id)
         centrality = await centrality_task(tenant_id)
         communities = await communities_task(tenant_id)
-        mlflow_run = log_analytics_task(centrality, communities)
+        hubs = await hubs_task(tenant_id)
+        mlflow_run = log_analytics_task(centrality, communities, hubs)
     logger.info(
-        "%d pages: %d link, %d keyword and %d content communities; %d orphans, %d dead ends; "
-        "mlflow run %s",
+        "%d pages: %d link, %d keyword and %d content communities; %d hubs, %d noise pages; "
+        "%d orphans, %d dead ends; mlflow run %s",
         communities.crawled_pages,
         communities.link.communities,
         communities.keyword.communities,
         communities.content.communities,
+        hubs.hubs,
+        hubs.noise,
         communities.orphans,
         communities.dead_ends,
         mlflow_run,
     )
-    return centrality, communities, mlflow_run
+    return centrality, communities, hubs, mlflow_run
 
 
 # Upserts keyed by url and position, so a retry converges on the same records.

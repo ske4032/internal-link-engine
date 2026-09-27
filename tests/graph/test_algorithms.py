@@ -10,16 +10,20 @@ from pydantic import ValidationError
 from sklearn.metrics import adjusted_rand_score
 
 from linking_engine.graph.algorithms import (
+    NOISE,
     Partition,
     agreement,
     build_link_graphs,
     content_pass_graph,
     crawled_betweenness,
     disconnected_communities,
+    find_hubs,
+    hub_centroids,
     keyword_pass_graph,
     knn_graph,
     link_pass_graph,
     link_states,
+    match_hubs,
     page_rank,
     partition,
     percentile_rank,
@@ -415,3 +419,60 @@ def test_link_states_flag_orphans_and_dead_ends_among_crawled_pages() -> None:
         "orphan": False,
         "self": True,
     }
+
+
+# ── HDBSCAN hubs ────────────────────────────────────────────────────────────
+
+
+def blobs(
+    topics: int = 3, size: int = 25, noise: int = 6, dim: int = 64
+) -> tuple[np.ndarray, list[int]]:
+    """Topic blobs in one region of the space and noise rows scattered outside it, like pages
+    about the site's subject against legal or event pages. Planted labels use -1 for noise."""
+    rng = np.random.default_rng(7)
+    centres = rng.normal(size=dim) + 0.6 * rng.normal(size=(topics, dim))
+    rows = [centres[t] + 0.1 * rng.normal(size=dim) for t in range(topics) for _ in range(size)]
+    rows += list(rng.normal(size=(noise, dim)))
+    return np.array(rows), [t for t in range(topics) for _ in range(size)] + [NOISE] * noise
+
+
+def test_hubs_recover_planted_topics_and_leave_scattered_rows_as_noise() -> None:
+    vectors, planted = blobs()
+    found = find_hubs(vectors)
+    labels = np.array(found.labels)
+    assert adjusted_rand_score(np.array(planted)[:75], labels[:75]) == 1.0
+    assert (labels[75:] == NOISE).all()
+    assert found.relative_validity is not None
+    assert len(found.persistence) == len(set(labels) - {NOISE})
+
+
+def test_too_few_pages_are_all_noise() -> None:
+    found = find_hubs(np.eye(10))
+    assert (found.labels, found.relative_validity, found.persistence) == ((NOISE,) * 10, None, ())
+
+
+def test_centroids_are_unit_means_and_noise_has_none() -> None:
+    vectors = np.array([[2.0, 0.0], [0.0, 3.0], [1.0, 1.0]])
+    centroids = hub_centroids([0, 0, NOISE], vectors)
+    assert list(centroids) == [0]
+    assert np.allclose(centroids[0], [np.sqrt(0.5), np.sqrt(0.5)])
+    with pytest.raises(ValueError, match="zero vector"):
+        hub_centroids([0], np.zeros((1, 2)))
+
+
+def test_matching_keeps_ids_of_similar_hubs_and_never_reuses_an_id() -> None:
+    previous = {4: np.array([1.0, 0.0]), 7: np.array([0.0, 1.0])}
+    current = {0: np.array([0.0, 1.0]), 1: np.array([1.0, 0.05]), 2: np.array([-1.0, -1.0])}
+    assert match_hubs(previous, current, next_id=9) == {0: 7, 1: 4, 2: 9}
+
+
+def test_one_previous_hub_goes_to_its_closest_match_only() -> None:
+    previous = {3: np.array([1.0, 0.0])}
+    current = {0: np.array([1.0, 0.2]), 1: np.array([1.0, 0.0])}
+    assert match_hubs(previous, current, next_id=5) == {1: 3, 0: 5}
+
+
+def test_a_hub_below_the_similarity_threshold_gets_a_new_id() -> None:
+    previous = {0: np.array([1.0, 0.0])}
+    current = {0: np.array([1.0, 1.0])}  # cosine 0.71
+    assert match_hubs(previous, current, next_id=1) == {0: 1}

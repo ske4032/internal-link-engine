@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from itertools import combinations
 from typing import TYPE_CHECKING, Final
 
+import hdbscan
 import igraph as ig
 import leidenalg as la
 import numpy as np
@@ -30,6 +31,13 @@ KNN_NEIGHBOURS: Final = 10
 # A keyword on k pages projects to k(k-1)/2 page pairs; the most shared keywords are dropped first.
 PROJECTION_EDGE_BUDGET: Final = 5_000_000
 MIN_PILLAR_COMMUNITY: Final = 3
+# HDBSCAN over raw unit page vectors (hdbscan-eval studies 1-3): min_samples=1 keeps planted
+# noise at -1 while halving false noise; PCA or UMAP lose the noise label.
+HUB_MIN_CLUSTER_SIZE: Final = 10
+HUB_MIN_SAMPLES: Final = 1
+# Cosine similarity at which a new hub centroid keeps the id of a previous one.
+HUB_MATCH_SIMILARITY: Final = 0.9
+NOISE: Final = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,3 +324,84 @@ def link_states(graphs: LinkGraphs) -> tuple[npt.NDArray[np.bool_], npt.NDArray[
 def _with_edges(graph: ig.Graph, vertices: Sequence[int]) -> tuple[ig.Graph, tuple[int, ...]]:
     keep = [i for i, degree in enumerate(graph.degree()) if degree > 0]
     return graph.induced_subgraph(keep), tuple(vertices[i] for i in keep)
+
+
+@dataclass(frozen=True, slots=True)
+class Hubs:
+    """HDBSCAN over unit vectors: one label per row, NOISE for rows in no dense region."""
+
+    labels: tuple[int, ...]
+    relative_validity: float | None
+    # Per cluster, in label order.
+    persistence: tuple[float, ...]
+
+
+def find_hubs(vectors: npt.NDArray[np.floating]) -> Hubs:
+    if len(vectors) <= HUB_MIN_CLUSTER_SIZE:
+        return Hubs((NOISE,) * len(vectors), None, ())
+    unit = _unit(vectors)
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=HUB_MIN_CLUSTER_SIZE,
+        min_samples=HUB_MIN_SAMPLES,
+        cluster_selection_method="eom",
+        gen_min_span_tree=True,
+    )
+    labels = clusterer.fit_predict(unit)
+    clustered = bool((labels != NOISE).any())
+    return Hubs(
+        labels=tuple(int(label) for label in labels),
+        relative_validity=float(clusterer.relative_validity_) if clustered else None,
+        persistence=tuple(float(p) for p in clusterer.cluster_persistence_),
+    )
+
+
+def hub_centroids(
+    labels: Sequence[int], vectors: npt.NDArray[np.floating]
+) -> dict[int, npt.NDArray[np.float64]]:
+    """Unit mean of each cluster's unit vectors; noise has none."""
+    unit = _unit(vectors)
+    members: dict[int, list[int]] = defaultdict(list)
+    for row, label in enumerate(labels):
+        if label != NOISE:
+            members[label].append(row)
+    return {
+        label: _unit(unit[rows].mean(axis=0, keepdims=True))[0] for label, rows in members.items()
+    }
+
+
+def match_hubs(
+    previous: Mapping[int, npt.NDArray[np.floating]],
+    current: Mapping[int, npt.NDArray[np.floating]],
+    next_id: int,
+    threshold: float = HUB_MATCH_SIMILARITY,
+) -> dict[int, int]:
+    """Stable id per current cluster: the most similar unclaimed previous hub at ``threshold``
+    or above, greedily from the closest pair, otherwise a fresh id from ``next_id`` upwards."""
+    pairs = sorted(
+        (
+            (float(np.dot(_unit(c[None, :])[0], _unit(p[None, :])[0])), label, hub)
+            for label, c in current.items()
+            for hub, p in previous.items()
+        ),
+        reverse=True,
+    )
+    ids: dict[int, int] = {}
+    claimed: set[int] = set()
+    for similarity, label, hub in pairs:
+        if similarity < threshold:
+            break
+        if label not in ids and hub not in claimed:
+            ids[label] = hub
+            claimed.add(hub)
+    for label in sorted(current):
+        if label not in ids:
+            ids[label] = next_id
+            next_id += 1
+    return ids
+
+
+def _unit(vectors: npt.NDArray[np.floating]) -> npt.NDArray[np.float64]:
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    if (norms == 0).any():
+        raise ValueError("a zero vector has no direction")
+    return np.asarray(vectors / norms, dtype=np.float64)

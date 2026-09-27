@@ -15,10 +15,13 @@ from linking_engine.models import CentralityReport, Link, LinkGraphSnapshot, Orp
 from linking_engine.pipeline.analytics import (
     compute_centrality,
     compute_communities,
+    compute_hubs,
     load_link_graphs,
     orphan_label,
     page_centrality,
+    singleton_noise,
     summarise,
+    url_section,
 )
 
 if TYPE_CHECKING:
@@ -385,12 +388,16 @@ async def test_a_tenant_without_keywords_or_vectors_gets_link_communities_only(
 
     assert (report.keyword.pages, report.content.pages, report.link.pages) == (0, 0, 3)
     assert report.agreement_link_content is None
-    assert "Keyword communities: no input" in summarise(
+    hubs = await compute_hubs(graph, tenant)
+    summary = summarise(
         CentralityReport(
             tenant_id=tenant, pages=3, placeholders=0, pagerank_s=0, betweenness_s=0, write_s=0
         ),
         report,
+        hubs,
     )
+    assert "Keyword communities: no input" in summary
+    assert "Hubs (HDBSCAN): 0 over 0 pages" in summary
 
 
 @pytest.mark.parametrize(
@@ -406,3 +413,116 @@ def test_orphan_labels_follow_the_template_inlinks(
     menu: int, footer: int, label: OrphanLabel
 ) -> None:
     assert orphan_label(menu, footer) is label
+
+
+def test_noise_becomes_singletons_so_it_never_agrees() -> None:
+    assert singleton_noise({5: 0, 6: -1, 7: 0, 8: -1}) == {5: 0, 6: 1, 7: 0, 8: 2}
+    assert singleton_noise({1: -1}) == {1: 0}
+
+
+@pytest.mark.parametrize(
+    ("url", "section"),
+    [("example.com", "/"), ("example.com/blog/post", "/blog"), ("example.com/legal", "/legal")],
+)
+def test_sections_are_the_first_path_segment(url: str, section: str) -> None:
+    assert url_section(url) == section
+
+
+# ── hubs ────────────────────────────────────────────────────────────────────
+
+HUB_TOPICS, HUB_SIZE, HUB_NOISE, HUB_DIM = 3, 20, 5, 2048
+
+
+def hub_vectors(topics: int, seed: int) -> list[list[float]]:
+    """Topic blobs near one region, as pages about one site's subject."""
+    rng = np.random.default_rng(seed)
+    centres = rng.normal(size=HUB_DIM) + 0.6 * rng.normal(size=(topics, HUB_DIM))
+    return [
+        (centres[t] + 0.1 * rng.normal(size=HUB_DIM)).tolist()
+        for t in range(topics)
+        for _ in range(HUB_SIZE)
+    ]
+
+
+async def set_vectors(graph: GraphRepo, tenant: str, rows: list[dict[str, object]]) -> None:
+    await graph._auto(
+        "UNWIND $rows AS row MATCH (p:Page {tenantId: $t, url: row.url}) "
+        "SET p.content_embedding = row.vec",
+        t=tenant,
+        rows=rows,
+    )
+
+
+async def seed_hubs(graph: GraphRepo, tenant: str) -> list[str]:
+    topic_urls = [f"example.com/t{t}/p{p:02d}" for t in range(HUB_TOPICS) for p in range(HUB_SIZE)]
+    noise_urls = [f"example.com/legal/n{i}" for i in range(HUB_NOISE)]
+    urls = [*topic_urls, *noise_urls, "example.com/no-vector"]
+    await graph.upsert_pages(tenant, [Page(url=u, status_code=200) for u in urls])
+    await graph.upsert_placeholders(tenant, ["example.com/ghost"])
+    noise = np.random.default_rng(1).normal(size=(HUB_NOISE, HUB_DIM)).tolist()
+    await set_vectors(
+        graph,
+        tenant,
+        [{"url": u, "vec": v} for u, v in zip(topic_urls, hub_vectors(HUB_TOPICS, 2), strict=True)]
+        + [{"url": u, "vec": v} for u, v in zip(noise_urls, noise, strict=True)],
+    )
+    return topic_urls
+
+
+@pytest.mark.integration
+async def test_hubs_find_topics_flag_noise_and_keep_their_ids_across_runs(
+    graph: GraphRepo, tenant: str
+) -> None:
+    topic_urls = await seed_hubs(graph, tenant)
+
+    first = await compute_hubs(graph, tenant)
+    pages = await written(graph, tenant)
+    again = await compute_hubs(graph, tenant)
+
+    assert (first.pages, first.hubs, first.noise, first.new_hubs) == (65, 3, 5, 3)
+    assert first.section_noise == {"/legal": 5}
+    assert first.relative_validity is not None
+    planted = [int(u.split("/")[1][1:]) for u in topic_urls]
+    assert adjusted_rand_score(planted, [pages[u].hub_id for u in topic_urls]) == 1.0
+    assert {pages[f"example.com/legal/n{i}"].hub_id for i in range(HUB_NOISE)} == {-1}
+    assert pages["example.com/no-vector"].hub_id is None
+    assert pages["example.com/ghost"].hub_id is None
+    assert sum(bool(p.is_hub_pillar) for p in pages.values()) == 3
+    assert (again.matched_hubs, again.new_hubs, again.retired_hubs, again.drift_ari) == (
+        3,
+        0,
+        0,
+        1.0,
+    )
+    assert await written(graph, tenant) == pages
+
+
+@pytest.mark.integration
+async def test_a_vanished_topic_retires_its_hub_and_a_new_one_gets_a_fresh_id(
+    graph: GraphRepo, tenant: str
+) -> None:
+    topic_urls = await seed_hubs(graph, tenant)
+    await compute_hubs(graph, tenant)
+    before = await written(graph, tenant)
+    retired = before[topic_urls[-1]].hub_id
+    await graph._auto(
+        "MATCH (p:Page {tenantId: $t}) WHERE p.url STARTS WITH 'example.com/t2/' "
+        "REMOVE p.content_embedding",
+        t=tenant,
+    )
+    new_urls = [f"example.com/t9/p{p:02d}" for p in range(HUB_SIZE)]
+    await graph.upsert_pages(tenant, [Page(url=u, status_code=200) for u in new_urls])
+    fresh = hub_vectors(HUB_TOPICS + 1, 2)[-HUB_SIZE:]
+    await set_vectors(
+        graph, tenant, [{"url": u, "vec": v} for u, v in zip(new_urls, fresh, strict=True)]
+    )
+
+    report = await compute_hubs(graph, tenant)
+
+    after = await written(graph, tenant)
+    assert (report.matched_hubs, report.new_hubs, report.retired_hubs) == (2, 1, 1)
+    assert {after[u].hub_id for u in new_urls} == {3}
+    assert retired != 3
+    assert after[topic_urls[-1]].hub_id is None
+    active, next_id = await graph.stored_hubs(tenant)
+    assert (sorted(active), next_id) == (sorted({*range(3)} - {retired} | {3}), 4)
