@@ -212,7 +212,6 @@ DEP002 = [
   # graph/repo.py
   # embedding/
   # graph/algorithms.py
-  "igraph",
   "leidenalg",
   "scikit-learn",
   "hdbscan",

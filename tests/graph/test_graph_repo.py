@@ -331,3 +331,22 @@ async def test_status_change_reflags_inbound_links_and_keeps_audit_flags(
     assert broken.issue_flags == {IssueFlag.GENERIC, IssueFlag.BROKEN}
     assert broken.verdict is ActionType.FIX
     assert (await graph.counts(tenant)).fix_links == 1
+
+
+@pytest.mark.integration
+async def test_link_graph_is_tenant_scoped_and_keeps_orphans_and_placeholders(
+    graph: GraphRepo, tenant: str
+) -> None:
+    other = f"{tenant}-other"
+    for t in (tenant, other):
+        await graph.upsert_pages(t, [page("/a"), page("/b"), page("/orphan")])
+        await graph.replace_links(t, [url("/a")], [link("/a", "/b", 0), link("/a", "/b", 1)])
+    await graph.upsert_placeholders(tenant, [url("/ghost")])
+    await graph.replace_links(other, [url("/b")], [link("/b", "/a", 0)])
+
+    snapshot = await graph.link_graph(tenant)
+
+    assert snapshot.pages == tuple(sorted(url(p) for p in ("/a", "/b", "/ghost", "/orphan")))
+    assert dict(zip(snapshot.pages, snapshot.placeholders, strict=True))[url("/ghost")] is True
+    assert sorted(snapshot.links) == [(url("/a"), url("/b"))] * 2
+    await graph.delete_tenant(other)
