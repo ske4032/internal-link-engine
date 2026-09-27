@@ -1,9 +1,9 @@
-"""Transform a scraped crawl (the pages_v2 shape) into the link engine schema.
+"""Transform a scraped crawl into the link engine schema.
 
 Dry run by default: reports what cleaning produces and writes nothing.
 
     uv run --env-file .env python scripts/prepare_corpus.py
-    uv run --env-file .env python scripts/prepare_corpus.py --tenant action1 --write
+    uv run --env-file .env python scripts/prepare_corpus.py --tenant <tenant> --write
 
 The source is read through CrawlSource, which has no write methods. With
 --write, pages and links are upserted into MONGO_DB under --tenant.
@@ -57,8 +57,8 @@ async def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--source-db", default="action1")
-    ap.add_argument("--source-collection", default="pages_v2")
+    ap.add_argument("--source-db", required=True, help="crawl database (read-only)")
+    ap.add_argument("--source-collection", required=True, help="crawl collection")
     ap.add_argument("--boilerplate-share", type=float, default=0.2)
     ap.add_argument("--nav-share", type=float, default=0.02)
     ap.add_argument("--tenant", help="tenant id the pages are written under")

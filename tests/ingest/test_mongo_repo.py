@@ -33,7 +33,7 @@ def record(path: str, links: int = 0, **fields: object) -> PageRecord:
         "link_count": links,
         "content_hash": "abc",
         "scraped_at": SCRAPED,
-        "source": "crawl.pages_v2",
+        "source": "crawl.pages",
         "crawl_url": url(path),
     }
     data.update(fields)
@@ -149,7 +149,7 @@ async def test_document_without_body_hash_fails_on_read(
         "linkCount": 0,
         "contentHash": None,
         "scrapedAt": None,
-        "source": "crawl.pages_v2",
+        "source": "crawl.pages",
     }
     client: AsyncMongoClient[dict[str, object]] = AsyncMongoClient(mongo_uri)
     await client["linking_engine_test"]["pages"].insert_one(document)
@@ -228,7 +228,7 @@ async def test_document_that_does_not_fit_raises_read_error(
 @pytest.mark.integration
 async def test_crawl_source_reads_the_crawler_shape(mongo_uri: str) -> None:
     client: AsyncMongoClient[dict[str, object]] = AsyncMongoClient(mongo_uri)
-    await client["crawl_test"]["pages_v2"].insert_many(
+    await client["crawl_test"]["crawl_pages"].insert_many(
         [
             {
                 "url": f"https://{BASE}/c{i}",
@@ -246,7 +246,7 @@ async def test_crawl_source_reads_the_crawler_shape(mongo_uri: str) -> None:
         ]
     )
     await client.close()
-    async with await CrawlSource.connect(mongo_uri, "crawl_test", "pages_v2") as source:
+    async with await CrawlSource.connect(mongo_uri, "crawl_test", "crawl_pages") as source:
         pages = [p async for batch in source.iter_pages(batch_size=2) for p in batch]
     assert [str(p.url) for p in pages] == [f"https://{BASE}/c{i}" for i in range(3)]
     assert pages[0].scraped_at == datetime(2026, 9, 19, 15, 40, 30, tzinfo=UTC)

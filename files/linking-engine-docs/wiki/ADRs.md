@@ -466,7 +466,7 @@ the models free to import the real driver. The dev scripts' synchronous
 **Status:** Accepted
 
 **Context.** The deployed MongoDB 8.0.32 is a standalone `mongod`, shared with an
-unrelated `action1` database. The project's compose file assumed an `rs0`
+unrelated client crawl database. The project's compose file assumed an `rs0`
 single-node replica set, and issue #3 says `directConnection=true` is required
 because "Mongo needs the replica set for transactions". An audit of every
 existing Mongo call found `insert_many` and `replace_one` only — no sessions, no
@@ -502,7 +502,7 @@ atomicity the pointer pattern cannot express, or change streams (e.g.
 event-driven cache invalidation — out of scope until after #30); the first PR
 that opens a session or calls `watch()` reopens this ADR rather than landing.
 Converting then means restarting the shared `mongod` with `--replSet`, which
-interrupts `action1`; a `keyFile` if authorization is on; and a member hostname
+interrupts that database; a `keyFile` if authorization is on; and a member hostname
 every client can resolve — the reason the old compose needed
 `directConnection=true` was that it advertised `localhost:27017`. A dedicated
 `mongod` for this project is the alternative to weigh at that point, not a
@@ -568,7 +568,7 @@ mirrors the deployed topology rather than restoring the old file.
 
 **Status:** Accepted (2026-09-26; supersedes "one Neo4j instance per tenant" in Decisions)
 
-**Context.** Real crawl data, the `action1` site's `pages_v2` collection, will sit
+**Context.** Real crawl data, a client site's crawl collection, will sit
 beside the synthetic `demo` corpus. MongoDB is already tenant-scoped. Neo4j was
 not: the synthetic seeder wiped the whole graph, page URL uniqueness was global,
 and vector search and the graph algorithms spanned every page. The documented

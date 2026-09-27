@@ -1,7 +1,7 @@
 """Show or change a tenant's query parameter overrides for URL normalisation.
 
-    uv run --env-file .env python scripts/url_rules.py --tenant action1
-    uv run --env-file .env python scripts/url_rules.py --tenant action1 --keep announcement_pg --drop p
+    uv run --env-file .env python scripts/url_rules.py --tenant <tenant>
+    uv run --env-file .env python scripts/url_rules.py --tenant <tenant> --keep announcement_pg --drop p
 
 Re-run prepare_corpus.py, load_graph.py and embed_tenant.py after a change.
 """

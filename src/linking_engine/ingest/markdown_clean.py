@@ -79,7 +79,7 @@ _GLYPH_BULLET = re.compile(
 )
 _REPLACEMENT_CHAR = re.compile(r"\ufffd")
 # A fragment the source wrapped right after a link: ", identifying ...". The
-# space keeps ".NET" and ".action1.com" from counting.
+# space keeps ".NET" and ".example.com" from counting.
 _CONTINUATION = re.compile(r"^[,.;:](?:\s|$)")
 # What an image-only table row or a stripped separator leaves behind: ";".
 _PUNCTUATION_ONLY = re.compile(r"[^\w]+")

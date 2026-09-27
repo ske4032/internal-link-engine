@@ -109,7 +109,7 @@ def test_arrows_and_pictographs_leave_the_key_but_meaningful_symbols_stay() -> N
     assert normalise_anchor("Read more →") == "read more"
     assert normalise_anchor("→ Next") == "next"
     assert normalise_anchor("Learn more 👉") == "learn more"
-    assert normalise_anchor("Action1®") == "action1"
+    assert normalise_anchor("Acme®") == "acme"
     assert normalise_anchor("C++") == "c++"
     assert normalise_anchor("$100") == "$100"
     assert normalise_anchor("→") == "→"

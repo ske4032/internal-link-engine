@@ -9,13 +9,13 @@ from linking_engine.urls import UrlRules, host_of, is_kept_param, normalise_url,
     ("url", "key"),
     [
         (
-            "https://www.Action1.com/Patch-Management/?utm_source=x#top",
-            "action1.com/patch-management",
+            "https://www.example.com/Patch-Management/?utm_source=x#top",
+            "example.com/patch-management",
         ),
-        ("http://action1.com/patch-management", "action1.com/patch-management"),
-        ("https://action1.com/", "action1.com"),
-        ("action1.com", "action1.com"),
-        ("//www.action1.com/a", "action1.com/a"),
+        ("http://example.com/patch-management", "example.com/patch-management"),
+        ("https://example.com/", "example.com"),
+        ("example.com", "example.com"),
+        ("//www.example.com/a", "example.com/a"),
         ("https://user:pass@www2.example.com:443/a//b/./c/../d/", "example.com/a/b/d"),
         ("http://example.com:80/a", "example.com/a"),
         ("https://example.com:8080/x", "example.com:8080/x"),
@@ -68,13 +68,13 @@ def test_host_of() -> None:
 @pytest.mark.parametrize(
     ("url", "key"),
     [
-        ("https://www.action1.com/blog?page=2", "action1.com/blog?page=2"),
-        ("https://www.action1.com/blog?page=1", "action1.com/blog"),
-        ("https://action1.com/blog/?page=0&utm_source=x", "action1.com/blog"),
+        ("https://www.example.com/blog?page=2", "example.com/blog?page=2"),
+        ("https://www.example.com/blog?page=1", "example.com/blog"),
+        ("https://example.com/blog/?page=0&utm_source=x", "example.com/blog"),
         ("https://example.com/news?utm_source=a&offset=20&sort=new", "example.com/news?offset=20"),
         ("https://example.com/list?start=0", "example.com/list"),
         ("https://example.com/list?page=abc", "example.com/list"),
-        ("https://www.action1.com/?page_id=31963", "action1.com?page_id=31963"),
+        ("https://www.example.com/?page_id=12345", "example.com?page_id=12345"),
         ("https://example.com/post?p=0042&ref=x", "example.com/post?p=42"),
         (
             "https://example.com/shop?product_id=SKU-9&page=3",
@@ -109,4 +109,4 @@ def test_a_key_keeps_its_query_whatever_rules_are_active() -> None:
 
 
 def test_host_of_a_key_with_a_query() -> None:
-    assert host_of("action1.com?page_id=31963") == "action1.com"
+    assert host_of("example.com?page_id=12345") == "example.com"

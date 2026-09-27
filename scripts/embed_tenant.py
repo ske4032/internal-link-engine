@@ -15,7 +15,7 @@ from linking_engine.errors import DatabaseError, EmbeddingError
 from linking_engine.pipeline.embed import FLUSH_SIZE
 from linking_engine.pipeline.flows import embed_links_flow, embed_pages_flow
 
-USAGE: Final = "uv run --env-file .env python scripts/embed_tenant.py --tenant action1 [--stage pages|links|all]"
+USAGE: Final = "uv run --env-file .env python scripts/embed_tenant.py --tenant <tenant> [--stage pages|links|all]"
 EXIT_FAILED: Final = 1
 # Exit status when the graph and Mongo disagree on some pages.
 EXIT_STALE_GRAPH: Final = 2
