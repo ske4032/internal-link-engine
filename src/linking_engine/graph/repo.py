@@ -29,6 +29,7 @@ from linking_engine.errors import (
     SchemaError,
 )
 from linking_engine.models import (
+    CommunityContext,
     EmbeddingModelCount,
     EmbeddingSelection,
     EmbeddingTarget,
@@ -48,7 +49,13 @@ if TYPE_CHECKING:
     import numpy.typing as npt
     from neo4j import AsyncDriver, AsyncManagedTransaction
 
-    from linking_engine.models import AnchorKeyUpdate, EdgeRef, PageCentrality, SentenceTarget
+    from linking_engine.models import (
+        AnchorKeyUpdate,
+        EdgeRef,
+        PageCentrality,
+        PageCommunities,
+        SentenceTarget,
+    )
 
 VECTOR_DIMENSIONS: Final = 2048
 VECTOR_INDEXES: Final = ("page_content", "page_gnn")
@@ -85,6 +92,13 @@ PAGE_PROPERTIES: Final = {
     "betweenness_percentile": "betweennessPercentile",
     "link_community_id": "linkCommunityId",
     "keyword_community_id": "keywordCommunityId",
+    "content_community_id": "contentCommunityId",
+    "is_link_pillar": "isLinkPillar",
+    "is_keyword_pillar": "isKeywordPillar",
+    "is_content_pillar": "isContentPillar",
+    "is_orphan": "isOrphan",
+    "is_dead_end": "isDeadEnd",
+    "orphan_label": "orphanLabel",
     "hub_id": "hubId",
     "is_chunked": "isChunked",
     "embedding_model": "embeddingModel",
@@ -297,6 +311,48 @@ MATCH (p:Page {tenantId: $tenant, isPlaceholder: true})
 WHERE p.pageRank IS NOT NULL OR p.betweenness IS NOT NULL
 REMOVE p.pageRank, p.pageRankPercentile, p.betweenness, p.betweennessPercentile
 RETURN count(p) AS n
+"""
+# Null values remove the property: a page that lost its community keeps no stale id.
+_WRITE_COMMUNITIES: Final = """
+UNWIND $rows AS row
+MATCH (p:Page {tenantId: $tenant, url: row.url})
+WHERE NOT coalesce(p.isPlaceholder, false)
+SET p.linkCommunityId = row.linkCommunityId,
+    p.keywordCommunityId = row.keywordCommunityId,
+    p.contentCommunityId = row.contentCommunityId,
+    p.isLinkPillar = row.isLinkPillar,
+    p.isKeywordPillar = row.isKeywordPillar,
+    p.isContentPillar = row.isContentPillar,
+    p.isOrphan = row.isOrphan,
+    p.isDeadEnd = row.isDeadEnd,
+    p.orphanLabel = row.orphanLabel
+RETURN count(p) AS n
+"""
+_CLEAR_PLACEHOLDER_COMMUNITIES: Final = """
+MATCH (p:Page {tenantId: $tenant, isPlaceholder: true})
+WHERE p.isOrphan IS NOT NULL OR p.linkCommunityId IS NOT NULL
+   OR p.keywordCommunityId IS NOT NULL OR p.contentCommunityId IS NOT NULL
+REMOVE p.linkCommunityId, p.keywordCommunityId, p.contentCommunityId, p.isLinkPillar,
+       p.isKeywordPillar, p.isContentPillar, p.isOrphan, p.isDeadEnd, p.orphanLabel
+RETURN count(p) AS n
+"""
+_KEYWORD_TARGETS: Final = """
+MATCH (p:Page {tenantId: $tenant})-[:TARGETS_KEYWORD]->(k:Keyword {tenantId: $tenant})
+WHERE NOT coalesce(p.isPlaceholder, false)
+RETURN p.url AS url, k.text AS text, k.language AS language
+"""
+_CONTENT_VECTORS: Final = """
+MATCH (p:Page {tenantId: $tenant})
+WHERE p.url > $after AND NOT coalesce(p.isPlaceholder, false) AND p.content_embedding IS NOT NULL
+RETURN p.url AS url, p.content_embedding AS vec
+ORDER BY p.url
+LIMIT $limit
+"""
+_COMMUNITY_CONTEXT: Final = """
+MATCH (p:Page {tenantId: $tenant})
+WHERE NOT coalesce(p.isPlaceholder, false)
+RETURN p.url AS url, coalesce(p.menuInlinks, 0) AS menu, coalesce(p.footerInlinks, 0) AS footer,
+       p.linkCommunityId AS link, p.keywordCommunityId AS keyword, p.contentCommunityId AS content
 """
 _SNAPSHOT_PAGES: Final = """
 MATCH (p:Page {tenantId: $tenant})
@@ -769,9 +825,59 @@ class GraphRepo:
             ]
             for chunk in batched(scores, batch_size)
         ]
+        return await self._write_pages(
+            _WRITE_CENTRALITY, _CLEAR_PLACEHOLDER_CENTRALITY, tenant_id, chunks
+        )
+
+    async def write_communities(
+        self,
+        tenant_id: str,
+        rows: Sequence[PageCommunities],
+        *,
+        batch_size: int = CENTRALITY_BATCH,
+    ) -> int:
+        """Write every crawled page's communities, pillar flags and link state in one
+        transaction; a row that matches no crawled page rolls the whole write back."""
+        _require_tenant(tenant_id)
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        urls = [row.url for row in rows]
+        if len(set(urls)) != len(urls):
+            raise ValueError("one row per page: duplicate urls")
+        chunks = [
+            [
+                {
+                    "url": row.url,
+                    "linkCommunityId": row.link_community_id,
+                    "keywordCommunityId": row.keyword_community_id,
+                    "contentCommunityId": row.content_community_id,
+                    "isLinkPillar": row.is_link_pillar,
+                    "isKeywordPillar": row.is_keyword_pillar,
+                    "isContentPillar": row.is_content_pillar,
+                    "isOrphan": row.is_orphan,
+                    "isDeadEnd": row.is_dead_end,
+                    "orphanLabel": _to_property(row.orphan_label),
+                }
+                for row in chunk
+            ]
+            for chunk in batched(rows, batch_size)
+        ]
+        return await self._write_pages(
+            _WRITE_COMMUNITIES, _CLEAR_PLACEHOLDER_COMMUNITIES, tenant_id, chunks
+        )
+
+    async def _write_pages(
+        self,
+        write: LiteralString,
+        clear: LiteralString,
+        tenant_id: str,
+        chunks: list[list[Row]],
+    ) -> int:
         try:
             async with self._driver.session(default_access_mode=WRITE_ACCESS) as session:
-                return await session.execute_write(_write_centrality, tenant_id, chunks)
+                return await session.execute_write(
+                    _write_page_rows, write, clear, tenant_id, chunks
+                )
         except (Neo4jError, DriverError) as error:
             raise _translate(error, write=True) from error
 
@@ -937,6 +1043,55 @@ class GraphRepo:
         except ValidationError as error:
             raise DatabaseReadError("neo4j", f"link graph of {tenant_id!r}: {error}") from error
 
+    async def keyword_targets(self, tenant_id: str) -> list[tuple[str, str, str]]:
+        """(page url, keyword text, keyword language) for every crawled page's target keyword."""
+        _require_tenant(tenant_id)
+        rows = await self._read(_KEYWORD_TARGETS, tenant=tenant_id)
+        return [(str(r["url"]), str(r["text"]), str(r["language"])) for r in rows]
+
+    async def content_vectors(
+        self, tenant_id: str, *, batch_size: int = PAGE_BATCH
+    ) -> dict[str, npt.NDArray[np.float32]]:
+        """Content embeddings of the tenant's crawled pages, paged by url."""
+        _require_tenant(tenant_id)
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        vectors: dict[str, npt.NDArray[np.float32]] = {}
+        after = ""
+        while True:
+            rows = await self._read(
+                _CONTENT_VECTORS, tenant=tenant_id, after=after, limit=batch_size
+            )
+            for row in rows:
+                vector = row["vec"]
+                if not isinstance(vector, list):
+                    raise DatabaseReadError("neo4j", f"page {row['url']!r} has no stored vector")
+                vectors[str(row["url"])] = np.asarray(vector, dtype=np.float32)
+            if len(rows) < batch_size:
+                return vectors
+            after = str(rows[-1]["url"])
+
+    async def community_context(self, tenant_id: str) -> list[CommunityContext]:
+        """Template inlink counts and the previous run's community ids of every crawled page."""
+        _require_tenant(tenant_id)
+        rows = await self._read(_COMMUNITY_CONTEXT, tenant=tenant_id)
+        try:
+            return [
+                CommunityContext(
+                    url=str(r["url"]),
+                    menu_inlinks=_int_row(r, "menu"),
+                    footer_inlinks=_int_row(r, "footer"),
+                    link_community_id=_optional_int(r["link"]),
+                    keyword_community_id=_optional_int(r["keyword"]),
+                    content_community_id=_optional_int(r["content"]),
+                )
+                for r in rows
+            ]
+        except ValidationError as error:
+            raise DatabaseReadError(
+                "neo4j", f"community context of {tenant_id!r}: {error}"
+            ) from error
+
     # ── transport ────────────────────────────────────────────────────────────
 
     async def _read(self, query: LiteralString, **params: object) -> list[Row]:
@@ -995,12 +1150,16 @@ async def _snapshot(
     return pages, links
 
 
-async def _write_centrality(
-    tx: AsyncManagedTransaction, tenant_id: str, chunks: list[list[Row]]
+async def _write_page_rows(
+    tx: AsyncManagedTransaction,
+    write: LiteralString,
+    clear: LiteralString,
+    tenant_id: str,
+    chunks: list[list[Row]],
 ) -> int:
     written = 0
     for rows in chunks:
-        written += _int(await _collect(tx, _WRITE_CENTRALITY, {"tenant": tenant_id, "rows": rows}))
+        written += _int(await _collect(tx, write, {"tenant": tenant_id, "rows": rows}))
     expected = sum(len(rows) for rows in chunks)
     if written != expected:
         raise DatabaseWriteError(
@@ -1008,7 +1167,7 @@ async def _write_centrality(
             f"wrote {written} of {expected} rows, rolled back; "
             "rows whose page is missing or a placeholder are dropped",
         )
-    await _collect(tx, _CLEAR_PLACEHOLDER_CENTRALITY, {"tenant": tenant_id})
+    await _collect(tx, clear, {"tenant": tenant_id})
     return written
 
 
@@ -1164,6 +1323,10 @@ def _int(rows: list[Row]) -> int:
 
 def _int_row(row: Row, key: str) -> int:
     return int(_int_or_float(row[key]))
+
+
+def _optional_int(value: object) -> int | None:
+    return None if value is None else int(_int_or_float(value))
 
 
 def _int_or_float(value: object) -> int | float:

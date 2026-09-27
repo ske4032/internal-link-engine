@@ -159,7 +159,7 @@ plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
 # No stubs published for these.
-module = ["igraph.*", "leidenalg.*", "hdbscan.*", "umap.*", "lightgbm.*", "voyageai.*"]
+module = ["igraph.*", "leidenalg.*", "hdbscan.*", "umap.*", "lightgbm.*", "voyageai.*", "sklearn.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
@@ -214,14 +214,11 @@ DEP002 = [
   # graph/repo.py
   # embedding/
   # graph/algorithms.py
-  "leidenalg",
-  "scikit-learn",
   "hdbscan",
   # ml/
   "lightgbm",
   "pandas",
   "pyarrow",
-  "mlflow",
   # anchor/
   "nltk",
   # serving and cross-cutting

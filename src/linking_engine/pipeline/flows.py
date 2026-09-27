@@ -19,12 +19,26 @@ from linking_engine.errors import (
 )
 from linking_engine.graph.repo import GraphRepo
 from linking_engine.ingest.mongo_repo import MongoRepo
-from linking_engine.models import EmbedRunReport, LinkEmbedReport, TenantConfig
+from linking_engine.ml.tracking import log_analytics
+from linking_engine.models import (
+    CentralityReport,
+    CommunityReport,
+    EmbedRunReport,
+    LinkEmbedReport,
+    TenantConfig,
+)
+from linking_engine.pipeline.analytics import compute_centrality, compute_communities, summarise
 from linking_engine.pipeline.embed import FLUSH_SIZE, embed_tenant
 from linking_engine.pipeline.embed_links import embed_links
 
 if TYPE_CHECKING:
     from prefect.client.schemas.objects import State
+
+
+async def neo4j() -> GraphRepo:
+    return await GraphRepo.connect(
+        os.environ["NEO4J_URI"], os.environ["NEO4J_USER"], os.environ["NEO4J_PASSWORD"]
+    )
 
 
 def voyage_client(tenant_id: str) -> VoyageClient:
@@ -130,3 +144,59 @@ async def embed_links_flow(tenant_id: str, flush_size: int = FLUSH_SIZE) -> Link
         links.elapsed_s,
     )
     return links
+
+
+# Each task reads its own snapshot and writes all its pages in one transaction, so a retry
+# rewrites the stage whole.
+@task(
+    name="graph-centrality",
+    retries=1,
+    retry_delay_seconds=30,
+    retry_condition_fn=is_transient,
+    cache_policy=NONE,
+)
+async def centrality_task(tenant_id: str) -> CentralityReport:
+    async with await neo4j() as graph:
+        await graph.check_server()
+        return await compute_centrality(graph, tenant_id)
+
+
+@task(
+    name="graph-communities",
+    retries=1,
+    retry_delay_seconds=30,
+    retry_condition_fn=is_transient,
+    cache_policy=NONE,
+)
+async def communities_task(tenant_id: str) -> CommunityReport:
+    async with await neo4j() as graph:
+        await graph.check_server()
+        return await compute_communities(graph, tenant_id)
+
+
+@task(name="mlflow-log", cache_policy=NONE)
+def log_analytics_task(centrality: CentralityReport, communities: CommunityReport) -> str:
+    return log_analytics(centrality, communities, summarise(centrality, communities))
+
+
+@flow(name="graph-analytics")
+async def graph_analytics_flow(tenant_id: str) -> tuple[CentralityReport, CommunityReport, str]:
+    """PageRank, betweenness and communities written to Neo4j, then the run logged to MLflow."""
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
+        logger.info("graph analytics of tenant %s", tenant_id)
+        centrality = await centrality_task(tenant_id)
+        communities = await communities_task(tenant_id)
+        mlflow_run = log_analytics_task(centrality, communities)
+    logger.info(
+        "%d pages: %d link, %d keyword and %d content communities; %d orphans, %d dead ends; "
+        "mlflow run %s",
+        communities.crawled_pages,
+        communities.link.communities,
+        communities.keyword.communities,
+        communities.content.communities,
+        communities.orphans,
+        communities.dead_ends,
+        mlflow_run,
+    )
+    return centrality, communities, mlflow_run

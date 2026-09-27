@@ -13,7 +13,14 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from linking_engine.models.enums import ActionType, AnchorType, IssueFlag, LifecycleStage, PageType
+from linking_engine.models.enums import (
+    ActionType,
+    AnchorType,
+    IssueFlag,
+    LifecycleStage,
+    OrphanLabel,
+    PageType,
+)
 from linking_engine.urls import UrlKey
 
 # Vectors are ``tuple[float, ...]`` rather than ``list[float]``: these models are
@@ -56,6 +63,16 @@ class Page(BaseModel):
     betweenness_percentile: float | None = Field(default=None, ge=0, lt=1)
     link_community_id: int | None = None
     keyword_community_id: int | None = None
+    # Leiden over the kNN graph of content embeddings; also covers pages without links.
+    content_community_id: int | None = None
+    # The member nearest its community's content centroid, PageRank breaking ties.
+    is_link_pillar: bool | None = None
+    is_keyword_pillar: bool | None = None
+    is_content_pillar: bool | None = None
+    # No body link from another page, and none to another page.
+    is_orphan: bool | None = None
+    is_dead_end: bool | None = None
+    orphan_label: OrphanLabel | None = None
     # HDBSCAN cluster label over content_embedding. -1 is the noise label, a
     # real assignment meaning "in no dense region", not a missing value.
     hub_id: int | None = None
@@ -159,6 +176,96 @@ class CentralityReport(BaseModel):
     placeholders: int = Field(ge=0)
     pagerank_s: float = Field(ge=0)
     betweenness_s: float = Field(ge=0)
+    write_s: float = Field(ge=0)
+
+
+class PageCommunities(BaseModel):
+    """Communities, pillar flags and link state of one crawled page; None means no community."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    # The stored key as read in the snapshot; written back verbatim, never re-normalised.
+    url: str = Field(min_length=1)
+    link_community_id: int | None = Field(default=None, ge=0)
+    keyword_community_id: int | None = Field(default=None, ge=0)
+    content_community_id: int | None = Field(default=None, ge=0)
+    is_link_pillar: bool = False
+    is_keyword_pillar: bool = False
+    is_content_pillar: bool = False
+    is_orphan: bool
+    is_dead_end: bool
+    orphan_label: OrphanLabel | None = None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Self:
+        if (self.orphan_label is not None) != self.is_orphan:
+            raise ValueError("orphan_label is set exactly when the page is an orphan")
+        for pillar, community in (
+            (self.is_link_pillar, self.link_community_id),
+            (self.is_keyword_pillar, self.keyword_community_id),
+            (self.is_content_pillar, self.content_community_id),
+        ):
+            if pillar and community is None:
+                raise ValueError("a pillar must belong to a community")
+        return self
+
+
+class CommunityContext(BaseModel):
+    """What the community stage reads about a crawled page before it writes."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    url: str = Field(min_length=1)
+    menu_inlinks: int = Field(default=0, ge=0)
+    footer_inlinks: int = Field(default=0, ge=0)
+    # The previous run's labels, to measure drift.
+    link_community_id: int | None = None
+    keyword_community_id: int | None = None
+    content_community_id: int | None = None
+
+
+class PassReport(BaseModel):
+    """One Leiden pass. Pages without an edge in the pass graph get no community."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    pages: int = Field(ge=0)
+    edges: int = Field(ge=0)
+    communities: int = Field(ge=0)
+    singletons: int = Field(ge=0)
+    largest_community_pct: float = Field(ge=0, le=1)
+    median_community_size: float = Field(ge=0)
+    modularity: float
+    disconnected_communities: int = Field(ge=0)
+    # Pairwise ARI across the seeded run and the extra seeds; None below two pages.
+    seed_stability_ari_mean: float | None = None
+    seed_stability_ari_min: float | None = None
+    # ARI against the previous run's labels on the pages both runs placed.
+    drift_ari: float | None = None
+    pillars: int = Field(ge=0)
+    runtime_s: float = Field(ge=0)
+    stability_s: float = Field(ge=0)
+
+
+class CommunityReport(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    tenant_id: str = Field(min_length=1)
+    crawled_pages: int = Field(ge=0)
+    seen_not_crawled: int = Field(ge=0)
+    link: PassReport
+    keyword: PassReport
+    content: PassReport
+    keywords: int = Field(ge=0)
+    keywords_dropped: int = Field(ge=0)
+    pages_with_keywords: int = Field(ge=0)
+    pages_with_embeddings: int = Field(ge=0)
+    agreement_link_content: float | None = None
+    agreement_link_keyword: float | None = None
+    agreement_keyword_content: float | None = None
+    orphans: int = Field(ge=0)
+    dead_ends: int = Field(ge=0)
+    orphan_labels: dict[OrphanLabel, int]
     write_s: float = Field(ge=0)
 
 

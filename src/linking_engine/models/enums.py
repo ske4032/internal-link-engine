@@ -66,6 +66,20 @@ class LifecycleStage(StrEnum):
     MATURE = "MATURE"
 
 
+class OrphanLabel(StrEnum):
+    """What still links to a crawled page that no body link reaches.
+
+    Menus and footer are the template blocks inside the crawled content: above or
+    within the main text, and after it. Site-wide header and footer menus are not
+    crawled.
+    """
+
+    MENUS_ONLY = "MENUS_ONLY"
+    FOOTER_ONLY = "FOOTER_ONLY"
+    MENUS_AND_FOOTER_ONLY = "MENUS_AND_FOOTER_ONLY"
+    NOT_LINKED = "NOT_LINKED"
+
+
 class PageType(StrEnum):
     """Structural role of a page in the site taxonomy.
 
