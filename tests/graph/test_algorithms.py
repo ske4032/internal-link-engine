@@ -3,15 +3,28 @@ from __future__ import annotations
 import random
 from fractions import Fraction
 
+import igraph as ig
 import numpy as np
 import pytest
 from pydantic import ValidationError
+from sklearn.metrics import adjusted_rand_score
 
 from linking_engine.graph.algorithms import (
+    Partition,
+    agreement,
     build_link_graphs,
+    content_pass_graph,
     crawled_betweenness,
+    disconnected_communities,
+    keyword_pass_graph,
+    knn_graph,
+    link_pass_graph,
+    link_states,
     page_rank,
+    partition,
     percentile_rank,
+    pillars,
+    seed_stability,
 )
 from linking_engine.models import LinkGraphSnapshot
 
@@ -231,3 +244,174 @@ def test_percentiles_stay_below_one_and_follow_the_order() -> None:
     ranks = percentile_rank(values)
     assert ranks.max() < 1
     assert (np.argsort(ranks, kind="stable") == np.argsort(values, kind="stable")).all()
+
+
+# ── Leiden passes ───────────────────────────────────────────────────────────
+
+
+def two_cliques(size: int = 5) -> ig.Graph:
+    """Two cliques of ``size`` joined by one edge between vertex 0 and vertex ``size``."""
+    left = [(a, b) for a in range(size) for b in range(a + 1, size)]
+    right = [(a + size, b + size) for a, b in left]
+    return ig.Graph(n=2 * size, edges=[*left, *right, (0, size)])
+
+
+def groups(found: Partition) -> set[frozenset[int]]:
+    members: dict[int, set[int]] = {}
+    for vertex, community in zip(found.vertices, found.membership, strict=True):
+        members.setdefault(community, set()).add(vertex)
+    return {frozenset(m) for m in members.values()}
+
+
+def test_two_cliques_joined_by_one_edge_are_exactly_the_two_cliques_every_run() -> None:
+    graph = two_cliques()
+    first = partition(graph, range(10), weighted=False)
+    second = partition(graph, range(10), weighted=False)
+    assert groups(first) == {frozenset(range(5)), frozenset(range(5, 10))}
+    assert first == second
+    assert seed_stability(graph, weighted=False) == (1.0, 1.0)
+
+
+def test_planted_topics_are_recovered() -> None:
+    rng = random.Random(9)
+    topics, size = 8, 40
+    planted = [v // size for v in range(topics * size)]
+    edges = {
+        (a, b)
+        for a in range(topics * size)
+        for b in range(a + 1, topics * size)
+        if rng.random() < (0.25 if planted[a] == planted[b] else 0.004)
+    }
+    found = partition(
+        ig.Graph(n=topics * size, edges=sorted(edges)), range(topics * size), weighted=False
+    )
+    assert adjusted_rand_score(planted, found.membership) > 0.7
+    graph = ig.Graph(n=topics * size, edges=sorted(edges))
+    assert disconnected_communities(graph, found.membership) == 0
+
+
+def test_a_community_split_into_pieces_is_counted() -> None:
+    graph = ig.Graph(n=4, edges=[(0, 1), (2, 3)])
+    assert disconnected_communities(graph, [0, 0, 0, 0]) == 1
+    assert disconnected_communities(graph, [0, 0, 1, 1]) == 0
+
+
+def test_partition_needs_one_id_per_vertex_and_handles_an_empty_graph() -> None:
+    with pytest.raises(ValueError, match="one vertex id"):
+        partition(two_cliques(), range(3), weighted=False)
+    assert partition(ig.Graph(), (), weighted=False) == Partition((), (), 0.0, 0)
+    assert seed_stability(ig.Graph(n=1), weighted=False) is None
+
+
+def test_the_link_pass_keeps_crawled_pages_with_a_crawled_link_only() -> None:
+    graphs = build_link_graphs(
+        snapshot(
+            ["a", "b", "c", "ghost", "lone"],
+            [("a", "b"), ("a", "b"), ("c", "ghost")],
+            [False, False, False, True, False],
+        )
+    )
+    graph, vertices = link_pass_graph(graphs)
+    assert [graphs.url_of(v) for v in vertices] == ["a", "b"]
+    assert graph.ecount() == 1
+
+
+def test_keyword_projection_weights_pairs_by_shared_keywords() -> None:
+    graph, vertices, dropped = keyword_pass_graph({10: {1, 2}, 11: {1, 2}, 12: {2}, 13: {3}})
+    assert (vertices, dropped) == ((10, 11, 12), ())
+    weights = {
+        tuple(sorted((vertices[e.source], vertices[e.target]))): w
+        for e, w in zip(graph.es, graph.es["weight"], strict=True)
+    }
+    assert weights == {(10, 11): 2.0, (10, 12): 1.0, (11, 12): 1.0}
+
+
+def test_the_most_shared_keywords_are_dropped_to_fit_the_budget() -> None:
+    brand = {page: {0} for page in range(6)}  # 15 pairs
+    niche = {6: {1}, 7: {1}}  # 1 pair
+    graph, vertices, dropped = keyword_pass_graph({**brand, **niche}, budget=10)
+    assert dropped == (0,)
+    assert (vertices, graph.ecount()) == ((6, 7), 1)
+
+
+def test_a_projection_without_shared_keywords_is_empty() -> None:
+    graph, vertices, dropped = keyword_pass_graph({1: {1}, 2: {2}})
+    assert (graph.vcount(), vertices, dropped) == (0, (), ())
+
+
+def test_knn_joins_nearest_rows_and_keeps_the_stronger_direction() -> None:
+    vectors = np.array([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9], [-1.0, 0.0]])
+    graph = knn_graph(vectors, k=1)
+    edges = {tuple(sorted(e.tuple)) for e in graph.es}
+    assert {(0, 1), (2, 3)} <= edges
+    assert all(w > 0 for w in graph.es["weight"])
+    # Row 4 points away from everything: its best similarity is negative, so it has no edge.
+    assert graph.degree(4) == 0
+
+
+def test_knn_rejects_zero_vectors_and_caps_k() -> None:
+    with pytest.raises(ValueError, match="zero vector"):
+        knn_graph(np.array([[0.0, 0.0], [1.0, 0.0]]))
+    assert knn_graph(np.array([[1.0, 0.0], [1.0, 0.1]]), k=10).ecount() == 1
+    assert knn_graph(np.array([[1.0, 0.0]])).vcount() == 1
+
+
+def test_the_content_pass_maps_rows_to_vertex_ids_and_drops_pages_without_edges() -> None:
+    vectors = np.array([[1.0, 0.0], [0.9, 0.1], [-1.0, 0.0]])
+    graph, vertices = content_pass_graph((7, 8, 9), vectors, k=1)
+    assert (vertices, graph.ecount()) == ((7, 8), 1)
+    with pytest.raises(ValueError, match="one vector per vertex"):
+        content_pass_graph((1,), vectors)
+
+
+def test_agreement_ignores_label_names_and_needs_two_shared_vertices() -> None:
+    assert agreement({1: 0, 2: 0, 3: 1}, {1: 5, 2: 5, 3: 9, 4: 9}) == 1.0
+    assert agreement({1: 0}, {1: 0, 2: 1}) is None
+
+
+def test_the_pillar_is_the_member_nearest_the_content_centroid() -> None:
+    found = Partition((1, 2, 3, 4), (0, 0, 0, 0), 0.5, 3)
+    vectors = {
+        1: np.array([1.0, 0.0]),
+        2: np.array([0.0, 1.0]),
+        3: np.array([0.7, 0.7]),
+        4: np.array([1.0, 0.1]),
+    }
+    assert pillars(found, vectors, np.zeros(5)) == {3}
+
+
+def test_pagerank_breaks_ties_and_decides_without_vectors() -> None:
+    ranks = np.array([0.0, 0.1, 0.5, 0.2, 0.0])
+    tied = {1: np.array([1.0, 0.0]), 2: np.array([0.0, 1.0])}
+    found = Partition((1, 2, 3), (0, 0, 0), 0.5, 2)
+    assert pillars(found, tied, ranks) == {2}
+    assert pillars(found, {}, ranks) == {2}
+
+
+def test_small_communities_have_no_pillar() -> None:
+    found = Partition((1, 2, 3, 4, 5), (0, 0, 1, 1, 1), 0.5, 3)
+    assert pillars(found, {}, np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5])) == {5}
+
+
+def test_link_states_flag_orphans_and_dead_ends_among_crawled_pages() -> None:
+    graphs = build_link_graphs(
+        snapshot(
+            ["hub", "leaf", "orphan", "ghost", "self"],
+            [("hub", "leaf"), ("orphan", "hub"), ("leaf", "ghost"), ("self", "self")],
+            [False, False, False, True, False],
+        )
+    )
+    no_inbound, no_outbound = link_states(graphs)
+    crawled = [graphs.url_of(v) for v in graphs.crawled]
+    assert dict(zip(crawled, no_inbound.tolist(), strict=True)) == {
+        "hub": False,
+        "leaf": False,
+        "orphan": True,
+        "self": True,
+    }
+    assert dict(zip(crawled, no_outbound.tolist(), strict=True)) == {
+        "hub": False,
+        "leaf": False,
+        "orphan": False,
+        "self": True,
+    }

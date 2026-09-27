@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
+from mlflow import MlflowClient
 from prefect.states import Failed
 from test_embed import DIM, record, seed, seed_plain, url
 from test_embed_links import text_vector
@@ -17,11 +18,12 @@ from linking_engine.errors import (
     EmbeddingRequestError,
     EmbeddingUnavailableError,
 )
-from linking_engine.models import LinkRecord
+from linking_engine.models import Link, LinkRecord, Page
 from linking_engine.pipeline import flows
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 
     from linking_engine.graph.repo import GraphRepo
     from linking_engine.ingest.mongo_repo import MongoRepo
@@ -224,3 +226,38 @@ def test_voyage_client_uses_the_tenant_model(monkeypatch: pytest.MonkeyPatch) ->
 )
 def test_only_outages_are_retried(error: Exception, retry: bool) -> None:
     assert flows.is_transient(None, None, Failed(data=error)) is retry
+
+
+@pytest.mark.integration
+async def test_graph_analytics_flow_writes_to_neo4j_and_logs_one_mlflow_run(
+    graph: GraphRepo,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    urls = [f"example.com/{name}" for name in ("a", "b", "c", "d")]
+    await graph.upsert_pages(tenant, [Page(url=u, status_code=200) for u in urls])
+    await graph.replace_links(
+        tenant,
+        urls,
+        [
+            Link(source_url=s, target_url=t, position=0, anchor_text="x", surrounding_text="")
+            for s, t in ((urls[0], urls[1]), (urls[1], urls[2]), (urls[2], urls[0]))
+        ],
+    )
+
+    centrality, communities, run_id = await flows.graph_analytics_flow(tenant)
+
+    assert (centrality.pages, communities.crawled_pages, communities.orphans) == (4, 4, 1)
+    [lone] = await graph.get_pages(tenant, [urls[3]])
+    assert (lone.page_rank is not None, lone.is_orphan, lone.link_community_id) == (
+        True,
+        True,
+        None,
+    )
+    run = MlflowClient(uri).get_run(run_id)
+    assert run.data.tags["tenant_id"] == tenant
+    assert run.data.metrics["link_pages"] == 3
