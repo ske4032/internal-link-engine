@@ -250,9 +250,10 @@ async def test_graph_analytics_flow_writes_to_neo4j_and_logs_one_mlflow_run(
         ],
     )
 
-    centrality, communities, run_id = await flows.graph_analytics_flow(tenant)
+    centrality, communities, hubs, run_id = await flows.graph_analytics_flow(tenant)
 
     assert (centrality.pages, communities.crawled_pages, communities.orphans) == (4, 4, 1)
+    assert (hubs.pages, hubs.hubs) == (0, 0)
     [lone] = await graph.get_pages(tenant, [urls[3]])
     assert (lone.page_rank is not None, lone.is_orphan, lone.link_community_id) == (
         True,

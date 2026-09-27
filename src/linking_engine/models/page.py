@@ -72,6 +72,7 @@ class Page(BaseModel):
     is_link_pillar: bool | None = None
     is_keyword_pillar: bool | None = None
     is_content_pillar: bool | None = None
+    is_hub_pillar: bool | None = None
     # No body link from another page, and none to another page.
     is_orphan: bool | None = None
     is_dead_end: bool | None = None
@@ -225,6 +226,67 @@ class CommunityContext(BaseModel):
     link_community_id: int | None = None
     keyword_community_id: int | None = None
     content_community_id: int | None = None
+    hub_id: int | None = None
+
+
+class PageHub(BaseModel):
+    """HDBSCAN hub of one crawled page: -1 is noise, None means the page has no content vector."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    # The stored key as read in the snapshot; written back verbatim, never re-normalised.
+    url: str = Field(min_length=1)
+    hub_id: int | None = Field(default=None, ge=-1)
+    is_hub_pillar: bool = False
+
+    @model_validator(mode="after")
+    def _pillar_in_a_hub(self) -> Self:
+        if self.is_hub_pillar and (self.hub_id is None or self.hub_id < 0):
+            raise ValueError("a hub pillar must belong to a hub")
+        return self
+
+
+class HubCentroid(BaseModel):
+    """One active hub: its stable id, size, content centroid and pillar page."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    hub_id: int = Field(ge=0)
+    size: int = Field(ge=1)
+    centroid: tuple[float, ...] = Field(min_length=1)
+    pillar_url: str | None = None
+
+
+class HubReport(BaseModel):
+    """One HDBSCAN run over the tenant's page vectors."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    tenant_id: str = Field(min_length=1)
+    pages: int = Field(ge=0)
+    hubs: int = Field(ge=0)
+    noise: int = Field(ge=0)
+    noise_pct: float = Field(ge=0, le=1)
+    largest_hub_pct: float = Field(ge=0, le=1)
+    median_hub_size: float = Field(ge=0)
+    # hdbscan's fast DBCV estimate; noise lowers it.
+    relative_validity: float | None = None
+    persistence_mean: float | None = None
+    persistence_min: float | None = None
+    persistence_weighted: float | None = None
+    # Hub ids carried over from the previous run, new ones, and previous hubs with no match.
+    matched_hubs: int = Field(ge=0)
+    new_hubs: int = Field(ge=0)
+    retired_hubs: int = Field(ge=0)
+    # ARI against the previous run's hub ids; noise pages count as singletons.
+    drift_ari: float | None = None
+    agreement_link: float | None = None
+    agreement_content: float | None = None
+    # Pages and noise pages per first url path segment.
+    section_pages: dict[str, int]
+    section_noise: dict[str, int]
+    runtime_s: float = Field(ge=0)
+    write_s: float = Field(ge=0)
 
 
 class PassReport(BaseModel):

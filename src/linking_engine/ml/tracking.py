@@ -9,6 +9,9 @@ import mlflow
 
 from linking_engine.graph.algorithms import (
     DAMPING,
+    HUB_MATCH_SIMILARITY,
+    HUB_MIN_CLUSTER_SIZE,
+    HUB_MIN_SAMPLES,
     KNN_NEIGHBOURS,
     MIN_PILLAR_COMMUNITY,
     PROJECTION_EDGE_BUDGET,
@@ -18,7 +21,7 @@ from linking_engine.graph.algorithms import (
 )
 
 if TYPE_CHECKING:
-    from linking_engine.models import CentralityReport, CommunityReport
+    from linking_engine.models import CentralityReport, CommunityReport, HubReport
 
 
 def analytics_experiment(tenant_id: str) -> str:
@@ -26,7 +29,7 @@ def analytics_experiment(tenant_id: str) -> str:
 
 
 def analytics_metrics(
-    centrality: CentralityReport, communities: CommunityReport
+    centrality: CentralityReport, communities: CommunityReport, hubs: HubReport
 ) -> dict[str, float]:
     """Every numeric result of the run, flat; values that could not be computed are left out."""
     metrics: dict[str, float] = {
@@ -55,14 +58,25 @@ def analytics_metrics(
             for label, count in communities.orphan_labels.items()
         }
     )
+    metrics.update(
+        {
+            f"hub_{name}": float(value)
+            for name, value in hubs.model_dump(
+                exclude={"tenant_id", "section_pages", "section_noise"}
+            ).items()
+            if value is not None
+        }
+    )
     return metrics
 
 
-def log_analytics(centrality: CentralityReport, communities: CommunityReport, summary: str) -> str:
+def log_analytics(
+    centrality: CentralityReport, communities: CommunityReport, hubs: HubReport, summary: str
+) -> str:
     """Log one graph analytics run with its description; returns the MLflow run id."""
     tenant_id = communities.tenant_id
-    if centrality.tenant_id != tenant_id:
-        raise ValueError("both reports must come from the same tenant")
+    if {centrality.tenant_id, hubs.tenant_id} != {tenant_id}:
+        raise ValueError("all reports must come from the same tenant")
     mlflow.set_experiment(analytics_experiment(tenant_id))
     with mlflow.start_run(
         run_name="graph analytics",
@@ -82,15 +96,20 @@ def log_analytics(centrality: CentralityReport, communities: CommunityReport, su
                 "knn_neighbours": KNN_NEIGHBOURS,
                 "projection_edge_budget": PROJECTION_EDGE_BUDGET,
                 "min_pillar_community": MIN_PILLAR_COMMUNITY,
+                "hub_min_cluster_size": HUB_MIN_CLUSTER_SIZE,
+                "hub_min_samples": HUB_MIN_SAMPLES,
+                "hub_match_similarity": HUB_MATCH_SIMILARITY,
                 "igraph": version("igraph"),
                 "leidenalg": version("leidenalg"),
+                "hdbscan": version("hdbscan"),
             }
         )
-        mlflow.log_metrics(analytics_metrics(centrality, communities))
+        mlflow.log_metrics(analytics_metrics(centrality, communities, hubs))
         mlflow.log_dict(
             {
                 "centrality": centrality.model_dump(mode="json"),
                 "communities": communities.model_dump(mode="json"),
+                "hubs": hubs.model_dump(mode="json"),
             },
             "report.json",
         )

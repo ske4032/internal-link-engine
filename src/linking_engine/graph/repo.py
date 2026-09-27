@@ -52,8 +52,10 @@ if TYPE_CHECKING:
     from linking_engine.models import (
         AnchorKeyUpdate,
         EdgeRef,
+        HubCentroid,
         PageCentrality,
         PageCommunities,
+        PageHub,
         SentenceTarget,
     )
 
@@ -98,6 +100,7 @@ PAGE_PROPERTIES: Final = {
     "is_link_pillar": "isLinkPillar",
     "is_keyword_pillar": "isKeywordPillar",
     "is_content_pillar": "isContentPillar",
+    "is_hub_pillar": "isHubPillar",
     "is_orphan": "isOrphan",
     "is_dead_end": "isDeadEnd",
     "orphan_label": "orphanLabel",
@@ -354,7 +357,40 @@ _COMMUNITY_CONTEXT: Final = """
 MATCH (p:Page {tenantId: $tenant})
 WHERE NOT coalesce(p.isPlaceholder, false)
 RETURN p.url AS url, coalesce(p.menuInlinks, 0) AS menu, coalesce(p.footerInlinks, 0) AS footer,
-       p.linkCommunityId AS link, p.keywordCommunityId AS keyword, p.contentCommunityId AS content
+       p.linkCommunityId AS link, p.keywordCommunityId AS keyword, p.contentCommunityId AS content,
+       p.hubId AS hub
+"""
+_WRITE_PAGE_HUBS: Final = """
+UNWIND $rows AS row
+MATCH (p:Page {tenantId: $tenant, url: row.url})
+WHERE NOT coalesce(p.isPlaceholder, false)
+SET p.hubId = row.hubId, p.isHubPillar = row.isHubPillar
+RETURN count(p) AS n
+"""
+_CLEAR_PLACEHOLDER_HUBS: Final = """
+MATCH (p:Page {tenantId: $tenant, isPlaceholder: true})
+WHERE p.hubId IS NOT NULL OR p.isHubPillar IS NOT NULL
+REMOVE p.hubId, p.isHubPillar
+RETURN count(p) AS n
+"""
+_UPSERT_HUBS: Final = """
+UNWIND $hubs AS hub
+MERGE (h:Hub {tenantId: $tenant, hubId: hub.hubId})
+SET h.size = hub.size, h.pillarUrl = hub.pillarUrl, h.active = true, h.updatedAt = datetime()
+WITH h, hub
+CALL db.create.setNodeVectorProperty(h, 'centroid', hub.centroid)
+RETURN count(h) AS n
+"""
+# Retired hubs keep their node and centroid, so their ids are never handed out again.
+_RETIRE_HUBS: Final = """
+MATCH (h:Hub {tenantId: $tenant})
+WHERE coalesce(h.active, false) AND NOT h.hubId IN $ids
+SET h.active = false, h.size = 0, h.pillarUrl = null, h.retiredAt = datetime()
+RETURN count(h) AS n
+"""
+_STORED_HUBS: Final = """
+MATCH (h:Hub {tenantId: $tenant})
+RETURN h.hubId AS hub, coalesce(h.active, false) AS active, h.centroid AS centroid
 """
 _SNAPSHOT_PAGES: Final = """
 MATCH (p:Page {tenantId: $tenant})
@@ -1086,6 +1122,7 @@ class GraphRepo:
                     link_community_id=_optional_int(r["link"]),
                     keyword_community_id=_optional_int(r["keyword"]),
                     content_community_id=_optional_int(r["content"]),
+                    hub_id=_optional_int(r["hub"]),
                 )
                 for r in rows
             ]
@@ -1093,6 +1130,68 @@ class GraphRepo:
             raise DatabaseReadError(
                 "neo4j", f"community context of {tenant_id!r}: {error}"
             ) from error
+
+    async def stored_hubs(self, tenant_id: str) -> tuple[dict[int, npt.NDArray[np.float32]], int]:
+        """Centroids of the tenant's active hubs, and the first id no hub has ever used."""
+        _require_tenant(tenant_id)
+        active: dict[int, npt.NDArray[np.float32]] = {}
+        next_id = 0
+        for row in await self._read(_STORED_HUBS, tenant=tenant_id):
+            hub = _int_row(row, "hub")
+            next_id = max(next_id, hub + 1)
+            if row["active"]:
+                centroid = row["centroid"]
+                if not isinstance(centroid, list):
+                    raise DatabaseReadError("neo4j", f"hub {hub} of {tenant_id!r} has no centroid")
+                active[hub] = np.asarray(centroid, dtype=np.float32)
+        return active, next_id
+
+    async def write_hubs(
+        self,
+        tenant_id: str,
+        pages: Sequence[PageHub],
+        hubs: Sequence[HubCentroid],
+        *,
+        batch_size: int = CENTRALITY_BATCH,
+    ) -> int:
+        """Page hubs, active Hub nodes and the retirement of hubs no longer found, in one
+        transaction; a row that matches no crawled page rolls it all back."""
+        _require_tenant(tenant_id)
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        urls = [page.url for page in pages]
+        if len(set(urls)) != len(urls):
+            raise ValueError("one row per page: duplicate urls")
+        ids = [hub.hub_id for hub in hubs]
+        if len(set(ids)) != len(ids):
+            raise ValueError("one row per hub: duplicate hub ids")
+        for hub in hubs:
+            if len(hub.centroid) != VECTOR_DIMENSIONS:
+                raise ValueError(
+                    f"hub {hub.hub_id} centroid has {len(hub.centroid)} dimensions, "
+                    f"expected {VECTOR_DIMENSIONS}"
+                )
+        chunks: list[list[Row]] = [
+            [
+                {"url": page.url, "hubId": page.hub_id, "isHubPillar": page.is_hub_pillar}
+                for page in chunk
+            ]
+            for chunk in batched(pages, batch_size)
+        ]
+        rows: list[Row] = [
+            {
+                "hubId": hub.hub_id,
+                "size": hub.size,
+                "pillarUrl": hub.pillar_url,
+                "centroid": list(hub.centroid),
+            }
+            for hub in hubs
+        ]
+        try:
+            async with self._driver.session(default_access_mode=WRITE_ACCESS) as session:
+                return await session.execute_write(_write_hub_rows, tenant_id, chunks, rows)
+        except (Neo4jError, DriverError) as error:
+            raise _translate(error, write=True) from error
 
     # ── transport ────────────────────────────────────────────────────────────
 
@@ -1170,6 +1269,20 @@ async def _write_page_rows(
             "rows whose page is missing or a placeholder are dropped",
         )
     await _collect(tx, clear, {"tenant": tenant_id})
+    return written
+
+
+async def _write_hub_rows(
+    tx: AsyncManagedTransaction, tenant_id: str, chunks: list[list[Row]], hubs: list[Row]
+) -> int:
+    written = await _write_page_rows(
+        tx, _WRITE_PAGE_HUBS, _CLEAR_PLACEHOLDER_HUBS, tenant_id, chunks
+    )
+    upserted = _int(await _collect(tx, _UPSERT_HUBS, {"tenant": tenant_id, "hubs": hubs}))
+    if upserted != len(hubs):
+        raise DatabaseWriteError("neo4j", f"wrote {upserted} of {len(hubs)} hubs, rolled back")
+    ids = [hub["hubId"] for hub in hubs]
+    await _collect(tx, _RETIRE_HUBS, {"tenant": tenant_id, "ids": ids})
     return written
 
 
