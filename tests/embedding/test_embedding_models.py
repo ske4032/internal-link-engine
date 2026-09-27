@@ -17,7 +17,6 @@ from linking_engine.models import (
     PageEmbedding,
     PageText,
     SentenceTarget,
-    TenantEmbedReport,
 )
 
 
@@ -344,12 +343,3 @@ def test_link_report_allows_no_ratio_when_nothing_was_counted() -> None:
 def test_link_report_rejects_bad_fields(field: str, value: object) -> None:
     with pytest.raises(ValidationError, match=field):
         LinkEmbedReport.model_validate(link_report(**{field: value}))
-
-
-def test_tenant_report_carries_both_stages() -> None:
-    pages = EmbedRunReport.model_validate(report())
-    links = LinkEmbedReport.model_validate(link_report())
-    result = TenantEmbedReport(pages=pages, links=links)
-    assert (result.pages, result.links) == (pages, links)
-    rebuilt = TenantEmbedReport.model_validate(result.model_dump(mode="json"))
-    assert rebuilt == result

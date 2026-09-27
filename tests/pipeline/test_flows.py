@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 from prefect.states import Failed
-from test_embed import DIM, body, record, seed, seed_plain, url
+from test_embed import DIM, record, seed, seed_plain, url
 from test_embed_links import text_vector
 from voyage_fakes import FakeVoyage, client, page_index
 from voyageai.error import InvalidRequestError, ServiceUnavailableError
@@ -17,7 +17,7 @@ from linking_engine.errors import (
     EmbeddingRequestError,
     EmbeddingUnavailableError,
 )
-from linking_engine.models import LinkRecord, TenantEmbedReport
+from linking_engine.models import LinkRecord
 from linking_engine.pipeline import flows
 
 if TYPE_CHECKING:
@@ -48,7 +48,7 @@ def flow_env(
     monkeypatch.setenv("NEO4J_PASSWORD", password)
     monkeypatch.setenv("MONGO_URI", mongo_uri)
     monkeypatch.setenv("MONGO_DB", "linking_engine_test")
-    for name in ("embed_tenant_task", "embed_links_task"):
+    for name in ("embed_pages_task", "embed_links_task"):
         task = getattr(flows, name)
         monkeypatch.setattr(flows, name, task.with_options(retry_delay_seconds=0))
 
@@ -58,18 +58,17 @@ def use(monkeypatch: pytest.MonkeyPatch, fake: FakeVoyage) -> None:
 
 
 @pytest.mark.integration
-async def test_flow_embeds_the_tenant(
+async def test_page_flow_embeds_the_tenants_pages(
     mongo: MongoRepo, graph: GraphRepo, tenant: str, flow_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await seed_plain(mongo, graph, tenant, 3)
     fake = FakeVoyage(dimension=DIM)
     use(monkeypatch, fake)
 
-    report = await flows.embed_tenant_flow(tenant, 2)
+    report = await flows.embed_pages_flow(tenant, 2)
 
-    assert isinstance(report, TenantEmbedReport)
-    assert (report.pages.selected, report.pages.embedded, report.pages.flushes) == (3, 3, 2)
-    assert (report.links.tenant_id, report.links.edges, fake.call_count) == (tenant, 0, 2)
+    assert (report.selected, report.embedded, report.flushes) == (3, 3, 2)
+    assert fake.call_count == 2
 
 
 @pytest.mark.integration
@@ -80,7 +79,7 @@ async def test_rejected_request_fails_the_run_without_a_task_retry(
     fake = FakeVoyage(dimension=DIM, failures=[InvalidRequestError("bad input", http_status=400)])
     use(monkeypatch, fake)
 
-    state = await flows.embed_tenant_flow(tenant, 2, return_state=True)
+    state = await flows.embed_pages_flow(tenant, 2, return_state=True)
 
     assert state.is_failed()
     assert fake.call_count == 1
@@ -96,10 +95,10 @@ async def test_outage_retries_the_task_and_embeds_only_the_uncommitted_flush(
     fake = FakeVoyage(dimension=DIM, fail_on=outage)
     use(monkeypatch, fake)
 
-    report = await flows.embed_tenant_flow(tenant, 2)
+    report = await flows.embed_pages_flow(tenant, 2)
 
     assert fake.call_count == 5
-    assert (report.pages.selected, report.pages.embedded) == (2, 2)
+    assert (report.selected, report.embedded) == (2, 2)
     assert sorted(page_index(text) for text in fake.calls[-1].texts) == [2, 3]
 
 
@@ -132,7 +131,6 @@ LINKS = (
         is_internal=True,
     ),
 )
-BODIES = {body(i) for i in range(3)}
 
 
 async def seed_linked(mongo: MongoRepo, graph: GraphRepo, tenant: str) -> None:
@@ -149,17 +147,15 @@ def any_text(**options: object) -> FakeVoyage:
 
 
 @pytest.mark.integration
-async def test_flow_embeds_links_after_pages_and_returns_both_reports(
+async def test_link_flow_embeds_anchors_and_sentences_without_page_vectors(
     mongo: MongoRepo, graph: GraphRepo, tenant: str, flow_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await seed_linked(mongo, graph, tenant)
     fake = any_text()
     use(monkeypatch, fake)
 
-    report = await flows.embed_tenant_flow(tenant, 2)
+    links = await flows.embed_links_flow(tenant, 2)
 
-    assert (report.pages.selected, report.pages.embedded) == (3, 3)
-    links = report.links
     assert (links.edges, links.unique_anchors, links.generic_anchors, links.anchors_embedded) == (
         3,
         2,
@@ -171,10 +167,23 @@ async def test_flow_embeds_links_after_pages_and_returns_both_reports(
         2,
         3,
     )
-    sent = [text for call in fake.calls for text in call.texts]
-    kinds = ["page" if text in BODIES else "link" for text in sent]
-    assert kinds == ["page"] * 3 + ["link"] * 3, "every page must be embedded before any link"
-    assert set(sent[3:]) == {"trail shoes", SHARED, OTHER}
+    sent = {text for call in fake.calls for text in call.texts}
+    assert sent == {"trail shoes", SHARED, OTHER}, "the link flow never embeds page bodies"
+
+
+@pytest.mark.integration
+async def test_a_failed_page_flow_leaves_the_link_flow_unaffected(
+    mongo: MongoRepo, graph: GraphRepo, tenant: str, flow_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await seed_linked(mongo, graph, tenant)
+    use(monkeypatch, any_text(failures=[InvalidRequestError("bad input", http_status=400)]))
+    pages = await flows.embed_pages_flow(tenant, 2, return_state=True)
+    use(monkeypatch, any_text())
+
+    links = await flows.embed_links_flow(tenant, 2)
+
+    assert pages.is_failed()
+    assert (links.anchors_embedded, links.sentences_embedded) == (1, 2)
 
 
 @pytest.mark.integration
@@ -182,20 +191,16 @@ async def test_link_outage_retries_only_the_link_task_and_embeds_only_the_rest(
     mongo: MongoRepo, graph: GraphRepo, tenant: str, flow_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     await seed_linked(mongo, graph, tenant)
-    # Flush size 1: pages are calls 1-3, the anchor call 4, sentences 5 and 6. Every client
-    # attempt of the second sentence flush (calls 6-8) hits an outage; the task retry is call 9.
-    outage = {n: ServiceUnavailableError("down", http_status=503) for n in (6, 7, 8)}
+    # Flush size 1: the anchor is call 1, sentences 2 and 3. Every client attempt of the
+    # second sentence flush (calls 3-5) hits an outage; the task retry is call 6.
+    outage = {n: ServiceUnavailableError("down", http_status=503) for n in (3, 4, 5)}
     fake = any_text(fail_on=outage)
     use(monkeypatch, fake)
 
-    report = await flows.embed_tenant_flow(tenant, 1)
+    links = await flows.embed_links_flow(tenant, 1)
 
-    assert fake.call_count == 9
-    sent = [text for call in fake.calls for text in call.texts]
-    assert sum(text in BODIES for text in sent) == 3, "the page task must not re-run"
-    assert report.pages.embedded == 3
-    assert set(fake.calls[-1].texts) == {SHARED, OTHER} - set(fake.calls[4].texts)
-    links = report.links
+    assert fake.call_count == 6
+    assert set(fake.calls[-1].texts) == {SHARED, OTHER} - set(fake.calls[1].texts)
     assert (links.anchors_cached, links.anchors_embedded) == (1, 0)
     assert (links.sentences_cached, links.sentences_embedded, links.keys_written) == (1, 1, 0)
 

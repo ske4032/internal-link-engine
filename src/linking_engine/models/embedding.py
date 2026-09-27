@@ -204,12 +204,3 @@ class LinkEmbedReport(BaseModel):
                 "unique_sentences must equal cached plus reused plus embedded sentences"
             )
         return self
-
-
-class TenantEmbedReport(BaseModel):
-    """One embed-tenant flow run: pages first, then links."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    pages: EmbedRunReport
-    links: LinkEmbedReport

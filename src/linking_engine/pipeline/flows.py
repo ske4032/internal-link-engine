@@ -19,7 +19,7 @@ from linking_engine.errors import (
 )
 from linking_engine.graph.repo import GraphRepo
 from linking_engine.ingest.mongo_repo import MongoRepo
-from linking_engine.models import EmbedRunReport, LinkEmbedReport, TenantConfig, TenantEmbedReport
+from linking_engine.models import EmbedRunReport, LinkEmbedReport, TenantConfig
 from linking_engine.pipeline.embed import FLUSH_SIZE, embed_tenant
 from linking_engine.pipeline.embed_links import embed_links
 
@@ -44,13 +44,13 @@ def is_transient(_task: object, _task_run: object, state: State[Any]) -> bool:
 
 # A retry re-runs the whole stage: the resume query skips every flush already committed.
 @task(
-    name="embed-tenant",
+    name="embed-pages",
     retries=1,
     retry_delay_seconds=30,
     retry_condition_fn=is_transient,
     cache_policy=NONE,
 )
-async def embed_tenant_task(tenant_id: str, flush_size: int) -> EmbedRunReport:
+async def embed_pages_task(tenant_id: str, flush_size: int) -> EmbedRunReport:
     voyage = voyage_client(tenant_id)
     async with (
         await GraphRepo.connect(
@@ -82,39 +82,51 @@ async def embed_links_task(tenant_id: str, flush_size: int) -> LinkEmbedReport:
         return await embed_links(graph, voyage, tenant_id, flush_size=flush_size, rules=rules)
 
 
-@flow(name="embed-tenant")
-async def embed_tenant_flow(tenant_id: str, flush_size: int = FLUSH_SIZE) -> TenantEmbedReport:
+# Two flows, not one: a failure shows as either the page or the link flow in Prefect.
+@flow(name="embed-pages")
+async def embed_pages_flow(tenant_id: str, flush_size: int = FLUSH_SIZE) -> EmbedRunReport:
     logger = get_run_logger()
     with bound_contextvars(run_id=str(flow_run.id)):
-        logger.info("embedding tenant %s, flush size %d", tenant_id, flush_size)
-        pages = await embed_tenant_task(tenant_id, flush_size)
+        logger.info("embedding pages of tenant %s, flush size %d", tenant_id, flush_size)
+        pages = await embed_pages_task(tenant_id, flush_size)
+    logger.info(
+        "embedded %d of %d selected pages in %d flushes; skipped %d not usable, %d empty, "
+        "%d missing, %d hash mismatch; %d api tokens, %.1fs",
+        pages.embedded,
+        pages.selected,
+        pages.flushes,
+        pages.skipped_not_usable,
+        pages.skipped_empty_body,
+        pages.skipped_missing,
+        pages.skipped_hash_mismatch,
+        pages.api_tokens,
+        pages.elapsed_s,
+    )
+    return pages
+
+
+@flow(name="embed-links")
+async def embed_links_flow(tenant_id: str, flush_size: int = FLUSH_SIZE) -> LinkEmbedReport:
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
         logger.info(
-            "embedded %d of %d selected pages in %d flushes; skipped %d not usable, %d empty, "
-            "%d missing, %d hash mismatch; %d api tokens, %.1fs",
-            pages.embedded,
-            pages.selected,
-            pages.flushes,
-            pages.skipped_not_usable,
-            pages.skipped_empty_body,
-            pages.skipped_missing,
-            pages.skipped_hash_mismatch,
-            pages.api_tokens,
-            pages.elapsed_s,
+            "embedding anchors and sentences of tenant %s, flush size %d", tenant_id, flush_size
         )
         links = await embed_links_task(tenant_id, flush_size)
-        logger.info(
-            "embedded %d of %d anchors (%d generic, %d cached) and %d of %d sentences "
-            "(%d cached) over %d edges; %d edges written; %d api tokens, %.1fs",
-            links.anchors_embedded,
-            links.unique_anchors,
-            links.generic_anchors,
-            links.anchors_cached,
-            links.sentences_embedded,
-            links.unique_sentences,
-            links.sentences_cached,
-            links.edges,
-            links.surrounding_edges_written,
-            links.api_tokens,
-            links.elapsed_s,
-        )
-    return TenantEmbedReport(pages=pages, links=links)
+    logger.info(
+        "embedded %d of %d anchors (%d generic, %d cached) and %d of %d sentences "
+        "(%d cached, %d reused) over %d edges; %d edges written; %d api tokens, %.1fs",
+        links.anchors_embedded,
+        links.unique_anchors,
+        links.generic_anchors,
+        links.anchors_cached,
+        links.sentences_embedded,
+        links.unique_sentences,
+        links.sentences_cached,
+        links.sentences_reused,
+        links.edges,
+        links.surrounding_edges_written,
+        links.api_tokens,
+        links.elapsed_s,
+    )
+    return links

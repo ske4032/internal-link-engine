@@ -35,7 +35,6 @@ from linking_engine.models.embedding import (
     PageEmbedding,
     PageText,
     SentenceTarget,
-    TenantEmbedReport,
 )
 from linking_engine.models.enums import (
     ActionType,
@@ -92,6 +91,5 @@ __all__ = [
     "RecommendationStatus",
     "SentenceTarget",
     "TenantConfig",
-    "TenantEmbedReport",
     "TenantGraphCounts",
 ]
