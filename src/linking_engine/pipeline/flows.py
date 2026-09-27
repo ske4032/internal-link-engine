@@ -10,6 +10,7 @@ from prefect.cache_policies import NONE
 from prefect.runtime import flow_run
 from structlog.contextvars import bound_contextvars
 
+from linking_engine.discovery.candidates import retrieve_candidates, summarise_candidates
 from linking_engine.embedding.voyage_client import VoyageClient, VoyageSettings
 from linking_engine.errors import (
     DatabaseAuthError,
@@ -21,8 +22,9 @@ from linking_engine.graph.repo import GraphRepo
 from linking_engine.ingest.graph_load import load_tenant_graph
 from linking_engine.ingest.mongo_repo import CrawlSource, MongoRepo
 from linking_engine.ingest.prepare import BOILERPLATE_SHARE, NAV_SHARE, prepare_tenant
-from linking_engine.ml.tracking import log_analytics
+from linking_engine.ml.tracking import log_analytics, log_candidates
 from linking_engine.models import (
+    CandidateSet,
     CentralityReport,
     CommunityReport,
     EmbedRunReport,
@@ -32,6 +34,7 @@ from linking_engine.models import (
     PrepareReport,
     TenantConfig,
     TenantGraphCounts,
+    VectorIndex,
 )
 from linking_engine.pipeline.analytics import (
     compute_centrality,
@@ -237,6 +240,57 @@ async def graph_analytics_flow(
         mlflow_run,
     )
     return centrality, communities, hubs, mlflow_run
+
+
+# Read-only against Neo4j, so a retry repeats the retrieval with nothing to undo.
+@task(
+    name="candidate-retrieval",
+    retries=1,
+    retry_delay_seconds=30,
+    retry_condition_fn=is_transient,
+    cache_policy=NONE,
+)
+async def candidates_task(tenant_id: str, index: VectorIndex) -> CandidateSet:
+    async with await neo4j() as graph:
+        await graph.check_server()
+        return await retrieve_candidates(graph, tenant_id, index=index)
+
+
+@task(name="mlflow-log-candidates", cache_policy=NONE)
+def log_candidates_task(found: CandidateSet) -> str:
+    return log_candidates(found, summarise_candidates(found.report))
+
+
+@flow(name="candidate-retrieval")
+async def candidate_retrieval_flow(
+    tenant_id: str, index: VectorIndex = "page_content"
+) -> tuple[CandidateSet, str]:
+    """The nearest eligible sources of every indexable page, capped per target; nothing is
+    written to Neo4j, the report and a per-target table are logged to MLflow."""
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
+        logger.info("candidate retrieval of tenant %s over the %s vectors", tenant_id, index)
+        found = await candidates_task(tenant_id, index)
+        mlflow_run = log_candidates_task(found)
+    report = found.report
+    logger.info(
+        "%d targets over %d source pages, %d candidates; %d full, %d short, %d empty targets; "
+        "%d linked pairs excluded, %d among the nearest; %.1fs (%.1fs load, %.1fs search); "
+        "mlflow run %s",
+        report.targets,
+        report.source_pages,
+        report.candidates,
+        report.full_targets,
+        report.short_targets,
+        report.empty_targets,
+        report.linked_pairs,
+        report.linked_nearer,
+        report.seconds,
+        report.load_seconds,
+        report.search_seconds,
+        mlflow_run,
+    )
+    return found, mlflow_run
 
 
 # Upserts keyed by url and position, so a retry converges on the same records.
