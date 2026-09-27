@@ -34,22 +34,28 @@ from linking_engine.models import (
     EmbeddingTarget,
     IssueFlag,
     Link,
+    LinkText,
     Page,
     TenantGraphCounts,
 )
 from linking_engine.urls import normalise_url
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping, Sequence
+    from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Mapping, Sequence
     from types import TracebackType
 
     import numpy.typing as npt
     from neo4j import AsyncDriver, AsyncManagedTransaction
 
+    from linking_engine.models import AnchorKeyUpdate, EdgeRef, SentenceTarget
+
 VECTOR_DIMENSIONS: Final = 2048
 VECTOR_INDEXES: Final = ("page_content", "page_gnn")
 PAGE_BATCH: Final = 500
 LINK_BATCH: Final = 1000
+# anchor_tenant_text rejects index entries over ~8 KB (an 8149-byte text failed at 8150 on 5.26);
+# half of that leaves room for tenantId. A longer key would fail its flush on every run.
+ANCHOR_KEY_MAX_BYTES: Final = 4096
 
 Row = dict[str, object]
 
@@ -94,6 +100,7 @@ LINK_PROPERTIES: Final = {
     "position": "position",
     **_INGESTED_LINK_PROPERTIES,
     "anchor_type": "anchorType",
+    "anchor_key": "anchorKey",
     "weight": "weight",
     "surrounding_embedding": "surroundingEmbedding",
     "target_status_code": "targetStatusCode",
@@ -225,6 +232,87 @@ RETURN count(p) AS n
 _DROPPED_EMBEDDINGS: Final = (
     "rows whose page is missing, is a placeholder or has a changed bodyHash are dropped"
 )
+# Keyset page over (source url, position). Ordering by the full (tenantId, url) index key lets the
+# planner read the index in order with a PartialTop; ORDER BY s.url alone sorts every remaining edge.
+_LINK_TEXTS_AFTER: Final = """
+MATCH (s:Page {tenantId: $tenant}) WHERE s.url >= $after_url
+MATCH (s)-[r:LINKS_TO]->()
+WHERE s.url > $after_url OR r.position > $after_position
+RETURN s.url AS source_url,
+       r.position AS position,
+       r.anchorText AS anchor_text,
+       r.surroundingText AS surrounding_text,
+       r.anchorKey AS anchor_key,
+       r.anchorGeneric AS anchor_generic,
+       r.surroundingEmbeddedHash AS surrounding_embedded_hash,
+       r.surroundingEmbeddingModel AS surrounding_embedding_model
+ORDER BY s.tenantId, s.url, r.position
+LIMIT $limit
+"""
+# A null key removes anchorKey.
+_SET_ANCHOR_KEYS: Final = """
+UNWIND $rows AS row
+MATCH (:Page {tenantId: $tenant, url: row.source})-[r:LINKS_TO {position: row.position}]->()
+SET r.anchorKey = row.key, r.anchorGeneric = row.generic
+RETURN count(r) AS n
+"""
+_DROPPED_EDGES: Final = "each (source url, position) must match exactly one LINKS_TO edge"
+_ANCHOR_KEYS_TO_EMBED: Final = """
+UNWIND $keys AS key
+WITH key
+WHERE NOT EXISTS {
+  MATCH (a:Anchor {tenantId: $tenant, text: key})
+  WHERE a.embeddingModel = $model AND a.embedding IS NOT NULL
+}
+RETURN key
+"""
+_WRITE_ANCHOR_EMBEDDINGS: Final = """
+UNWIND $rows AS row
+MERGE (a:Anchor {tenantId: $tenant, text: row.key})
+WITH a, row
+CALL db.create.setNodeVectorProperty(a, 'embedding', row.vec)
+SET a.embeddingModel = $model,
+    a.embeddingDimensions = $dimensions,
+    a.embeddedAt = datetime()
+RETURN count(a) AS n
+"""
+_DROPPED_ANCHORS: Final = "every key must merge exactly one Anchor"
+# Each vector is sent once per unique sentence and fanned out to its edges server-side.
+# Tenant-scoped: a vector is only ever reused within the tenant that paid for it.
+_SURROUNDING_VECTORS: Final = """
+UNWIND $hashes AS h
+MATCH (:Page {tenantId: $tenant})-[r:LINKS_TO {surroundingEmbeddedHash: h}]->()
+WHERE r.surroundingEmbeddingModel = $model AND r.surroundingEmbedding IS NOT NULL
+WITH h, head(collect(r.surroundingEmbedding)) AS vec
+RETURN h AS hash, vec
+"""
+_WRITE_SURROUNDING_EMBEDDINGS: Final = """
+UNWIND $rows AS row
+UNWIND row.edges AS edge
+MATCH (:Page {tenantId: $tenant, url: edge.source})-[r:LINKS_TO {position: edge.position}]->()
+CALL db.create.setRelationshipVectorProperty(r, 'surroundingEmbedding', row.vec)
+SET r.surroundingEmbeddedHash = row.hash,
+    r.surroundingEmbeddingModel = $model
+RETURN count(r) AS n
+"""
+_CLEAR_SURROUNDING_EMBEDDINGS: Final = """
+UNWIND $rows AS row
+MATCH (:Page {tenantId: $tenant, url: row.source})-[r:LINKS_TO {position: row.position}]->()
+REMOVE r.surroundingEmbedding, r.surroundingEmbeddedHash, r.surroundingEmbeddingModel
+RETURN count(r) AS n
+"""
+_ANCHOR_EMBEDDING_MODELS: Final = """
+MATCH (a:Anchor {tenantId: $tenant})
+WHERE a.embedding IS NOT NULL
+RETURN a.embeddingModel AS embedding_model, count(a) AS vectors
+ORDER BY embedding_model
+"""
+_SURROUNDING_EMBEDDING_MODELS: Final = """
+MATCH (:Page {tenantId: $tenant})-[r:LINKS_TO]->()
+WHERE r.surroundingEmbedding IS NOT NULL
+RETURN r.surroundingEmbeddingModel AS embedding_model, count(r) AS vectors
+ORDER BY embedding_model
+"""
 _DELETE_TENANT: Final = """
 MATCH (n) WHERE n.tenantId = $tenant
 CALL (n) { DETACH DELETE n } IN TRANSACTIONS OF $batch ROWS
@@ -468,7 +556,14 @@ class GraphRepo:
         """Write one flush of content vectors in one transaction: every row is written or none."""
         _require_tenant(tenant_id)
         urls = [normalise_url(url) for url in urls]
-        _check_embeddings(urls, body_hashes, vectors, model=model, dimensions=dimensions)
+        _check_embeddings(
+            urls,
+            vectors,
+            what="urls",
+            model=model,
+            dimensions=dimensions,
+            counts=(("body hashes", len(body_hashes)),),
+        )
         rows = [
             {"url": url, "hash": body_hash, "vec": vector}
             for url, body_hash, vector in zip(urls, body_hashes, vectors.tolist(), strict=True)
@@ -482,6 +577,139 @@ class GraphRepo:
             model=model,
             dimensions=dimensions,
         )
+
+    async def set_anchor_keys(
+        self,
+        tenant_id: str,
+        updates: Sequence[AnchorKeyUpdate],
+        *,
+        batch_size: int = LINK_BATCH,
+    ) -> int:
+        """Set anchorKey and anchorGeneric on the given edges; a None key removes anchorKey."""
+        _require_tenant(tenant_id)
+        _check_unique_edges((u.source_url, u.position) for u in updates)
+        if any(u.anchor_key is not None and not u.anchor_key.strip() for u in updates):
+            raise ValueError("anchor_key must be None or a non-blank string")
+        written = 0
+        for chunk in batched(updates, batch_size):
+            rows = [
+                {
+                    "source": u.source_url,
+                    "position": u.position,
+                    "key": u.anchor_key,
+                    "generic": u.anchor_generic,
+                }
+                for u in chunk
+            ]
+            written += await self._write_all(
+                _SET_ANCHOR_KEYS, len(rows), dropped=_DROPPED_EDGES, tenant=tenant_id, rows=rows
+            )
+        return written
+
+    async def write_anchor_embeddings(
+        self,
+        tenant_id: str,
+        keys: Sequence[str],
+        vectors: npt.NDArray[np.float32],
+        *,
+        model: str,
+        dimensions: int,
+    ) -> int:
+        """Write one flush of anchor vectors, one Anchor per key, in one transaction."""
+        _require_tenant(tenant_id)
+        _check_embeddings(keys, vectors, what="keys", model=model, dimensions=dimensions)
+        oversize = sum(len(key.encode()) > ANCHOR_KEY_MAX_BYTES for key in keys)
+        if oversize:
+            raise ValueError(
+                f"{oversize} keys exceed {ANCHOR_KEY_MAX_BYTES} UTF-8 bytes, the Anchor index limit"
+            )
+        rows = [
+            {"key": key, "vec": vector} for key, vector in zip(keys, vectors.tolist(), strict=True)
+        ]
+        return await self._write_exactly(
+            _WRITE_ANCHOR_EMBEDDINGS,
+            len(rows),
+            _DROPPED_ANCHORS,
+            tenant=tenant_id,
+            rows=rows,
+            model=model,
+            dimensions=dimensions,
+        )
+
+    async def write_surrounding_embeddings(
+        self,
+        tenant_id: str,
+        targets: Sequence[SentenceTarget],
+        vectors: npt.NDArray[np.float32],
+        *,
+        model: str,
+        dimensions: int,
+    ) -> int:
+        """Write one flush of sentence vectors to every target edge; all edges or none."""
+        _require_tenant(tenant_id)
+        _check_embeddings(
+            [t.sentence_hash for t in targets],
+            vectors,
+            what="sentence hashes",
+            model=model,
+            dimensions=dimensions,
+        )
+        _check_unique_edges((e.source_url, e.position) for t in targets for e in t.edges)
+        rows = [
+            {
+                "hash": target.sentence_hash,
+                "vec": vector,
+                "edges": [{"source": e.source_url, "position": e.position} for e in target.edges],
+            }
+            for target, vector in zip(targets, vectors.tolist(), strict=True)
+        ]
+        return await self._write_exactly(
+            _WRITE_SURROUNDING_EMBEDDINGS,
+            sum(len(target.edges) for target in targets),
+            _DROPPED_EDGES,
+            tenant=tenant_id,
+            rows=rows,
+            model=model,
+        )
+
+    async def surrounding_vectors(
+        self, tenant_id: str, hashes: Sequence[str], *, model: str, batch_size: int = LINK_BATCH
+    ) -> dict[str, npt.NDArray[np.float32]]:
+        """Stored vectors of this tenant for sentence hashes, from any edge with the same model."""
+        _require_tenant(tenant_id)
+        found: dict[str, npt.NDArray[np.float32]] = {}
+        for chunk in batched(hashes, batch_size):
+            rows = await self._read(
+                _SURROUNDING_VECTORS, tenant=tenant_id, hashes=list(chunk), model=model
+            )
+            for row in rows:
+                vector = row["vec"]
+                if not isinstance(vector, list):
+                    raise DatabaseReadError(
+                        "neo4j", f"sentence {row['hash']!r} has no stored vector"
+                    )
+                found[str(row["hash"])] = np.asarray(vector, dtype=np.float32)
+        return found
+
+    async def clear_surrounding_embeddings(
+        self, tenant_id: str, edges: Sequence[EdgeRef], *, batch_size: int = LINK_BATCH
+    ) -> int:
+        """Remove the surrounding vector, hash and model from each edge; returns edges cleared."""
+        _require_tenant(tenant_id)
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        _check_unique_edges((e.source_url, e.position) for e in edges)
+        cleared = 0
+        for chunk in batched(edges, batch_size):
+            rows = [{"source": e.source_url, "position": e.position} for e in chunk]
+            cleared += await self._write_all(
+                _CLEAR_SURROUNDING_EMBEDDINGS,
+                len(rows),
+                dropped=_DROPPED_EDGES,
+                tenant=tenant_id,
+                rows=rows,
+            )
+        return cleared
 
     async def delete_tenant(self, tenant_id: str, *, batch_size: int = 1000) -> int:
         _require_tenant(tenant_id)
@@ -567,13 +795,65 @@ class GraphRepo:
     async def embedding_models(self, tenant_id: str) -> tuple[EmbeddingModelCount, ...]:
         """Stored content vectors per embeddingModel, ordered by model with None last."""
         _require_tenant(tenant_id)
-        rows = await self._read(_EMBEDDING_MODELS, tenant=tenant_id)
-        try:
-            return tuple(EmbeddingModelCount.model_validate(row) for row in rows)
-        except ValidationError as error:
-            raise DatabaseReadError(
-                "neo4j", f"embedding model counts do not fit the model: {error}"
-            ) from error
+        return _model_counts(await self._read(_EMBEDDING_MODELS, tenant=tenant_id))
+
+    async def anchor_embedding_models(self, tenant_id: str) -> tuple[EmbeddingModelCount, ...]:
+        """Stored Anchor vectors per embeddingModel, ordered by model with None last."""
+        _require_tenant(tenant_id)
+        return _model_counts(await self._read(_ANCHOR_EMBEDDING_MODELS, tenant=tenant_id))
+
+    async def surrounding_embedding_models(self, tenant_id: str) -> tuple[EmbeddingModelCount, ...]:
+        """Stored surroundingEmbedding per surroundingEmbeddingModel, ordered with None last."""
+        _require_tenant(tenant_id)
+        return _model_counts(await self._read(_SURROUNDING_EMBEDDING_MODELS, tenant=tenant_id))
+
+    async def iter_link_texts(
+        self, tenant_id: str, *, batch_size: int = LINK_BATCH
+    ) -> AsyncGenerator[list[LinkText], None]:
+        """Every LINKS_TO edge's texts and markers, ordered by (source url, position); no vectors."""
+        _require_tenant(tenant_id)
+        # LIMIT 0 would end the scan at once and read as a tenant without edges.
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        after_url, after_position = "", -1
+        while True:
+            rows = await self._read(
+                _LINK_TEXTS_AFTER,
+                tenant=tenant_id,
+                after_url=after_url,
+                after_position=after_position,
+                limit=batch_size,
+            )
+            if not rows:
+                return
+            try:
+                texts = [LinkText.model_validate(row) for row in rows]
+            except ValidationError as error:
+                raise DatabaseReadError(
+                    "neo4j", f"link texts do not fit the LinkText model: {error}"
+                ) from error
+            yield texts
+            after_url, after_position = texts[-1].source_url, texts[-1].position
+
+    async def anchor_keys_to_embed(
+        self,
+        tenant_id: str,
+        keys: Sequence[str],
+        *,
+        model: str,
+        batch_size: int = LINK_BATCH,
+    ) -> tuple[str, ...]:
+        """The keys, in input order, whose Anchor has no vector from ``model``."""
+        _require_tenant(tenant_id)
+        if not model.strip():
+            raise ValueError("model must be a non-empty string")
+        pending: set[str] = set()
+        for chunk in batched(keys, batch_size):
+            rows = await self._read(
+                _ANCHOR_KEYS_TO_EMBED, tenant=tenant_id, keys=list(chunk), model=model
+            )
+            pending.update(str(row["key"]) for row in rows)
+        return tuple(key for key in keys if key in pending)
 
     # ── transport ────────────────────────────────────────────────────────────
 
@@ -600,13 +880,17 @@ class GraphRepo:
         except (Neo4jError, DriverError) as error:
             raise _translate(error, write=True) from error
 
-    async def _write_all(self, query: LiteralString, expected: int, **params: object) -> int:
+    async def _write_all(
+        self,
+        query: LiteralString,
+        expected: int,
+        *,
+        dropped: str = "rows with missing endpoint pages are dropped",
+        **params: object,
+    ) -> int:
         written = _int(await self._write(query, **params))
         if written != expected:
-            raise DatabaseWriteError(
-                "neo4j",
-                f"wrote {written} of {expected} rows; rows with missing endpoint pages are dropped",
-            )
+            raise DatabaseWriteError("neo4j", f"wrote {written} of {expected} rows; {dropped}")
         return written
 
     async def _write_exactly(
@@ -664,13 +948,15 @@ def _require_tenant(tenant_id: str) -> None:
 
 
 def _check_embeddings(
-    urls: Sequence[str],
-    body_hashes: Sequence[str],
+    ids: Sequence[str],
     vectors: npt.NDArray[np.float32],
     *,
+    what: str,
     model: str,
     dimensions: int,
+    counts: Sequence[tuple[str, int]] = (),
 ) -> None:
+    """Validate one flush: ``ids`` name its rows; ``counts`` are other per-row inputs."""
     if not model.strip():
         raise ValueError("model must be a non-empty string")
     # Neo4j accepts a vector of another size but leaves it out of the index.
@@ -678,21 +964,40 @@ def _check_embeddings(
         raise ValueError(
             f"dimensions {dimensions} does not match the {VECTOR_DIMENSIONS}d vector index"
         )
-    if not urls:
+    if not ids:
         raise ValueError("no embeddings to write")
     if vectors.dtype != np.float32 or vectors.ndim != 2 or vectors.shape[1] != dimensions:
         raise ValueError(
             f"vectors must be a float32 matrix with {dimensions} columns, "
             f"got {vectors.dtype} {vectors.shape}"
         )
-    if not len(urls) == len(body_hashes) == vectors.shape[0]:
-        raise ValueError(
-            f"got {len(urls)} urls, {len(body_hashes)} body hashes and {vectors.shape[0]} vectors"
-        )
-    if len(set(urls)) != len(urls):
-        raise ValueError("duplicate urls in one flush")
+    sizes = ((what, len(ids)), *counts)
+    if any(size != vectors.shape[0] for _, size in sizes):
+        listed = ", ".join(f"{size} {name}" for name, size in sizes)
+        raise ValueError(f"got {listed} and {vectors.shape[0]} vectors")
+    if any(not i.strip() for i in ids):
+        raise ValueError(f"blank {what} in one flush")
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"duplicate {what} in one flush")
     if not np.isfinite(vectors).all():
         raise ValueError("vectors contain NaN or infinite values")
+
+
+def _check_unique_edges(edges: Iterable[tuple[str, int]]) -> None:
+    seen: set[tuple[str, int]] = set()
+    for edge in edges:
+        if edge in seen:
+            raise ValueError(f"duplicate edge {edge[0]!r} position {edge[1]} in one call")
+        seen.add(edge)
+
+
+def _model_counts(rows: list[Row]) -> tuple[EmbeddingModelCount, ...]:
+    try:
+        return tuple(EmbeddingModelCount.model_validate(row) for row in rows)
+    except ValidationError as error:
+        raise DatabaseReadError(
+            "neo4j", f"embedding model counts do not fit the model: {error}"
+        ) from error
 
 
 def _to_property(value: object) -> object:

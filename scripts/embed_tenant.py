@@ -1,4 +1,4 @@
-"""Embed one tenant's new and changed pages with Voyage and store the vectors in Neo4j."""
+"""Embed one tenant's new and changed pages, then its anchors and surrounding sentences, into Neo4j."""
 
 from __future__ import annotations
 
@@ -19,7 +19,12 @@ EXIT_STALE_GRAPH: Final = 2
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, epilog=USAGE)
     ap.add_argument("--tenant", required=True)
-    ap.add_argument("--flush-size", type=int, default=FLUSH_SIZE, help="pages per Neo4j write")
+    ap.add_argument(
+        "--flush-size",
+        type=int,
+        default=FLUSH_SIZE,
+        help="pages, anchors or sentences per Neo4j write",
+    )
     args = ap.parse_args()
     if args.flush_size < 1:
         ap.error("--flush-size must be at least 1")
@@ -29,7 +34,7 @@ def main() -> None:
     except (EmbeddingError, DatabaseError) as error:
         sys.exit(f"embedding run failed: {type(error).__name__}: {error}")
     print(report.model_dump_json(indent=2))
-    stale = report.skipped_missing + report.skipped_hash_mismatch
+    stale = report.pages.skipped_missing + report.pages.skipped_hash_mismatch
     if stale:
         print(
             f"graph and Mongo disagree for {stale} pages: "

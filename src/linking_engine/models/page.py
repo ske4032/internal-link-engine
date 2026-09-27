@@ -106,6 +106,8 @@ class Link(BaseModel):
     position: int = Field(ge=0)
     anchor_text: str
     anchor_type: AnchorType | None = None
+    # normalise_anchor(anchor_text); None when the anchor normalises to "".
+    anchor_key: str | None = None
     # A closed vocabulary of one, for the same reason ActionType has no
     # REPOSITION: the crawler discards nav, header, footer and sidebar links at
     # extraction, so "body" is the only value that can ever reach this model.

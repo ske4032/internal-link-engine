@@ -102,3 +102,114 @@ class EmbedRunReport(BaseModel):
         if self.selected != handled:
             raise ValueError("selected must equal embedded plus every skipped count")
         return self
+
+
+class LinkText(BaseModel):
+    """One LINKS_TO edge's texts and its stored link-embedding markers."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source_url: str = Field(min_length=1)
+    position: int = Field(ge=0)
+    anchor_text: str
+    surrounding_text: str
+    anchor_key: str | None = None
+    anchor_generic: bool | None = None
+    surrounding_embedded_hash: str | None = None
+    surrounding_embedding_model: str | None = None
+
+
+class EdgeRef(BaseModel):
+    """(source_url, position) identifies a LINKS_TO edge."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source_url: str = Field(min_length=1)
+    position: int = Field(ge=0)
+
+
+class AnchorKeyUpdate(BaseModel):
+    """An edge's normalised anchor key; None removes anchorKey (anchor normalises to "")."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source_url: str = Field(min_length=1)
+    position: int = Field(ge=0)
+    anchor_key: str | None
+    anchor_generic: bool
+
+
+class SentenceTarget(BaseModel):
+    """One unique surrounding sentence and every edge its vector goes to."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    sentence_hash: str = Field(min_length=1)
+    edges: tuple[EdgeRef, ...] = Field(min_length=1)
+
+
+class LinkEmbedReport(BaseModel):
+    """Outcome of one link-embedding run; every distinct anchor and sentence is accounted for."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    tenant_id: str = Field(min_length=1)
+    embedding_model: str = Field(min_length=1)
+    dimensions: int = Field(ge=1)
+    edges: int = Field(ge=0)
+    # Edges whose anchorKey or anchorGeneric changed this run.
+    keys_written: int = Field(ge=0)
+    empty_anchors: int = Field(ge=0)
+    # Distinct non-empty anchor keys, generic included.
+    unique_anchors: int = Field(ge=0)
+    # (edges - empty_anchors) / unique_anchors; None when there are no keys.
+    anchor_dedupe_ratio: float | None = Field(ge=0)
+    generic_anchors: int = Field(ge=0)
+    generic_edges: int = Field(ge=0)
+    # Distinct non-generic keys whose Anchor already has a vector from this model.
+    anchors_cached: int = Field(ge=0)
+    anchors_embedded: int = Field(ge=0)
+    empty_sentences: int = Field(ge=0)
+    # Blank-sentence edges whose older surrounding vector was removed this run.
+    surrounding_cleared: int = Field(ge=0)
+    unique_sentences: int = Field(ge=0)
+    # (edges - empty_sentences) / unique_sentences; None when there are no sentences.
+    sentence_dedupe_ratio: float | None = Field(ge=0)
+    # Distinct hashes whose every edge already carries that hash and model.
+    sentences_cached: int = Field(ge=0)
+    # Vectors copied from another edge of this tenant with the same sentence and model.
+    sentences_reused: int = Field(default=0, ge=0)
+    sentences_embedded: int = Field(ge=0)
+    surrounding_edges_written: int = Field(ge=0)
+    anchor_flushes: int = Field(ge=0)
+    sentence_flushes: int = Field(ge=0)
+    api_tokens: int = Field(ge=0)
+    tokens: int = Field(ge=0)
+    truncated: int = Field(ge=0)
+    elapsed_s: float = Field(ge=0)
+    finished_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _distinct_texts_accounted_for(self) -> Self:
+        if (
+            self.unique_anchors
+            != self.generic_anchors + self.anchors_cached + self.anchors_embedded
+        ):
+            raise ValueError("unique_anchors must equal generic plus cached plus embedded anchors")
+        if (
+            self.unique_sentences
+            != self.sentences_cached + self.sentences_reused + self.sentences_embedded
+        ):
+            raise ValueError(
+                "unique_sentences must equal cached plus reused plus embedded sentences"
+            )
+        return self
+
+
+class TenantEmbedReport(BaseModel):
+    """One embed-tenant flow run: pages first, then links."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    pages: EmbedRunReport
+    links: LinkEmbedReport

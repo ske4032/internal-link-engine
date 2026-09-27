@@ -119,6 +119,7 @@ LINK_KWARGS: dict[str, object] = {
     "position": 0,
     "anchor_text": "trail running shoes",
     "anchor_type": AnchorType.PARTIAL,
+    "anchor_key": "trail running shoes",
     # Body links only (ADR-004): "body" is the only value that can reach the model.
     "link_position": "body",
     "weight": 1.0,

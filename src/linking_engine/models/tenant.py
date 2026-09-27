@@ -28,6 +28,15 @@ class AnchorTypeProfile(BaseModel):
     branded: float = Field(default=0.15, ge=0, le=1)
 
 
+class AnchorRules(BaseModel):
+    """A tenant's additions to and exemptions from the generic-anchor dictionary."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    generic_add: frozenset[str] = frozenset()
+    generic_remove: frozenset[str] = frozenset()
+
+
 class TenantConfig(BaseSettings):
     """Everything that varies per tenant.
 

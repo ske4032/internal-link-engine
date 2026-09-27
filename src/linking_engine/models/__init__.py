@@ -23,13 +23,19 @@ from linking_engine.models.corpus import (
     QueryParamEvidence,
 )
 from linking_engine.models.embedding import (
+    AnchorKeyUpdate,
+    EdgeRef,
     EmbeddingBatch,
     EmbeddingModelCount,
     EmbeddingSelection,
     EmbeddingTarget,
     EmbedRunReport,
+    LinkEmbedReport,
+    LinkText,
     PageEmbedding,
     PageText,
+    SentenceTarget,
+    TenantEmbedReport,
 )
 from linking_engine.models.enums import (
     ActionType,
@@ -44,16 +50,19 @@ from linking_engine.models.enums import (
 from linking_engine.models.features import PairFeatures
 from linking_engine.models.page import Keyword, Link, Page, TenantGraphCounts
 from linking_engine.models.recommendation import AnchorCandidate, Recommendation
-from linking_engine.models.tenant import AnchorTypeProfile, TenantConfig
+from linking_engine.models.tenant import AnchorRules, AnchorTypeProfile, TenantConfig
 
 __all__ = [
     "ActionType",
     "AnchorCandidate",
+    "AnchorKeyUpdate",
+    "AnchorRules",
     "AnchorType",
     "AnchorTypeProfile",
     "CleanedPage",
     "ContentGapFinding",
     "CrawlPage",
+    "EdgeRef",
     "EmbedRunReport",
     "EmbeddingBatch",
     "EmbeddingModelCount",
@@ -68,7 +77,9 @@ __all__ = [
     "LifecycleStage",
     "Link",
     "LinkAuditResult",
+    "LinkEmbedReport",
     "LinkRecord",
+    "LinkText",
     "Page",
     "PageEmbedding",
     "PageRecord",
@@ -79,6 +90,8 @@ __all__ = [
     "QueryParamEvidence",
     "Recommendation",
     "RecommendationStatus",
+    "SentenceTarget",
     "TenantConfig",
+    "TenantEmbedReport",
     "TenantGraphCounts",
 ]

@@ -6,12 +6,18 @@ import pytest
 from pydantic import ValidationError
 
 from linking_engine.models import (
+    AnchorKeyUpdate,
+    EdgeRef,
     EmbeddingBatch,
     EmbeddingModelCount,
     EmbeddingTarget,
     EmbedRunReport,
+    LinkEmbedReport,
+    LinkText,
     PageEmbedding,
     PageText,
+    SentenceTarget,
+    TenantEmbedReport,
 )
 
 
@@ -199,3 +205,151 @@ def test_run_report_accepts_a_one_char_name_and_one_dimension() -> None:
 def test_run_report_rejects_negative_counts() -> None:
     with pytest.raises(ValidationError, match="skipped_missing"):
         EmbedRunReport.model_validate(report(selected=7, skipped_missing=-4))
+
+
+# --- link-embedding models ----------------------------------------------------------------
+
+
+def test_sentence_target_needs_a_hash_and_at_least_one_edge() -> None:
+    edge = EdgeRef(source_url="example.com/a", position=0)
+    assert SentenceTarget(sentence_hash="ab", edges=(edge,)).edges == (edge,)
+    with pytest.raises(ValidationError, match="edges"):
+        SentenceTarget(sentence_hash="ab", edges=())
+    with pytest.raises(ValidationError, match="sentence_hash"):
+        SentenceTarget(sentence_hash="", edges=(edge,))
+
+
+@pytest.mark.parametrize("model", [EdgeRef, LinkText])
+def test_an_edge_needs_a_source_and_a_non_negative_position(model: type[EdgeRef]) -> None:
+    extra = {"anchor_text": "a", "surrounding_text": "s"} if model is LinkText else {}
+    with pytest.raises(ValidationError, match="source_url"):
+        model(source_url="", position=0, **extra)
+    with pytest.raises(ValidationError, match="position"):
+        model(source_url="example.com/a", position=-1, **extra)
+
+
+def test_anchor_key_update_requires_an_explicit_key_even_when_none() -> None:
+    update = AnchorKeyUpdate(
+        source_url="example.com/a", position=0, anchor_key=None, anchor_generic=False
+    )
+    assert update.anchor_key is None
+    with pytest.raises(ValidationError, match="anchor_key"):
+        AnchorKeyUpdate(source_url="example.com/a", position=0, anchor_generic=False)  # type: ignore[call-arg]
+
+
+# --- LinkEmbedReport ----------------------------------------------------------------------
+
+
+# Distinct values, so a sum that drops or double-counts one field cannot match.
+ANCHOR_COUNTS = {"generic_anchors": 2, "anchors_cached": 3, "anchors_embedded": 4}
+SENTENCE_COUNTS = {"sentences_cached": 5, "sentences_embedded": 6}
+
+
+def link_report(**overrides: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "tenant_id": "t",
+        "embedding_model": "voyage-4-large",
+        "dimensions": 2048,
+        "edges": 30,
+        "keys_written": 30,
+        "empty_anchors": 3,
+        "unique_anchors": 9,
+        "anchor_dedupe_ratio": 3.0,
+        **ANCHOR_COUNTS,
+        "generic_edges": 7,
+        "empty_sentences": 8,
+        "surrounding_cleared": 1,
+        "unique_sentences": 11,
+        "sentence_dedupe_ratio": 2.0,
+        **SENTENCE_COUNTS,
+        "surrounding_edges_written": 12,
+        "anchor_flushes": 1,
+        "sentence_flushes": 2,
+        "api_tokens": 100,
+        "tokens": 90,
+        "truncated": 0,
+        "elapsed_s": 0.5,
+        "finished_at": datetime(2026, 9, 27, tzinfo=UTC),
+    }
+    values.update(overrides)
+    return values
+
+
+def test_link_report_accepts_accounted_anchors_and_sentences() -> None:
+    result = LinkEmbedReport.model_validate(link_report())
+    assert result.unique_anchors == 2 + 3 + 4
+    assert result.unique_sentences == 5 + 6
+
+
+@pytest.mark.parametrize("name", ANCHOR_COUNTS)
+def test_every_anchor_count_is_part_of_unique_anchors(name: str) -> None:
+    bumped = {name: ANCHOR_COUNTS[name] + 1}
+    with pytest.raises(ValidationError, match="unique_anchors must equal"):
+        LinkEmbedReport.model_validate(link_report(**bumped))
+    result = LinkEmbedReport.model_validate(link_report(**bumped, unique_anchors=10))
+    assert result.unique_anchors == 10
+
+
+@pytest.mark.parametrize("name", SENTENCE_COUNTS)
+def test_every_sentence_count_is_part_of_unique_sentences(name: str) -> None:
+    bumped = {name: SENTENCE_COUNTS[name] + 1}
+    with pytest.raises(ValidationError, match="unique_sentences must equal"):
+        LinkEmbedReport.model_validate(link_report(**bumped))
+    result = LinkEmbedReport.model_validate(link_report(**bumped, unique_sentences=12))
+    assert result.unique_sentences == 12
+
+
+def test_surrounding_cleared_is_required() -> None:
+    values = link_report()
+    del values["surrounding_cleared"]
+    with pytest.raises(ValidationError, match="surrounding_cleared"):
+        LinkEmbedReport.model_validate(values)
+
+
+def test_link_report_allows_no_ratio_when_nothing_was_counted() -> None:
+    empty = link_report(
+        edges=0,
+        keys_written=0,
+        empty_anchors=0,
+        unique_anchors=0,
+        anchor_dedupe_ratio=None,
+        generic_anchors=0,
+        generic_edges=0,
+        anchors_cached=0,
+        anchors_embedded=0,
+        empty_sentences=0,
+        surrounding_cleared=0,
+        unique_sentences=0,
+        sentence_dedupe_ratio=None,
+        sentences_cached=0,
+        sentences_embedded=0,
+        surrounding_edges_written=0,
+    )
+    result = LinkEmbedReport.model_validate(empty)
+    assert (result.anchor_dedupe_ratio, result.sentence_dedupe_ratio) == (None, None)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("tenant_id", ""),
+        ("embedding_model", ""),
+        ("dimensions", 0),
+        ("edges", -1),
+        ("surrounding_cleared", -1),
+        ("anchor_dedupe_ratio", -0.5),
+        ("finished_at", datetime(2026, 9, 27)),
+    ],
+)
+def test_link_report_rejects_bad_fields(field: str, value: object) -> None:
+    with pytest.raises(ValidationError, match=field):
+        LinkEmbedReport.model_validate(link_report(**{field: value}))
+
+
+def test_tenant_report_carries_both_stages() -> None:
+    pages = EmbedRunReport.model_validate(report())
+    links = LinkEmbedReport.model_validate(link_report())
+    result = TenantEmbedReport(pages=pages, links=links)
+    assert (result.pages, result.links) == (pages, links)
+    rebuilt = TenantEmbedReport.model_validate(result.model_dump(mode="json"))
+    assert rebuilt == result
