@@ -34,6 +34,7 @@ from linking_engine.models import (
     EmbeddingSelection,
     EmbeddingTarget,
     IssueFlag,
+    KeywordSource,
     Link,
     LinkGraphSnapshot,
     LinkText,
@@ -344,6 +345,11 @@ WHERE p.isOrphan IS NOT NULL OR p.linkCommunityId IS NOT NULL
 REMOVE p.linkCommunityId, p.keywordCommunityId, p.contentCommunityId, p.isLinkPillar,
        p.isKeywordPillar, p.isContentPillar, p.isOrphan, p.isDeadEnd, p.orphanLabel
 RETURN count(p) AS n
+"""
+_KEYWORD_EDGES: Final = """
+MATCH (p:Page {tenantId: $tenant})-[e:TARGETS_KEYWORD]->(k:Keyword {tenantId: $tenant})
+WHERE NOT coalesce(p.isPlaceholder, false)
+RETURN p.url AS url, k.text AS text, e.source AS source
 """
 _KEYWORD_TARGETS: Final = """
 MATCH (p:Page {tenantId: $tenant})-[:TARGETS_KEYWORD]->(k:Keyword {tenantId: $tenant})
@@ -1109,6 +1115,25 @@ class GraphRepo:
         _require_tenant(tenant_id)
         rows = await self._read(_KEYWORD_TARGETS, tenant=tenant_id)
         return [(str(r["url"]), str(r["text"]), str(r["language"])) for r in rows]
+
+    async def keyword_edges(self, tenant_id: str) -> list[tuple[str, str, KeywordSource]]:
+        """(page url, keyword text, edge source) for every crawled page's target keyword."""
+        _require_tenant(tenant_id)
+        rows = await self._read(_KEYWORD_EDGES, tenant=tenant_id)
+        edges: list[tuple[str, str, KeywordSource]] = []
+        for r in rows:
+            url, text, source = r["url"], r["text"], r["source"]
+            if not isinstance(url, str) or not isinstance(text, str):
+                raise DatabaseReadError(
+                    "neo4j", f"keyword edge of {tenant_id!r} without a url or text"
+                )
+            try:
+                edges.append((url, text, KeywordSource(str(source))))
+            except ValueError as error:
+                raise DatabaseReadError(
+                    "neo4j", f"keyword edges of {tenant_id!r}: {error}"
+                ) from error
+        return edges
 
     async def content_vectors(
         self, tenant_id: str, *, batch_size: int = PAGE_BATCH

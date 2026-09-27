@@ -50,6 +50,7 @@ from linking_engine.models.embedding import (
 from linking_engine.models.enums import (
     ActionType,
     AnchorType,
+    ClusterAgreement,
     ContentGapFinding,
     IssueFlag,
     KeywordSource,
@@ -76,6 +77,7 @@ from linking_engine.models.page import (
     TenantGraphCounts,
 )
 from linking_engine.models.recommendation import AnchorCandidate, Recommendation
+from linking_engine.models.signals import GscQuery, PageSignals, PairSignals, SignalReport
 from linking_engine.models.tenant import AnchorRules, AnchorTypeProfile, TenantConfig
 
 __all__ = [
@@ -90,6 +92,7 @@ __all__ = [
     "CandidateTarget",
     "CentralityReport",
     "CleanedPage",
+    "ClusterAgreement",
     "CommunityContext",
     "CommunityReport",
     "ContentGapFinding",
@@ -102,6 +105,7 @@ __all__ = [
     "EmbeddingTarget",
     "ExtractedLink",
     "GraphLoadReport",
+    "GscQuery",
     "Heading",
     "HubCentroid",
     "HubReport",
@@ -122,16 +126,19 @@ __all__ = [
     "PageEmbedding",
     "PageHub",
     "PageRecord",
+    "PageSignals",
     "PageSummary",
     "PageText",
     "PageType",
     "PairFeatures",
+    "PairSignals",
     "PassReport",
     "PrepareReport",
     "QueryParamEvidence",
     "Recommendation",
     "RecommendationStatus",
     "SentenceTarget",
+    "SignalReport",
     "TargetCandidates",
     "TargetSelection",
     "TemplateInlinks",
