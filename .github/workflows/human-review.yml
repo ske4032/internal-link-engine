@@ -1,0 +1,44 @@
+name: Human review
+
+# pull_request_target runs this workflow and its script from the base branch, so a pull
+# request cannot change the gate that judges it. Nothing from the pull request is checked
+# out or executed; it is only read through the API.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited, labeled, unlabeled]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  # Queued, not cancelled: a cancelled push run would leave the old approval in place.
+  group: human-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Human review gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/ci
+
+      - name: Check provenance and human review
+        run: python3 scripts/ci/human_review.py
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REVIEWERS: ${{ vars.HUMAN_REVIEWERS || github.repository_owner }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ai-provenance
+          path: ai-provenance.json
+          retention-days: 90
