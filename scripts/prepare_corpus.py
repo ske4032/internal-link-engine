@@ -6,7 +6,9 @@ Dry run by default: reports what cleaning produces and writes nothing.
     uv run --env-file .env python scripts/prepare_corpus.py --tenant <tenant> --write
 
 The source is read through CrawlSource, which has no write methods. With
---write, pages and links are upserted into MONGO_DB under --tenant.
+--write, pages and links are upserted into MONGO_DB under --tenant, each page
+with its menu and footer inlinks: distinct other crawled pages linking to it
+from template lines.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from linking_engine.ingest.markdown_clean import (
     line_shares,
 )
 from linking_engine.ingest.mongo_repo import CrawlSource, MongoRepo
+from linking_engine.ingest.template_links import count_template_inlinks
 from linking_engine.ingest.url_params import query_param_evidence
 from linking_engine.models import CleanedPage, CrawlPage, Heading, LinkRecord, PageRecord
 from linking_engine.urls import UrlRules, normalise_url, url_rules
@@ -211,9 +214,6 @@ async def prepare(args: argparse.Namespace) -> None:
     print("---- after (first 500 chars) ----")
     print(sample.body_text[:500])
 
-    if not args.write:
-        print("\ndry run: nothing written")
-        return
     chosen: dict[str, tuple[CrawlPage, CleanedPage]] = {}
     merged: list[str] = []
     for doc in docs:
@@ -231,9 +231,26 @@ async def prepare(args: argparse.Namespace) -> None:
             f"\n{len(merged)} crawled urls share a normalised key with a kept page, e.g. {merged[:5]}"
         )
 
+    inlinks = {
+        item.url: item
+        for item in count_template_inlinks((key, page) for key, (_, page) in chosen.items())
+        if item.url in chosen
+    }
+    menu = sum(1 for item in inlinks.values() if item.menu_inlinks)
+    footer = sum(1 for item in inlinks.values() if item.footer_inlinks)
+    both = sum(1 for item in inlinks.values() if item.menu_inlinks and item.footer_inlinks)
+    print(
+        f"\npages linked from template lines of other pages: {menu} from menus, "
+        f"{footer} from footers, {both} from both, of {len(chosen)}"
+    )
+
+    if not args.write:
+        print("\ndry run: nothing written")
+        return
     records: list[PageRecord] = []
     link_records: list[LinkRecord] = []
     for key, (doc, page) in chosen.items():
+        found = inlinks.get(key)
         records.append(
             PageRecord(
                 url=key,
@@ -251,6 +268,8 @@ async def prepare(args: argparse.Namespace) -> None:
                 body_hash=body_hash(page.body_text),
                 scraped_at=doc.scraped_at,
                 source=f"{args.source_db}.{args.source_collection}",
+                menu_inlinks=found.menu_inlinks if found else 0,
+                footer_inlinks=found.footer_inlinks if found else 0,
             )
         )
         link_records.extend(

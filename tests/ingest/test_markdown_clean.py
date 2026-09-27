@@ -328,6 +328,115 @@ def test_a_leading_dot_word_is_not_a_continuation() -> None:
     )
 
 
+# ── template links ───────────────────────────────────────────────────────────
+
+ROOT = "[Home](https://www.example.com/)"
+SIDEBAR = ("*   [Alerts](/docs/alerts/)", "*   [Reports](/docs/reports/)")
+BANNER = "**Try it free for 30 days on every endpoint.** [Sign up](/signup/)"
+RELATED = "[Recent posts](/blog/) [Older posts](/blog/?page=2) [Partner](https://other.test/)"
+UNRECORDED = (
+    "[![badge](/b.png)](/awards/) [Contact](mailto:team@example.com) "
+    "[Top](#top) [](/empty/) ![logo](/logo.png)"
+)
+TEMPLATE = frozenset({ROOT, *SIDEBAR, BANNER, RELATED, UNRECORDED})
+TEMPLATED_PAGE = "\n".join(
+    [
+        ROOT,
+        " 5 [Blog](/blog/)",
+        "\u203a [Guides](/blog/guides/) \u203a Patch guide",
+        *SIDEBAR,
+        "",
+        "# Patch guide",
+        "",
+        "Read our [setup notes](/docs/setup/) first.",
+        SIDEBAR[0],
+        "More text with [an external link](https://other.test/x).",
+        "",
+        "Setup",
+        "-----",
+        "",
+        "Final words on [reports](/docs/reports/).",
+        "",
+        BANNER,
+        RELATED,
+        UNRECORDED,
+        "",
+    ]
+)
+
+
+def test_recording_template_links_leaves_body_and_body_hash_as_before() -> None:
+    # Expected values are the cleaner's output on this page before template links were recorded.
+    page = clean(TEMPLATED_PAGE, boilerplate=TEMPLATE)
+    assert page.body_text == (
+        "Patch guide\n\nRead our setup notes first.\nMore text with an external link."
+        "\n\nSetup\n\nFinal words on reports."
+    )
+    assert body_hash(page.body_text) == (
+        "61716174c0d867f9856079fdfe89b975e0a71189df74ebe02912b319a9e91e59"
+    )
+    assert (page.h1, page.headings) == ("Patch guide", ((1, "Patch guide"), (2, "Setup")))
+    assert [
+        (str(link.target_url), link.anchor_text, link.surrounding_text, link.is_internal)
+        for link in page.links
+    ] == [
+        ("https://www.example.com/docs/setup/", "setup notes", "Read our setup notes first.", True),
+        ("https://other.test/x", "an external link", "More text with an external link.", False),
+        ("https://www.example.com/docs/reports/", "reports", "Final words on reports.", True),
+    ]
+    assert page.removed == (
+        ("boilerplate_line", 7),
+        ("breadcrumb_line", 2),
+        ("heading_marker", 1),
+        ("link_markup", 3),
+        ("rule_or_underline", 1),
+    )
+
+
+def test_template_links_are_menu_above_or_within_the_body_and_footer_after_it() -> None:
+    page = clean(TEMPLATED_PAGE, boilerplate=TEMPLATE)
+    assert [(link.zone, str(link.target_url)) for link in page.template_links] == [
+        ("menu", "https://www.example.com/"),
+        ("menu", "https://www.example.com/blog/"),
+        ("menu", "https://www.example.com/blog/guides/"),
+        ("menu", "https://www.example.com/docs/alerts/"),
+        ("menu", "https://www.example.com/docs/reports/"),
+        ("menu", "https://www.example.com/docs/alerts/"),
+        ("footer", "https://www.example.com/signup/"),
+        ("footer", "https://www.example.com/blog/"),
+        ("footer", "https://www.example.com/blog/?page=2"),
+    ]
+
+
+def test_external_same_page_non_web_empty_and_image_links_are_not_template_links() -> None:
+    page = clean(f"Body.\n{UNRECORDED}\n{RELATED}", boilerplate=frozenset({UNRECORDED, RELATED}))
+    assert [str(link.target_url) for link in page.template_links] == [
+        "https://www.example.com/blog/",
+        "https://www.example.com/blog/?page=2",
+    ]
+
+
+def test_an_invalid_template_link_is_skipped_without_counting_as_removed() -> None:
+    too_long = "[Search](/search?q=" + "a" * 2100 + ")"  # over HttpUrl's 2083 characters
+    page = clean(f"Body.\n{too_long}", boilerplate=frozenset({too_long}))
+    assert page.template_links == ()
+    assert removed(page) == {"boilerplate_line": 1}
+
+
+def test_a_breadcrumb_after_the_last_body_line_is_footer() -> None:
+    page = clean("Body text.\n\n---\n\n\u203a [Back to the blog](/blog/)")
+    assert [(link.zone, str(link.target_url)) for link in page.template_links] == [
+        ("footer", "https://www.example.com/blog/")
+    ]
+
+
+def test_without_body_text_every_template_link_is_menu() -> None:
+    page = clean(f"{ROOT}\n\n{BANNER}", boilerplate=frozenset({ROOT, BANNER}))
+    assert page.body_text == ""
+    assert {link.zone for link in page.template_links} == {"menu"}
+    assert len(page.template_links) == 2
+
+
 # ── body hash ────────────────────────────────────────────────────────────────
 
 # Expected digests come from `shasum -a 256` over the UTF-8 bytes, not from hashlib.

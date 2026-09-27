@@ -74,6 +74,8 @@ _CRAWL_PROPERTIES: Final = {
     "freshness": "freshness",
     "published_at": "publishedAt",
     "lifecycle_stage": "lifecycleStage",
+    "menu_inlinks": "menuInlinks",
+    "footer_inlinks": "footerInlinks",
 }
 PAGE_PROPERTIES: Final = {
     "url": "url",

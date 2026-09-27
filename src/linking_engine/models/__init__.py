@@ -21,6 +21,8 @@ from linking_engine.models.corpus import (
     PageRecord,
     PageSummary,
     QueryParamEvidence,
+    TemplateInlinks,
+    TemplateLink,
 )
 from linking_engine.models.embedding import (
     AnchorKeyUpdate,
@@ -101,6 +103,8 @@ __all__ = [
     "Recommendation",
     "RecommendationStatus",
     "SentenceTarget",
+    "TemplateInlinks",
+    "TemplateLink",
     "TenantConfig",
     "TenantGraphCounts",
 ]

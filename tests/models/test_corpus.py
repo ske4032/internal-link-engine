@@ -77,3 +77,14 @@ def test_malformed_body_hash_is_rejected(
 def test_null_body_hash_is_rejected(model: type[BaseModel], data: dict[str, object]) -> None:
     with pytest.raises(ValidationError, match="body_hash"):
         model.model_validate({**data, "body_hash": None})
+
+
+@pytest.mark.parametrize(("model", "data"), MODELS)
+def test_template_inlinks_default_to_zero_and_are_never_negative(
+    model: type[BaseModel], data: dict[str, object]
+) -> None:
+    dumped = model.model_validate(data).model_dump()
+    assert (dumped["menu_inlinks"], dumped["footer_inlinks"]) == (0, 0)
+    for field in ("menu_inlinks", "footer_inlinks"):
+        with pytest.raises(ValidationError, match=field):
+            model.model_validate({**data, field: -1})
