@@ -18,14 +18,19 @@ from linking_engine.errors import (
     EmbeddingUnavailableError,
 )
 from linking_engine.graph.repo import GraphRepo
-from linking_engine.ingest.mongo_repo import MongoRepo
+from linking_engine.ingest.graph_load import load_tenant_graph
+from linking_engine.ingest.mongo_repo import CrawlSource, MongoRepo
+from linking_engine.ingest.prepare import BOILERPLATE_SHARE, NAV_SHARE, prepare_tenant
 from linking_engine.ml.tracking import log_analytics
 from linking_engine.models import (
     CentralityReport,
     CommunityReport,
     EmbedRunReport,
+    GraphLoadReport,
     LinkEmbedReport,
+    PrepareReport,
     TenantConfig,
+    TenantGraphCounts,
 )
 from linking_engine.pipeline.analytics import compute_centrality, compute_communities, summarise
 from linking_engine.pipeline.embed import FLUSH_SIZE, embed_tenant
@@ -39,6 +44,10 @@ async def neo4j() -> GraphRepo:
     return await GraphRepo.connect(
         os.environ["NEO4J_URI"], os.environ["NEO4J_USER"], os.environ["NEO4J_PASSWORD"]
     )
+
+
+async def mongo() -> MongoRepo:
+    return await MongoRepo.connect(os.environ["MONGO_URI"], os.environ["MONGO_DB"])
 
 
 def voyage_client(tenant_id: str) -> VoyageClient:
@@ -200,3 +209,109 @@ async def graph_analytics_flow(tenant_id: str) -> tuple[CentralityReport, Commun
         mlflow_run,
     )
     return centrality, communities, mlflow_run
+
+
+# Upserts keyed by url and position, so a retry converges on the same records.
+@task(
+    name="prepare-corpus",
+    retries=1,
+    retry_delay_seconds=30,
+    retry_condition_fn=is_transient,
+    cache_policy=NONE,
+)
+async def prepare_task(
+    tenant_id: str,
+    source_db: str,
+    source_collection: str,
+    boilerplate_share: float,
+    nav_share: float,
+) -> PrepareReport:
+    if source_db == os.environ["MONGO_DB"]:
+        raise ValueError("source and target database must differ: the source is read-only")
+    async with (
+        await CrawlSource.connect(os.environ["MONGO_URI"], source_db, source_collection) as source,
+        await mongo() as repo,
+    ):
+        _, report = await prepare_tenant(
+            source,
+            repo,
+            tenant_id,
+            source_name=f"{source_db}.{source_collection}",
+            boilerplate_share=boilerplate_share,
+            nav_share=nav_share,
+        )
+        return report
+
+
+# The load converges on re-run, including pages that lost links.
+@task(
+    name="load-graph",
+    retries=1,
+    retry_delay_seconds=30,
+    retry_condition_fn=is_transient,
+    cache_policy=NONE,
+)
+async def load_graph_task(tenant_id: str) -> tuple[GraphLoadReport, TenantGraphCounts]:
+    logger = get_run_logger()
+    async with await neo4j() as graph, await mongo() as repo:
+        await graph.check_server()
+        applied = await graph.migrate()
+        logger.info("neo4j migrations applied: %s", list(applied) or "none pending")
+        await repo.ensure_indexes()
+        report = await load_tenant_graph(repo, graph, tenant_id)
+        return report, await graph.counts(tenant_id)
+
+
+# Separate flows, like embedding: a failure shows as either the prepare or the load flow.
+@flow(name="prepare-corpus")
+async def prepare_corpus_flow(
+    tenant_id: str,
+    source_db: str,
+    source_collection: str,
+    boilerplate_share: float = BOILERPLATE_SHARE,
+    nav_share: float = NAV_SHARE,
+) -> PrepareReport:
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
+        logger.info("preparing the crawl of tenant %s", tenant_id)
+        report = await prepare_task(
+            tenant_id, source_db, source_collection, boilerplate_share, nav_share
+        )
+    logger.info(
+        "%d documents, %d pages (%d merged urls), %d links; skipped %s; %d template lines; "
+        "%d pages with menu inlinks, %d with footer inlinks; written %d pages, %d links, "
+        "%d stale links deleted",
+        report.documents,
+        report.pages,
+        report.merged_urls,
+        report.links,
+        report.skipped or "none",
+        report.template_lines,
+        report.menu_inlink_pages,
+        report.footer_inlink_pages,
+        report.pages_written,
+        report.links_written,
+        report.stale_links_deleted,
+    )
+    return report
+
+
+@flow(name="load-graph")
+async def load_graph_flow(tenant_id: str) -> tuple[GraphLoadReport, TenantGraphCounts]:
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
+        logger.info("loading the graph of tenant %s", tenant_id)
+        report, counts = await load_graph_task(tenant_id)
+    logger.info(
+        "%d pages, %d placeholders, %d links; skipped %d external and %d self links; "
+        "%d stale links deleted; %d broken pages, %d FIX links",
+        report.pages,
+        report.placeholders,
+        report.links,
+        report.external_links_skipped,
+        report.self_links_skipped,
+        report.stale_links_deleted,
+        counts.broken_pages,
+        counts.fix_links,
+    )
+    return report, counts

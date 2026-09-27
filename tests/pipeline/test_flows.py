@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import pytest
 from mlflow import MlflowClient
 from prefect.states import Failed
+from pymongo import AsyncMongoClient
 from test_embed import DIM, record, seed, seed_plain, url
 from test_embed_links import text_vector
 from voyage_fakes import FakeVoyage, client, page_index
@@ -261,3 +262,61 @@ async def test_graph_analytics_flow_writes_to_neo4j_and_logs_one_mlflow_run(
     run = MlflowClient(uri).get_run(run_id)
     assert run.data.tags["tenant_id"] == tenant
     assert run.data.metrics["link_pages"] == 3
+
+
+NAV_LINE = "- [Pricing](https://example.com/pricing)"
+
+
+async def seed_crawl(mongo_uri: str, database: str) -> None:
+    client: AsyncMongoClient[dict[str, object]] = AsyncMongoClient(mongo_uri)
+    await client[database]["crawl_pages"].insert_many(
+        [
+            {
+                "url": f"https://example.com/{name}",
+                "title": name,
+                "content": f"{NAV_LINE}\n\n{name.title()} page. Read [the next one]"
+                f"(https://example.com/{nxt}) as well.",
+                "statusCode": 200,
+                "usable": True,
+            }
+            for name, nxt in zip(
+                ("pricing", "a", "b", "c", "d", "e"), ("a", "b", "c", "d", "e", "a"), strict=True
+            )
+        ]
+    )
+    await client.close()
+
+
+@pytest.mark.integration
+async def test_prepare_and_load_flows_ingest_a_crawl_into_mongo_and_neo4j(
+    graph: GraphRepo, mongo_uri: str, tenant: str, flow_env: None
+) -> None:
+    source_db = f"crawl_{tenant.replace('-', '_')}"
+    await seed_crawl(mongo_uri, source_db)
+
+    prepared = await flows.prepare_corpus_flow(tenant, source_db, "crawl_pages")
+    loaded, counts = await flows.load_graph_flow(tenant)
+
+    assert (prepared.documents, prepared.pages, prepared.links, prepared.pages_written) == (
+        6,
+        6,
+        6,
+        6,
+    )
+    assert prepared.menu_inlink_pages == 1
+    assert (loaded.pages, loaded.links, counts.pages) == (6, 6, 6)
+    [pricing] = await graph.get_pages(tenant, ["example.com/pricing"])
+    assert pricing.menu_inlinks == 5
+
+
+@pytest.mark.integration
+async def test_the_prepare_flow_refuses_the_project_database_as_its_source(
+    tenant: str, flow_env: None
+) -> None:
+    state = await flows.prepare_corpus_flow(
+        tenant, "linking_engine_test", "crawl_pages", return_state=True
+    )
+
+    assert state.is_failed()
+    with pytest.raises(ValueError, match="source and target database must differ"):
+        await state.result()
