@@ -132,6 +132,34 @@ async def test_body_hash_round_trips_through_every_read(
 
 
 @pytest.mark.integration
+async def test_template_inlinks_round_trip_and_read_as_zero_when_absent(
+    mongo: MongoRepo, tenant: str, mongo_uri: str
+) -> None:
+    linked = record("/a", menu_inlinks=3, footer_inlinks=1)
+    await mongo.write_pages(tenant, [linked, record("/b")], [])
+    assert await mongo.get_pages(tenant, [url("/a")]) == [linked]
+    summaries = [s async for batch in mongo.iter_page_summaries(tenant) for s in batch]
+    assert {str(s.url): (s.menu_inlinks, s.footer_inlinks) for s in summaries} == {
+        url("/a"): (3, 1),
+        url("/b"): (0, 0),
+    }
+
+    client: AsyncMongoClient[dict[str, object]] = AsyncMongoClient(mongo_uri)
+    pages = client["linking_engine_test"]["pages"]
+    stored = await pages.find_one({"tenantId": tenant, "url": url("/a")})
+    assert stored is not None
+    assert (stored["menuInlinks"], stored["footerInlinks"]) == (3, 1)
+    # A page prepared before the counts existed has neither key.
+    await pages.update_one(
+        {"tenantId": tenant, "url": url("/a")},
+        {"$unset": {"menuInlinks": "", "footerInlinks": ""}},
+    )
+    await client.close()
+    [before] = await mongo.get_pages(tenant, [url("/a")])
+    assert (before.menu_inlinks, before.footer_inlinks) == (0, 0)
+
+
+@pytest.mark.integration
 async def test_document_without_body_hash_fails_on_read(
     mongo: MongoRepo, tenant: str, mongo_uri: str
 ) -> None:

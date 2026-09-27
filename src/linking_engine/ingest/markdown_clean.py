@@ -12,7 +12,9 @@ Links are extracted before their markup goes. Each link's anchor words stay in
 the body text, and its target, anchor and surrounding sentence are returned
 alongside: that is the only record of them the audit and anchor stages get.
 Boilerplate lines are dropped before extraction, so breadcrumb and banner links
-never become body links (ADR-004).
+never become body links (ADR-004). Their internal links are kept apart as
+template links, zoned menu or footer, so a page linked only from template is
+not mistaken for one nobody links to.
 
 Everything here is a pure function over strings. Reading a source collection
 and writing the result belongs to the caller.
@@ -29,7 +31,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from pydantic import HttpUrl, ValidationError
 
-from linking_engine.models.corpus import CleanedPage, ExtractedLink
+from linking_engine.models.corpus import CleanedPage, ExtractedLink, TemplateLink
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -180,6 +182,9 @@ def clean_page(
     host = _host(page_url)
     removed: Counter[str] = Counter()
     links: list[ExtractedLink] = []
+    # (line index, target) of internal links on dropped template and breadcrumb lines.
+    template_targets: list[tuple[int, str]] = []
+    last_body_line: int | None = None
     out: list[str] = []
     headings: list[tuple[int, str]] = []
     h1: str | None = None
@@ -191,7 +196,7 @@ def clean_page(
     text = _WRAPPED_LINK_TEXT.sub(lambda m: m.group(0).replace("\n", " "), text)
     template = frozenset(template_key(line) for line in boilerplate)
     in_breadcrumb = False
-    for raw in text.split("\n"):
+    for index, raw in enumerate(text.split("\n")):
         stripped = raw.strip()
         underlined, last_line = last_line, None
         if not stripped:
@@ -200,6 +205,7 @@ def clean_page(
             continue
         if template_key(stripped) in template:
             removed["boilerplate_line"] += 1
+            template_targets.extend(_template_targets(stripped, index, page_url, host))
             in_breadcrumb = True
             continue
         if (
@@ -208,6 +214,7 @@ def clean_page(
             or (_BREADCRUMB_SEPARATOR.search(stripped) and _LINK.search(stripped))
         ):
             removed["breadcrumb_line"] += 1
+            template_targets.extend(_template_targets(stripped, index, page_url, host))
             in_breadcrumb = True
             continue
         in_breadcrumb = False
@@ -273,6 +280,18 @@ def clean_page(
             except ValidationError:
                 removed["invalid_link"] += 1
         out.append(cleaned)
+        last_body_line = index
+
+    template_links: list[TemplateLink] = []
+    for index, target in template_targets:
+        after_body = last_body_line is not None and index > last_body_line
+        try:
+            template_links.append(
+                TemplateLink(target_url=HttpUrl(target), zone="footer" if after_body else "menu")
+            )
+        except ValidationError:
+            # Not a valid page url, so it can never be a crawled page's inlink.
+            continue
 
     return CleanedPage(
         url=HttpUrl(page_url),
@@ -281,6 +300,7 @@ def clean_page(
         headings=tuple(headings),
         body_text=_join(out),
         links=tuple(links),
+        template_links=tuple(template_links),
         removed=tuple(sorted(removed.items())),
     )
 
@@ -307,6 +327,13 @@ def _strip_block_markers(line: str, removed: Counter[str]) -> str:
         if new == line:
             return line
         line = new
+
+
+def _template_targets(line: str, index: int, page_url: str, host: str) -> list[tuple[int, str]]:
+    """Internal link targets on a dropped line, found exactly as body links are."""
+    # A throwaway counter: dropped lines must not change what the body reports removed.
+    _, found = _clean_inline(line, page_url, host, Counter())
+    return [(index, target) for _, target, internal in found if internal]
 
 
 def _clean_inline(

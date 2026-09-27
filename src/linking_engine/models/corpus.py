@@ -7,6 +7,7 @@ keeps the anchor words in place.
 """
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, HttpUrl
 
@@ -22,6 +23,16 @@ class ExtractedLink(BaseModel):
     anchor_text: str = Field(min_length=1)
     surrounding_text: str
     is_internal: bool
+
+
+class TemplateLink(BaseModel):
+    """An internal link on a dropped template or breadcrumb line; never a body link (ADR-004)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    target_url: HttpUrl
+    # footer: after the last line of body text; menu: above or within it.
+    zone: Literal["menu", "footer"]
 
 
 class CleanedPage(BaseModel):
@@ -40,7 +51,18 @@ class CleanedPage(BaseModel):
     headings: tuple[tuple[int, str], ...] = ()
     body_text: str
     links: tuple[ExtractedLink, ...] = ()
+    template_links: tuple[TemplateLink, ...] = ()
     removed: tuple[tuple[str, int], ...] = ()
+
+
+class TemplateInlinks(BaseModel):
+    """Distinct pages linking to ``url`` from menu and from footer template lines."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    url: UrlKey
+    menu_inlinks: int = Field(ge=0)
+    footer_inlinks: int = Field(ge=0)
 
 
 # MongoDB documents; stored keys are the camelCase form of these field names.
@@ -77,6 +99,9 @@ class PageRecord(BaseModel):
     body_hash: str = Field(pattern=_SHA256_HEX)
     scraped_at: AwareDatetime | None
     source: str = Field(min_length=1)
+    # Distinct crawled pages linking here from template lines, by zone; never edges.
+    menu_inlinks: int = Field(default=0, ge=0)
+    footer_inlinks: int = Field(default=0, ge=0)
 
 
 class CrawlPage(BaseModel):
@@ -104,6 +129,8 @@ class PageSummary(BaseModel):
     word_count: int = Field(ge=0)
     content_hash: str | None
     body_hash: str = Field(pattern=_SHA256_HEX)
+    menu_inlinks: int = Field(default=0, ge=0)
+    footer_inlinks: int = Field(default=0, ge=0)
 
 
 class LinkRecord(BaseModel):

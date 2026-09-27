@@ -23,7 +23,9 @@ if TYPE_CHECKING:
 BASE = "example.com"
 
 
-def page(path: str, links: int, body: str = "text") -> PageRecord:
+def page(
+    path: str, links: int, body: str = "text", *, menu: int = 0, footer: int = 0
+) -> PageRecord:
     return PageRecord(
         url=f"{BASE}{path}",
         crawl_url=f"{BASE}{path}",
@@ -40,6 +42,8 @@ def page(path: str, links: int, body: str = "text") -> PageRecord:
         body_hash=body_hash(body),
         scraped_at=None,
         source="test",
+        menu_inlinks=menu,
+        footer_inlinks=footer,
     )
 
 
@@ -147,3 +151,36 @@ async def test_a_body_edit_makes_exactly_that_page_a_target_again(
         placeholders=0,
         non_2xx=0,
     )
+
+
+async def graph_inlinks(graph: GraphRepo, tenant: str) -> dict[str, tuple[int | None, int | None]]:
+    urls = [f"{BASE}{path}" for path in ("/a", "/b", "/uncrawled")]
+    return {
+        str(p.url): (p.menu_inlinks, p.footer_inlinks) for p in await graph.get_pages(tenant, urls)
+    }
+
+
+@pytest.mark.integration
+async def test_load_writes_template_inlinks_and_a_reload_converges(
+    mongo: MongoRepo, graph: GraphRepo, tenant: str
+) -> None:
+    await mongo.write_pages(
+        tenant, [page("/a", 1, menu=2, footer=1), page("/b", 0)], [link("/a", 0, "/uncrawled")]
+    )
+    await load_tenant_graph(mongo, graph, tenant)
+    assert await graph_inlinks(graph, tenant) == {
+        f"{BASE}/a": (2, 1),
+        f"{BASE}/b": (0, 0),
+        f"{BASE}/uncrawled": (None, None),
+    }
+    assert await graph.counts(tenant) == TenantGraphCounts(pages=2, placeholders=1, links=1)
+
+    await mongo.write_pages(tenant, [page("/a", 1, footer=4)], [link("/a", 0, "/uncrawled")])
+    await load_tenant_graph(mongo, graph, tenant)
+    await load_tenant_graph(mongo, graph, tenant)
+    assert await graph_inlinks(graph, tenant) == {
+        f"{BASE}/a": (0, 4),
+        f"{BASE}/b": (0, 0),
+        f"{BASE}/uncrawled": (None, None),
+    }
+    assert await graph.counts(tenant) == TenantGraphCounts(pages=2, placeholders=1, links=1)

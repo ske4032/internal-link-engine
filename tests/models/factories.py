@@ -90,6 +90,8 @@ PAGE_KWARGS: dict[str, object] = {
     "freshness": 1,
     "published_at": "2024-06-01",
     "lifecycle_stage": LifecycleStage.ESTABLISHED,
+    "menu_inlinks": 4,
+    "footer_inlinks": 2,
     "page_rank": 0.0042,
     "page_rank_percentile": 0.9,
     "betweenness": 0.13,

@@ -46,6 +46,9 @@ class Page(BaseModel):
     freshness: float | None = Field(default=None, ge=0, le=1)
     published_at: datetime | None = None
     lifecycle_stage: LifecycleStage | None = None
+    # Distinct crawled pages linking here from menu or footer template lines; never edges.
+    menu_inlinks: int | None = Field(default=None, ge=0)
+    footer_inlinks: int | None = Field(default=None, ge=0)
 
     # ── graph analytics ─────────────────────────────────────────────────────
     # pageRank is over body links only; nav and footer links are never captured.
