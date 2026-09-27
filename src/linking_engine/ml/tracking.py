@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 from importlib.metadata import version
 from typing import TYPE_CHECKING
 
@@ -21,7 +23,13 @@ from linking_engine.graph.algorithms import (
 )
 
 if TYPE_CHECKING:
-    from linking_engine.models import CentralityReport, CommunityReport, HubReport
+    from linking_engine.models import (
+        CandidateReport,
+        CandidateSet,
+        CentralityReport,
+        CommunityReport,
+        HubReport,
+    )
 
 
 def analytics_experiment(tenant_id: str) -> str:
@@ -114,4 +122,70 @@ def log_analytics(
             "report.json",
         )
         mlflow.log_text(summary, "summary.md")
+        return str(run.info.run_id)
+
+
+_CANDIDATE_PARAMS = ("index", "per_target", "chunk_size")
+
+
+def candidate_metrics(report: CandidateReport) -> dict[str, float]:
+    """Every numeric result of the run, flat; values that could not be computed are left out."""
+    return {
+        name: float(value)
+        for name, value in report.model_dump(
+            exclude={"tenant_id", "finished_at", *_CANDIDATE_PARAMS}
+        ).items()
+        if value is not None
+    }
+
+
+def candidate_table(found: CandidateSet) -> str:
+    """One CSV row per target: its candidates, the eligible and linked pages, and the first
+    and last kept similarity (empty without candidates)."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(
+        (
+            "target_url",
+            "candidates",
+            "eligible",
+            "linked",
+            "linked_nearer",
+            "best_similarity",
+            "last_similarity",
+        )
+    )
+    writer.writerows(
+        (
+            target.target_url,
+            len(target.sources),
+            target.eligible,
+            target.linked,
+            target.linked_nearer,
+            target.similarities[0] if target.similarities else "",
+            target.similarities[-1] if target.similarities else "",
+        )
+        for target in found.targets
+    )
+    return buffer.getvalue()
+
+
+def log_candidates(found: CandidateSet, summary: str) -> str:
+    """Log one candidate retrieval run with its description; returns the MLflow run id."""
+    report = found.report
+    mlflow.set_experiment(analytics_experiment(report.tenant_id))
+    with mlflow.start_run(
+        run_name="candidate retrieval",
+        tags={
+            "tenant_id": report.tenant_id,
+            "kind": "pipeline",
+            "stage": "candidate-retrieval",
+            "mlflow.note.content": summary,
+        },
+    ) as run:
+        mlflow.log_params(report.model_dump(include=set(_CANDIDATE_PARAMS)))
+        mlflow.log_metrics(candidate_metrics(report))
+        mlflow.log_dict(report.model_dump(mode="json"), "report.json")
+        mlflow.log_text(summary, "summary.md")
+        mlflow.log_text(candidate_table(found), "targets.csv")
         return str(run.info.run_id)

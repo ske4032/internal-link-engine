@@ -1,17 +1,31 @@
 from __future__ import annotations
 
+import csv
+import io
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
 from mlflow import MlflowClient
+from mlflow.artifacts import load_dict, load_text
 
-from linking_engine.ml.tracking import analytics_experiment, analytics_metrics, log_analytics
+from linking_engine.ml.tracking import (
+    analytics_experiment,
+    analytics_metrics,
+    candidate_metrics,
+    candidate_table,
+    log_analytics,
+    log_candidates,
+)
 from linking_engine.models import (
+    CandidateReport,
+    CandidateSet,
     CentralityReport,
     CommunityReport,
     HubReport,
     OrphanLabel,
     PassReport,
+    TargetCandidates,
 )
 
 if TYPE_CHECKING:
@@ -126,3 +140,180 @@ def test_reports_from_two_tenants_are_refused(local_mlflow: str) -> None:
     centrality, communities, _ = reports("acme")
     with pytest.raises(ValueError, match="same tenant"):
         log_analytics(centrality, communities, hub_report("globex"), "x")
+
+
+# ── candidate retrieval ─────────────────────────────────────────────────────
+
+COUNTS: dict[str, int | float | None] = {
+    "targets": 2,
+    "indexable_assumed": 1,
+    "source_pages": 3,
+    "candidates": 3,
+    "full_targets": 1,
+    "short_targets": 1,
+    "empty_targets": 0,
+    "min_per_target": 1,
+    "median_per_target": 1.5,
+    "max_per_target": 2,
+    "linked_pairs": 4,
+    "linked_nearer": 1,
+    "drop_rate": 0.25,
+}
+NO_TARGETS: dict[str, int | float | None] = {
+    "targets": 0,
+    "indexable_assumed": 0,
+    "source_pages": 0,
+    "candidates": 0,
+    "full_targets": 0,
+    "short_targets": 0,
+    "empty_targets": 0,
+    "linked_pairs": 0,
+    "linked_nearer": 0,
+}
+
+
+def candidate_set(tenant: str = "acme", *, empty: bool = False) -> CandidateSet:
+    targets = (
+        ()
+        if empty
+        else (
+            TargetCandidates(
+                target_url="example.com/a",
+                sources=("example.com/b", "example.com/c"),
+                similarities=(0.875, 0.5),
+                eligible=5,
+                linked=3,
+                linked_nearer=1,
+            ),
+            TargetCandidates(
+                target_url="example.com/new",
+                sources=("example.com/a",),
+                similarities=(0.625,),
+                eligible=1,
+                linked=1,
+                linked_nearer=0,
+            ),
+        )
+    )
+    report = CandidateReport.model_validate(
+        {
+            "tenant_id": tenant,
+            "index": "page_content",
+            "per_target": 2,
+            "chunk_size": 512,
+            "crawled_pages": 4,
+            "not_indexable": 1,
+            "without_vector": 1,
+            "load_seconds": 0.5,
+            "search_seconds": 0.125,
+            "seconds": 0.75,
+            "finished_at": datetime(2026, 9, 27, tzinfo=UTC),
+            **(NO_TARGETS if empty else COUNTS),
+        }
+    )
+    return CandidateSet(report=report, targets=targets)
+
+
+def test_candidate_metrics_are_the_runs_results_without_settings_or_missing_values() -> None:
+    assert candidate_metrics(candidate_set().report) == {
+        "crawled_pages": 4,
+        "not_indexable": 1,
+        "without_vector": 1,
+        **COUNTS,
+        "load_seconds": 0.5,
+        "search_seconds": 0.125,
+        "seconds": 0.75,
+    }
+    empty = candidate_metrics(candidate_set(empty=True).report)
+    assert (empty["targets"], empty["candidates"], empty["source_pages"]) == (0, 0, 0)
+    for missing in ("min_per_target", "median_per_target", "max_per_target", "drop_rate"):
+        assert missing not in empty, f"{missing} was not computed and must be left out"
+
+
+def test_the_target_table_leaves_similarities_blank_without_candidates() -> None:
+    found = candidate_set()
+    lonely = TargetCandidates(
+        target_url="example.com/lonely",
+        sources=(),
+        similarities=(),
+        eligible=0,
+        linked=2,
+        linked_nearer=0,
+    )
+    with_lonely = CandidateSet(
+        report=found.report.model_copy(
+            update={
+                "targets": 3,
+                "empty_targets": 1,
+                "source_pages": 4,
+                "linked_pairs": found.report.linked_pairs + lonely.linked,
+            }
+        ),
+        targets=(*found.targets, lonely),
+    )
+
+    rows = list(csv.reader(io.StringIO(candidate_table(with_lonely))))
+
+    assert rows == [
+        [
+            "target_url",
+            "candidates",
+            "eligible",
+            "linked",
+            "linked_nearer",
+            "best_similarity",
+            "last_similarity",
+        ],
+        ["example.com/a", "2", "5", "3", "1", "0.875", "0.5"],
+        ["example.com/new", "1", "1", "1", "0", "0.625", "0.625"],
+        ["example.com/lonely", "0", "0", "2", "0", "", ""],
+    ]
+
+
+def test_a_candidate_run_is_logged_with_its_settings_report_and_target_table(
+    local_mlflow: str,
+) -> None:
+    found = candidate_set()
+
+    run_id = log_candidates(found, "Candidate retrieval for tenant acme.")
+
+    client = MlflowClient(local_mlflow)
+    run = client.get_run(run_id)
+    assert client.get_experiment(run.info.experiment_id).name == analytics_experiment("acme")
+    assert run.info.run_name == "candidate retrieval"
+    assert {k: v for k, v in run.data.tags.items() if not k.startswith("mlflow.")} == {
+        "tenant_id": "acme",
+        "kind": "pipeline",
+        "stage": "candidate-retrieval",
+    }
+    assert run.data.tags["mlflow.note.content"] == "Candidate retrieval for tenant acme."
+    assert run.data.params == {"index": "page_content", "per_target": "2", "chunk_size": "512"}
+    assert run.data.metrics == candidate_metrics(found.report)
+    assert {a.path for a in client.list_artifacts(run_id)} == {
+        "report.json",
+        "summary.md",
+        "targets.csv",
+    }
+    artifacts = f"runs:/{run_id}"
+    assert load_dict(f"{artifacts}/report.json") == found.report.model_dump(mode="json")
+    assert load_text(f"{artifacts}/summary.md") == "Candidate retrieval for tenant acme."
+    assert load_text(f"{artifacts}/targets.csv") == candidate_table(found)
+
+
+def test_an_empty_candidate_run_is_logged_with_a_header_only_table(local_mlflow: str) -> None:
+    run_id = log_candidates(candidate_set(empty=True), "No targets.")
+
+    rows = list(csv.reader(io.StringIO(load_text(f"runs:/{run_id}/targets.csv"))))
+    assert len(rows) == 1
+    assert MlflowClient(local_mlflow).get_run(run_id).data.metrics["targets"] == 0
+
+
+def test_candidate_runs_of_two_tenants_never_share_an_experiment(local_mlflow: str) -> None:
+    client = MlflowClient(local_mlflow)
+    acme = client.get_run(log_candidates(candidate_set("acme"), "a"))
+    globex = client.get_run(log_candidates(candidate_set("globex"), "g"))
+    analytics = client.get_run(log_analytics(*reports("acme"), "x"))
+
+    assert acme.info.experiment_id == analytics.info.experiment_id
+    assert globex.info.experiment_id != acme.info.experiment_id
+    assert globex.data.tags["tenant_id"] == "globex"

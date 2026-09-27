@@ -11,8 +11,10 @@ from test_embed_links import text_vector
 from voyage_fakes import FakeVoyage, client, page_index
 from voyageai.error import InvalidRequestError, ServiceUnavailableError
 
+from linking_engine.discovery.candidates import retrieve_candidates, summarise_candidates
 from linking_engine.errors import (
     DatabaseAuthError,
+    DatabaseReadError,
     DatabaseUnavailableError,
     EmbeddingAuthError,
     EmbeddingModelMismatchError,
@@ -28,6 +30,7 @@ if TYPE_CHECKING:
 
     from linking_engine.graph.repo import GraphRepo
     from linking_engine.ingest.mongo_repo import MongoRepo
+    from linking_engine.models import CandidateSet
 
 
 @pytest.fixture(scope="session")
@@ -51,7 +54,7 @@ def flow_env(
     monkeypatch.setenv("NEO4J_PASSWORD", password)
     monkeypatch.setenv("MONGO_URI", mongo_uri)
     monkeypatch.setenv("MONGO_DB", "linking_engine_test")
-    for name in ("embed_pages_task", "embed_links_task"):
+    for name in ("embed_pages_task", "embed_links_task", "candidates_task"):
         task = getattr(flows, name)
         monkeypatch.setattr(flows, name, task.with_options(retry_delay_seconds=0))
 
@@ -321,3 +324,118 @@ async def test_the_prepare_flow_refuses_the_project_database_as_its_source(
     assert state.is_failed()
     with pytest.raises(ValueError, match="source and target database must differ"):
         await state.result()
+
+
+# a -> b -> c -> a; d is linked from nowhere.
+CANDIDATE_VECTORS = {
+    "a": [1.0, 0.0, 0.0, 0.0],
+    "b": [0.9, 0.1, 0.0, 0.0],
+    "c": [0.0, 1.0, 0.0, 0.0],
+    "d": [0.0, 0.0, 1.0, 0.5],
+}
+
+
+async def seed_candidates(graph: GraphRepo, tenant: str) -> dict[str, str]:
+    urls = {name: f"example.com/{name}" for name in CANDIDATE_VECTORS}
+    await graph.upsert_pages(tenant, [Page(url=u, status_code=200) for u in urls.values()])
+    await graph.replace_links(
+        tenant,
+        list(urls.values()),
+        [
+            Link(
+                source_url=urls[s],
+                target_url=urls[t],
+                position=0,
+                anchor_text="x",
+                surrounding_text="",
+            )
+            for s, t in (("a", "b"), ("b", "c"), ("c", "a"))
+        ],
+    )
+    await graph._auto(
+        "UNWIND $rows AS row MATCH (p:Page {tenantId: $t, url: row.url}) "
+        "SET p.content_embedding = row.vec",
+        t=tenant,
+        rows=[{"url": urls[name], "vec": vec} for name, vec in CANDIDATE_VECTORS.items()],
+    )
+    return urls
+
+
+@pytest.mark.integration
+async def test_candidate_retrieval_flow_reads_neo4j_and_logs_one_mlflow_run(
+    graph: GraphRepo,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    u = await seed_candidates(graph, tenant)
+
+    found, run_id = await flows.candidate_retrieval_flow(tenant)
+
+    assert {t.target_url: set(t.sources) for t in found.targets} == {
+        u["a"]: {u["b"], u["d"]},
+        u["b"]: {u["c"], u["d"]},
+        u["c"]: {u["a"], u["d"]},
+        u["d"]: {u["a"], u["b"], u["c"]},
+    }
+    report = found.report
+    assert (report.tenant_id, report.targets, report.indexable_assumed, report.candidates) == (
+        tenant,
+        4,
+        4,
+        9,
+    )
+    assert (report.linked_pairs, report.linked_nearer, report.drop_rate) == (3, 3, 0.25)
+    run = MlflowClient(uri).get_run(run_id)
+    assert (run.data.tags["tenant_id"], run.data.tags["stage"]) == (tenant, "candidate-retrieval")
+    assert run.data.tags["mlflow.note.content"] == summarise_candidates(report)
+    assert run.data.params["index"] == "page_content"
+    assert run.data.metrics["candidates"] == 9
+
+
+def failing_first(monkeypatch: pytest.MonkeyPatch, error: Exception, *, times: int) -> list[str]:
+    """Make retrieve_candidates raise ``error`` on its first ``times`` calls; returns the calls."""
+    calls: list[str] = []
+
+    async def retrieve(graph: GraphRepo, tenant_id: str, **options: object) -> CandidateSet:
+        calls.append(tenant_id)
+        if len(calls) <= times:
+            raise error
+        return await retrieve_candidates(graph, tenant_id, **options)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(flows, "retrieve_candidates", retrieve)
+    return calls
+
+
+@pytest.mark.integration
+async def test_a_neo4j_outage_retries_candidate_retrieval_once(
+    graph: GraphRepo,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", f"sqlite:///{tmp_path / 'mlflow.db'}")
+    await seed_candidates(graph, tenant)
+    calls = failing_first(monkeypatch, DatabaseUnavailableError("neo4j", "down"), times=1)
+
+    found, _ = await flows.candidate_retrieval_flow(tenant)
+
+    assert calls == [tenant, tenant]
+    assert found.report.candidates == 9
+
+
+@pytest.mark.integration
+async def test_unreadable_graph_data_fails_candidate_retrieval_without_a_retry(
+    tenant: str, flow_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", f"sqlite:///{tmp_path / 'mlflow.db'}")
+    calls = failing_first(monkeypatch, DatabaseReadError("neo4j", "bad vector"), times=2)
+
+    state = await flows.candidate_retrieval_flow(tenant, return_state=True)
+
+    assert state.is_failed()
+    assert calls == [tenant]

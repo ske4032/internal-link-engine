@@ -38,6 +38,7 @@ from linking_engine.models import (
     LinkGraphSnapshot,
     LinkText,
     Page,
+    TargetSelection,
     TenantGraphCounts,
 )
 from linking_engine.urls import normalise_url
@@ -57,10 +58,13 @@ if TYPE_CHECKING:
         PageCommunities,
         PageHub,
         SentenceTarget,
+        VectorIndex,
     )
 
 VECTOR_DIMENSIONS: Final = 2048
-VECTOR_INDEXES: Final = ("page_content", "page_gnn")
+# Vector index name -> the Page property it indexes.
+VECTOR_PROPERTIES: Final = {"page_content": "content_embedding", "page_gnn": "gnn_embedding"}
+VECTOR_INDEXES: Final = tuple(VECTOR_PROPERTIES)
 PAGE_BATCH: Final = 500
 LINK_BATCH: Final = 1000
 CENTRALITY_BATCH: Final = 5000
@@ -346,12 +350,31 @@ MATCH (p:Page {tenantId: $tenant})-[:TARGETS_KEYWORD]->(k:Keyword {tenantId: $te
 WHERE NOT coalesce(p.isPlaceholder, false)
 RETURN p.url AS url, k.text AS text, k.language AS language
 """
-_CONTENT_VECTORS: Final = """
+# Keyset page over url: a (tenantId, url) seek read in index order and stopped at $limit.
+# Without the hint, or ordered by p.url alone, the planner has scanned every tenant's pages or
+# sorted the rest of this tenant's, loading every remaining vector for each page.
+_PAGE_VECTORS: Final = """
 MATCH (p:Page {tenantId: $tenant})
-WHERE p.url > $after AND NOT coalesce(p.isPlaceholder, false) AND p.content_embedding IS NOT NULL
-RETURN p.url AS url, p.content_embedding AS vec
-ORDER BY p.url
+USING INDEX SEEK p:Page(tenantId, url)
+WHERE p.url > $after AND NOT coalesce(p.isPlaceholder, false) AND p[$property] IS NOT NULL
+RETURN p.url AS url, p[$property] AS vec
+ORDER BY p.tenantId, p.url
 LIMIT $limit
+"""
+_CANDIDATE_TARGETS: Final = """
+MATCH (p:Page {tenantId: $tenant})
+WHERE NOT coalesce(p.isPlaceholder, false)
+WITH p, CASE
+    WHEN NOT coalesce(p.isIndexable, 200 <= p.statusCode <= 299, false) THEN 'not_indexable'
+    WHEN p[$property] IS NULL THEN 'without_vector'
+    ELSE 'target'
+  END AS state
+ORDER BY p.url
+RETURN count(p) AS crawled_pages,
+       count(CASE state WHEN 'not_indexable' THEN 1 END) AS not_indexable,
+       count(CASE state WHEN 'without_vector' THEN 1 END) AS without_vector,
+       collect(CASE state WHEN 'target'
+         THEN {url: p.url, indexable_assumed: p.isIndexable IS NULL} END) AS targets
 """
 _COMMUNITY_CONTEXT: Final = """
 MATCH (p:Page {tenantId: $tenant})
@@ -1091,23 +1114,49 @@ class GraphRepo:
         self, tenant_id: str, *, batch_size: int = PAGE_BATCH
     ) -> dict[str, npt.NDArray[np.float32]]:
         """Content embeddings of the tenant's crawled pages, paged by url."""
+        return await self.page_vectors(tenant_id, index="page_content", batch_size=batch_size)
+
+    async def page_vectors(
+        self, tenant_id: str, *, index: VectorIndex = "page_content", batch_size: int = PAGE_BATCH
+    ) -> dict[str, npt.NDArray[np.float32]]:
+        """The vectors in ``index``'s property of the tenant's crawled pages, paged by url."""
         _require_tenant(tenant_id)
+        vector_property = _vector_property(index)
         if batch_size < 1:
             raise ValueError("batch_size must be at least 1")
         vectors: dict[str, npt.NDArray[np.float32]] = {}
         after = ""
         while True:
-            rows = await self._read(
-                _CONTENT_VECTORS, tenant=tenant_id, after=after, limit=batch_size
+            rows = await self._read_values(
+                _PAGE_VECTORS,
+                tenant=tenant_id,
+                property=vector_property,
+                after=after,
+                limit=batch_size,
             )
-            for row in rows:
-                vector = row["vec"]
+            for url, vector in rows:
                 if not isinstance(vector, list):
-                    raise DatabaseReadError("neo4j", f"page {row['url']!r} has no stored vector")
-                vectors[str(row["url"])] = np.asarray(vector, dtype=np.float32)
+                    raise DatabaseReadError("neo4j", f"page {url!r} has no stored vector")
+                vectors[str(url)] = np.asarray(vector, dtype=np.float32)
             if len(rows) < batch_size:
                 return vectors
-            after = str(rows[-1]["url"])
+            after = str(rows[-1][0])
+
+    async def candidate_targets(
+        self, tenant_id: str, *, index: VectorIndex = "page_content"
+    ) -> TargetSelection:
+        """The tenant's crawled pages that can be link targets, ordered by url, and how many
+        of the rest are not indexable or have no vector in ``index``."""
+        _require_tenant(tenant_id)
+        rows = await self._read(
+            _CANDIDATE_TARGETS, tenant=tenant_id, property=_vector_property(index)
+        )
+        try:
+            return TargetSelection.model_validate(rows[0])
+        except ValidationError as error:
+            raise DatabaseReadError(
+                "neo4j", f"candidate targets of {tenant_id!r}: {error}"
+            ) from error
 
     async def community_context(self, tenant_id: str) -> list[CommunityContext]:
         """Template inlink counts and the previous run's community ids of every crawled page."""
@@ -1202,6 +1251,15 @@ class GraphRepo:
         except (Neo4jError, DriverError) as error:
             raise _translate(error, write=False) from error
 
+    async def _read_values(self, query: LiteralString, **params: object) -> list[list[object]]:
+        # Rows as plain value lists. Record.data() walks every element of every list, which
+        # dominates reads of 2048-float vectors.
+        try:
+            async with self._driver.session(default_access_mode=READ_ACCESS) as session:
+                return await session.execute_read(_values, query, params)
+        except (Neo4jError, DriverError) as error:
+            raise _translate(error, write=False) from error
+
     async def _write(self, query: LiteralString, **params: object) -> list[Row]:
         try:
             async with self._driver.session(default_access_mode=WRITE_ACCESS) as session:
@@ -1293,6 +1351,12 @@ async def _collect(
     return [record.data() async for record in result]
 
 
+async def _values(
+    tx: AsyncManagedTransaction, query: LiteralString, params: Mapping[str, object]
+) -> list[list[object]]:
+    return await (await tx.run(query, dict(params))).values()
+
+
 async def _count_exactly(
     tx: AsyncManagedTransaction,
     query: LiteralString,
@@ -1327,6 +1391,13 @@ def status_issue(status_code: int | None) -> IssueFlag | None:
 def _require_tenant(tenant_id: str) -> None:
     if not tenant_id.strip():
         raise ValueError("tenant_id must be a non-empty string")
+
+
+def _vector_property(index: str) -> str:
+    try:
+        return VECTOR_PROPERTIES[index]
+    except KeyError:
+        raise ValueError(f"unknown vector index {index!r}") from None
 
 
 def _check_embeddings(

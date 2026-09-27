@@ -11,6 +11,14 @@ not fetch it, compute it, or log it.
 """
 
 from linking_engine.models.audit import LinkAuditResult
+from linking_engine.models.candidates import (
+    CandidateReport,
+    CandidateSet,
+    CandidateTarget,
+    TargetCandidates,
+    TargetSelection,
+    VectorIndex,
+)
 from linking_engine.models.corpus import (
     CleanedPage,
     CrawlPage,
@@ -77,6 +85,9 @@ __all__ = [
     "AnchorRules",
     "AnchorType",
     "AnchorTypeProfile",
+    "CandidateReport",
+    "CandidateSet",
+    "CandidateTarget",
     "CentralityReport",
     "CleanedPage",
     "CommunityContext",
@@ -121,8 +132,11 @@ __all__ = [
     "Recommendation",
     "RecommendationStatus",
     "SentenceTarget",
+    "TargetCandidates",
+    "TargetSelection",
     "TemplateInlinks",
     "TemplateLink",
     "TenantConfig",
     "TenantGraphCounts",
+    "VectorIndex",
 ]
