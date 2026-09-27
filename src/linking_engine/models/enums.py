@@ -93,6 +93,24 @@ class PageType(StrEnum):
     ARTICLE = "ARTICLE"
 
 
+class ClusterAgreement(StrEnum):
+    """A pair's topic clustering against its link clustering; the disagreement is the signal.
+
+    Two pages match on links only when both belong to the same link community, so a page
+    in no link community (an orphan) never matches. The topic is unknown when either page
+    has no topic community.
+    """
+
+    # Already well connected.
+    SAME_TOPIC_SAME_LINKS = "SAME_TOPIC_SAME_LINKS"
+    # The missing link.
+    SAME_TOPIC_OTHER_LINKS = "SAME_TOPIC_OTHER_LINKS"
+    # Linked neighbourhoods across topics: possibly a link to remove.
+    OTHER_TOPIC_SAME_LINKS = "OTHER_TOPIC_SAME_LINKS"
+    OTHER_TOPIC_OTHER_LINKS = "OTHER_TOPIC_OTHER_LINKS"
+    UNKNOWN_TOPIC = "UNKNOWN_TOPIC"
+
+
 class KeywordSource(StrEnum):
     """Where a `TARGETS_KEYWORD` edge came from.
 

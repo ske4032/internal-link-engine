@@ -28,7 +28,15 @@ from linking_engine.errors import (
     DatabaseWriteError,
     SchemaError,
 )
-from linking_engine.models import AnchorRules, CrawlPage, LinkRecord, PageRecord, PageSummary
+from linking_engine.models import (
+    AnchorRules,
+    CrawlPage,
+    GscQuery,
+    LinkRecord,
+    PageRecord,
+    PageSummary,
+    StrategicKeyword,
+)
 from linking_engine.urls import UrlRules, normalise_url
 
 if TYPE_CHECKING:
@@ -306,6 +314,32 @@ class MongoRepo:
             self._db["pages"], {"tenantId": tenant_id}, PageSummary, batch_size
         ):
             yield [_from_document(PageSummary, document) for document in documents]
+
+    async def gsc_queries(
+        self, tenant_id: str, *, batch_size: int = READ_BATCH
+    ) -> list[tuple[str, str]]:
+        """(url, query) of every stored GSC query row of the tenant, ordered by url then query."""
+        _require_tenant(tenant_id)
+        rows: list[tuple[str, str]] = []
+        async for documents in _find_batches(
+            self._db["gsc_queries"], {"tenantId": tenant_id}, GscQuery, batch_size
+        ):
+            for document in documents:
+                row = _from_document(GscQuery, document)
+                rows.append((row.url, row.query))
+        return sorted(rows)
+
+    async def strategic_keywords(
+        self, tenant_id: str, *, batch_size: int = READ_BATCH
+    ) -> list[StrategicKeyword]:
+        """The client's keywords per page, ordered by url, keyword and language."""
+        _require_tenant(tenant_id)
+        rows: list[StrategicKeyword] = []
+        async for documents in _find_batches(
+            self._db["strategic_keywords"], {"tenantId": tenant_id}, StrategicKeyword, batch_size
+        ):
+            rows.extend(_from_document(StrategicKeyword, document) for document in documents)
+        return sorted(rows, key=lambda row: (row.url, row.keyword, row.language))
 
     async def get_pages(
         self, tenant_id: str, urls: Sequence[str], *, batch_size: int = READ_BATCH
