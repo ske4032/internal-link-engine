@@ -80,7 +80,7 @@ class PageRecord(BaseModel):
 
 
 class CrawlPage(BaseModel):
-    """Crawler output (pages_v2)."""
+    """A page as the crawler stored it."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 

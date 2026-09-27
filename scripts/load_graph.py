@@ -1,6 +1,6 @@
 """Apply Neo4j migrations and Mongo indexes, then load one tenant from MONGO_DB into Neo4j.
 
-uv run --env-file .env python scripts/load_graph.py --tenant action1
+uv run --env-file .env python scripts/load_graph.py --tenant <tenant>
 """
 
 from __future__ import annotations

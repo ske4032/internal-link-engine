@@ -1,7 +1,7 @@
 """Show or change a tenant's overrides of the generic-anchor dictionary.
 
-    uv run --env-file .env python scripts/anchor_rules.py --tenant action1
-    uv run --env-file .env python scripts/anchor_rules.py --tenant action1 --add "download now" --remove details
+    uv run --env-file .env python scripts/anchor_rules.py --tenant <tenant>
+    uv run --env-file .env python scripts/anchor_rules.py --tenant <tenant> --add "download now" --remove details
 
 Re-run embed_tenant.py after a change.
 """
