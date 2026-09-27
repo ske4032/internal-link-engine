@@ -34,6 +34,7 @@ from linking_engine.models import (
     EmbeddingTarget,
     IssueFlag,
     Link,
+    LinkGraphSnapshot,
     LinkText,
     Page,
     TenantGraphCounts,
@@ -279,6 +280,15 @@ RETURN count(a) AS n
 _DROPPED_ANCHORS: Final = "every key must merge exactly one Anchor"
 # Each vector is sent once per unique sentence and fanned out to its edges server-side.
 # Tenant-scoped: a vector is only ever reused within the tenant that paid for it.
+_SNAPSHOT_PAGES: Final = """
+MATCH (p:Page {tenantId: $tenant})
+RETURN p.url AS url, coalesce(p.isPlaceholder, false) AS placeholder
+ORDER BY url
+"""
+_SNAPSHOT_LINKS: Final = """
+MATCH (a:Page {tenantId: $tenant})-[:LINKS_TO]->(b:Page {tenantId: $tenant})
+RETURN a.url AS source, b.url AS target
+"""
 _SURROUNDING_VECTORS: Final = """
 UNWIND $hashes AS h
 MATCH (:Page {tenantId: $tenant})-[r:LINKS_TO {surroundingEmbeddedHash: h}]->()
@@ -855,6 +865,24 @@ class GraphRepo:
             pending.update(str(row["key"]) for row in rows)
         return tuple(key for key in keys if key in pending)
 
+    async def link_graph(self, tenant_id: str) -> LinkGraphSnapshot:
+        """Every page (placeholders and orphans included) and body link of a tenant, consistently."""
+        _require_tenant(tenant_id)
+        try:
+            async with self._driver.session(default_access_mode=READ_ACCESS) as session:
+                pages, links = await session.execute_read(_snapshot, tenant_id)
+        except (Neo4jError, DriverError) as error:
+            raise _translate(error, write=False) from error
+        try:
+            return LinkGraphSnapshot(
+                tenant_id=tenant_id,
+                pages=tuple(str(url) for url, _ in pages),
+                placeholders=tuple(bool(flag) for _, flag in pages),
+                links=tuple((str(source), str(target)) for source, target in links),
+            )
+        except ValidationError as error:
+            raise DatabaseReadError("neo4j", f"link graph of {tenant_id!r}: {error}") from error
+
     # ── transport ────────────────────────────────────────────────────────────
 
     async def _read(self, query: LiteralString, **params: object) -> list[Row]:
@@ -902,6 +930,15 @@ class GraphRepo:
                 return await session.execute_write(_count_exactly, query, params, expected, dropped)
         except (Neo4jError, DriverError) as error:
             raise _translate(error, write=True) from error
+
+
+async def _snapshot(
+    tx: AsyncManagedTransaction, tenant_id: str
+) -> tuple[list[list[object]], list[list[object]]]:
+    # Both reads in one transaction: no link can point at a page missing from the list.
+    pages = await (await tx.run(_SNAPSHOT_PAGES, tenant=tenant_id)).values()
+    links = await (await tx.run(_SNAPSHOT_LINKS, tenant=tenant_id)).values()
+    return pages, links
 
 
 async def _collect(

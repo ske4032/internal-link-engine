@@ -9,9 +9,9 @@ scheme, www, query or trailing slash, so one page has one identity across tenant
 """
 
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from linking_engine.models.enums import ActionType, AnchorType, IssueFlag, LifecycleStage, PageType
 from linking_engine.urls import UrlKey
@@ -133,3 +133,21 @@ class TenantGraphCounts(BaseModel):
     redirected_pages: int = Field(default=0, ge=0)
     broken_pages: int = Field(default=0, ge=0)
     fix_links: int = Field(default=0, ge=0)
+
+
+class LinkGraphSnapshot(BaseModel):
+    """A tenant's pages and body links, read in one transaction; index in ``pages`` is the node id."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    tenant_id: str = Field(min_length=1)
+    pages: tuple[str, ...]
+    placeholders: tuple[bool, ...]
+    # (source url, target url), one per LINKS_TO edge.
+    links: tuple[tuple[str, str], ...]
+
+    @model_validator(mode="after")
+    def _aligned(self) -> Self:
+        if len(self.placeholders) != len(self.pages):
+            raise ValueError("placeholders must have one flag per page")
+        return self

@@ -47,7 +47,7 @@ from linking_engine.models.enums import (
     RecommendationStatus,
 )
 from linking_engine.models.features import PairFeatures
-from linking_engine.models.page import Keyword, Link, Page, TenantGraphCounts
+from linking_engine.models.page import Keyword, Link, LinkGraphSnapshot, Page, TenantGraphCounts
 from linking_engine.models.recommendation import AnchorCandidate, Recommendation
 from linking_engine.models.tenant import AnchorRules, AnchorTypeProfile, TenantConfig
 
@@ -77,6 +77,7 @@ __all__ = [
     "Link",
     "LinkAuditResult",
     "LinkEmbedReport",
+    "LinkGraphSnapshot",
     "LinkRecord",
     "LinkText",
     "Page",
