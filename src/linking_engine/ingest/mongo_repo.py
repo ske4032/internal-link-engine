@@ -28,7 +28,7 @@ from linking_engine.errors import (
     DatabaseWriteError,
     SchemaError,
 )
-from linking_engine.models import CrawlPage, LinkRecord, PageRecord, PageSummary
+from linking_engine.models import AnchorRules, CrawlPage, LinkRecord, PageRecord, PageSummary
 from linking_engine.urls import UrlRules, normalise_url
 
 if TYPE_CHECKING:
@@ -244,6 +244,46 @@ class MongoRepo:
             ),
             write=True,
             what="write url rules",
+        )
+
+    async def get_anchor_rules(self, tenant_id: str) -> AnchorRules:
+        """The tenant's generic-anchor overrides; none stored means the built-in dictionary."""
+        _require_tenant(tenant_id)
+        document = await _retrying(
+            partial(
+                self._db["tenant_config"].find_one,
+                {"tenantId": tenant_id},
+                {"_id": 0, "genericAnchorsAdd": 1, "genericAnchorsRemove": 1},
+            ),
+            write=False,
+            what="read anchor rules",
+        )
+        if not document:
+            return AnchorRules()
+        return AnchorRules.model_validate(
+            {
+                "generic_add": document.get("genericAnchorsAdd") or [],
+                "generic_remove": document.get("genericAnchorsRemove") or [],
+            }
+        )
+
+    async def set_anchor_rules(self, tenant_id: str, rules: AnchorRules) -> None:
+        _require_tenant(tenant_id)
+        await _retrying(
+            partial(
+                self._db["tenant_config"].update_one,
+                {"tenantId": tenant_id},
+                {
+                    "$set": {
+                        "genericAnchorsAdd": sorted(rules.generic_add),
+                        "genericAnchorsRemove": sorted(rules.generic_remove),
+                        "anchorRulesUpdatedAt": datetime.now(UTC),
+                    }
+                },
+                upsert=True,
+            ),
+            write=True,
+            what="write anchor rules",
         )
 
     async def delete_tenant(self, tenant_id: str) -> int:

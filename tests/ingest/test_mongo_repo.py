@@ -8,7 +8,7 @@ from pymongo import AsyncMongoClient
 from linking_engine.errors import DatabaseAuthError, DatabaseReadError, DatabaseUnavailableError
 from linking_engine.ingest.markdown_clean import body_hash
 from linking_engine.ingest.mongo_repo import INDEXES, CrawlSource, MongoRepo
-from linking_engine.models import Heading, LinkRecord, PageRecord
+from linking_engine.models import AnchorRules, Heading, LinkRecord, PageRecord
 from linking_engine.urls import UrlRules
 
 BASE = "example.com"
@@ -265,3 +265,14 @@ async def test_url_rules_round_trip_per_tenant(mongo: MongoRepo, tenant: str) ->
     assert await mongo.get_url_rules(other) == UrlRules()
     await mongo.delete_tenant(tenant)
     assert await mongo.get_url_rules(tenant) == UrlRules()
+
+
+@pytest.mark.integration
+async def test_anchor_rules_round_trip_per_tenant(mongo: MongoRepo, tenant: str) -> None:
+    assert await mongo.get_anchor_rules(tenant) == AnchorRules()
+    rules = AnchorRules(generic_add={"download now"}, generic_remove={"details"})
+    await mongo.set_anchor_rules(tenant, rules)
+    assert await mongo.get_anchor_rules(tenant) == rules
+    assert await mongo.get_anchor_rules(f"{tenant}-other") == AnchorRules()
+    await mongo.delete_tenant(tenant)
+    assert await mongo.get_anchor_rules(tenant) == AnchorRules()

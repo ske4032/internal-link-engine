@@ -10,3 +10,9 @@
 3. **Search by meaning: `zg`.** `zg query "<intent>"` or the MCP tool `zvec_grep_search`. Confirm a hit
    with `rg` or cxpak before editing. After large changes, refresh the index with `zg index`
    (stored in `.zvec-grep/`, gitignored).
+
+## Tenant isolation (mandatory)
+
+Tenant data is never shared. Every read, cache lookup, deduplication, reuse and write is
+filtered by `tenantId`: no cross-tenant reuse of vectors, anchors, sentences or
+configuration, even for identical text.
