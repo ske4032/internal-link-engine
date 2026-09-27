@@ -47,7 +47,15 @@ from linking_engine.models.enums import (
     RecommendationStatus,
 )
 from linking_engine.models.features import PairFeatures
-from linking_engine.models.page import Keyword, Link, LinkGraphSnapshot, Page, TenantGraphCounts
+from linking_engine.models.page import (
+    CentralityReport,
+    Keyword,
+    Link,
+    LinkGraphSnapshot,
+    Page,
+    PageCentrality,
+    TenantGraphCounts,
+)
 from linking_engine.models.recommendation import AnchorCandidate, Recommendation
 from linking_engine.models.tenant import AnchorRules, AnchorTypeProfile, TenantConfig
 
@@ -58,6 +66,7 @@ __all__ = [
     "AnchorRules",
     "AnchorType",
     "AnchorTypeProfile",
+    "CentralityReport",
     "CleanedPage",
     "ContentGapFinding",
     "CrawlPage",
@@ -81,6 +90,7 @@ __all__ = [
     "LinkRecord",
     "LinkText",
     "Page",
+    "PageCentrality",
     "PageEmbedding",
     "PageRecord",
     "PageSummary",

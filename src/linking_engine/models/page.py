@@ -50,7 +50,10 @@ class Page(BaseModel):
     # ── graph analytics ─────────────────────────────────────────────────────
     # pageRank is over body links only; nav and footer links are never captured.
     page_rank: float | None = Field(default=None, ge=0)
+    # Share of the tenant's crawled pages scoring strictly lower; placeholders have no scores.
+    page_rank_percentile: float | None = Field(default=None, ge=0, lt=1)
     betweenness: float | None = Field(default=None, ge=0)
+    betweenness_percentile: float | None = Field(default=None, ge=0, lt=1)
     link_community_id: int | None = None
     keyword_community_id: int | None = None
     # HDBSCAN cluster label over content_embedding. -1 is the noise label, a
@@ -133,6 +136,30 @@ class TenantGraphCounts(BaseModel):
     redirected_pages: int = Field(default=0, ge=0)
     broken_pages: int = Field(default=0, ge=0)
     fix_links: int = Field(default=0, ge=0)
+
+
+class PageCentrality(BaseModel):
+    """PageRank and betweenness of one crawled page, with its percentile among crawled pages."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    # The stored key as read in the snapshot; written back verbatim, never re-normalised.
+    url: str = Field(min_length=1)
+    page_rank: float = Field(ge=0, le=1)
+    page_rank_percentile: float = Field(ge=0, lt=1)
+    betweenness: float = Field(ge=0)
+    betweenness_percentile: float = Field(ge=0, lt=1)
+
+
+class CentralityReport(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    tenant_id: str = Field(min_length=1)
+    pages: int = Field(ge=0)
+    placeholders: int = Field(ge=0)
+    pagerank_s: float = Field(ge=0)
+    betweenness_s: float = Field(ge=0)
+    write_s: float = Field(ge=0)
 
 
 class LinkGraphSnapshot(BaseModel):
