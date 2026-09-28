@@ -12,7 +12,7 @@ shared by several pages is rejected with its reason.
 from __future__ import annotations
 
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import TYPE_CHECKING, Final
 
 from linking_engine.anchor.generic import is_generic
@@ -157,15 +157,20 @@ def fallback_texts(page: PageRecord) -> tuple[str, ...]:
 
 
 def repeated_fallbacks(
-    pages: Iterable[Sequence[str]], suffix: str | None, prefix: str | None = None
+    pages: Iterable[tuple[Sequence[str], str]], suffix: str | None, prefix: str | None = None
 ) -> frozenset[str]:
-    """Normalised cleaned fallbacks found on at least ``REPEATED_FALLBACK_PAGES`` pages; each
-    entry of ``pages`` holds one page's ``fallback_texts``."""
-    counts: Counter[str] = Counter()
-    for texts in pages:
+    """Normalised cleaned fallbacks found over at least ``REPEATED_FALLBACK_PAGES`` different
+    bodies; each entry of ``pages`` is one page's ``fallback_texts`` and body hash. A template
+    heading sits over different content; the same article served at several urls has one body
+    and keeps its heading."""
+    bodies: defaultdict[str, set[str]] = defaultdict(set)
+    for texts, body in pages:
         cleaned = (clean_title(text, suffix, prefix) for text in texts)
-        counts.update({normalise_term(text) for text in cleaned if text})
-    return frozenset(text for text, count in counts.items() if count >= REPEATED_FALLBACK_PAGES)
+        for text in {normalise_term(text) for text in cleaned if text}:
+            bodies[text].add(body)
+    return frozenset(
+        text for text, found in bodies.items() if len(found) >= REPEATED_FALLBACK_PAGES
+    )
 
 
 def fallback_reason(

@@ -403,16 +403,24 @@ def test_an_h1_that_is_only_the_brand_is_rejected() -> None:
     assert (found.rung, reasons) == (KeywordRung.TITLE, ("h1_brand",))
 
 
-def test_fallbacks_on_at_least_three_pages_are_repeated_templates() -> None:
+def test_fallbacks_over_at_least_three_different_bodies_are_repeated_templates() -> None:
     pages = [
-        ("Our Products", "Tents | Acme"),
-        ("Our Products", "Stoves | Acme"),
-        ("our  products", "Boots | Acme"),
-        ("Unique", "Tents | Acme"),
-        ("Sale | Acme", "Sale"),
+        (("Our Products", "Tents | Acme"), "body-1"),
+        (("Our Products", "Stoves | Acme"), "body-2"),
+        (("our  products", "Boots | Acme"), "body-3"),
+        (("Unique", "Tents | Acme"), "body-4"),
+        (("Sale | Acme", "Sale"), "body-5"),
     ]
 
     assert repeated_fallbacks(pages, "Acme") == {"our products"}
+
+
+def test_one_article_served_at_several_urls_keeps_its_heading() -> None:
+    # The same body at four urls is one page published four times, not a template.
+    same = [(("What is Patching?", "What is Patching? | Acme"), "body-1") for _ in range(4)]
+    listing = [(("Blog", "Blog | Acme"), f"page-{i}") for i in range(3)]
+
+    assert repeated_fallbacks([*same, *listing], "Acme") == {"blog"}
 
 
 def test_a_repeated_h1_falls_through_and_a_repeated_title_leaves_the_page_unresolved() -> None:

@@ -270,7 +270,7 @@ async def test_a_tenant_without_gsc_or_strategic_data_resolves_from_headings(
 ) -> None:
     # A template H1 on three pages cannot tell them apart; their titles can.
     templated = [
-        page_record(f"/t{i}", 200, f"{name} | Acme", "Our Products", "", "en")
+        page_record(f"/t{i}", 200, f"{name} | Acme", "Our Products", f"{name} copy", "en")
         for i, name in enumerate(("Tents", "Stoves", "Boots"))
     ]
     records = [record("/gsc"), record("/title"), *templated]
@@ -325,7 +325,7 @@ async def test_unseen_h1_formats_fall_back_for_the_recorded_reason(
     graph: GraphRepo, mongo: MongoRepo, tenant: str
 ) -> None:
     records = [
-        page_record(path, 200, title, h1, "", "en", headings)
+        page_record(path, 200, title, h1, f"copy of {path}", "en", headings)
         for path, (title, h1, headings) in UNSEEN.items()
     ]
     await mongo.write_pages(tenant, records, [])
