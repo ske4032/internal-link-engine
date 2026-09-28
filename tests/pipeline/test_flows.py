@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 from mlflow import MlflowClient
+from mlflow.artifacts import load_dict
 from prefect.states import Failed
 from pymongo import AsyncMongoClient
 from test_embed import DIM, record, seed, seed_plain, url
@@ -25,8 +26,9 @@ from linking_engine.errors import (
     EmbeddingRequestError,
     EmbeddingUnavailableError,
 )
-from linking_engine.models import Link, LinkRecord, Page
+from linking_engine.models import DuplicateGroup, Link, LinkRecord, Page
 from linking_engine.pipeline import flows
+from linking_engine.pipeline.duplicates import summarise_duplicates
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -275,21 +277,24 @@ async def test_graph_analytics_flow_writes_to_neo4j_and_logs_one_mlflow_run(
 NAV_LINE = "- [Pricing](https://example.com/pricing)"
 
 
-async def seed_crawl(mongo_uri: str, database: str) -> None:
+async def seed_crawl(mongo_uri: str, database: str, copies: tuple[str, ...] = ()) -> None:
+    """A chain of six pages; each of ``copies`` serves page a's content at another path."""
     client: AsyncMongoClient[dict[str, object]] = AsyncMongoClient(mongo_uri)
+    pages = [
+        *zip(("pricing", "a", "b", "c", "d", "e"), ("a", "b", "c", "d", "e", "a"), strict=True),
+        *((copy, "b") for copy in copies),
+    ]
     await client[database]["crawl_pages"].insert_many(
         [
             {
-                "url": f"https://example.com/{name}",
-                "title": name,
-                "content": f"{NAV_LINE}\n\n{name.title()} page. Read [the next one]"
-                f"(https://example.com/{nxt}) as well.",
+                "url": f"https://example.com/{path}",
+                "title": path,
+                "content": f"{NAV_LINE}\n\n{path.rsplit('/', 1)[-1].title()} page. Read "
+                f"[the next one](https://example.com/{nxt}) as well.",
                 "statusCode": 200,
                 "usable": True,
             }
-            for name, nxt in zip(
-                ("pricing", "a", "b", "c", "d", "e"), ("a", "b", "c", "d", "e", "a"), strict=True
-            )
+            for path, nxt in pages
         ]
     )
     await client.close()
@@ -297,13 +302,19 @@ async def seed_crawl(mongo_uri: str, database: str) -> None:
 
 @pytest.mark.integration
 async def test_prepare_and_load_flows_ingest_a_crawl_into_mongo_and_neo4j(
-    graph: GraphRepo, mongo_uri: str, tenant: str, flow_env: None
+    graph: GraphRepo,
+    mongo_uri: str,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", f"sqlite:///{tmp_path / 'mlflow.db'}")
     source_db = f"crawl_{tenant.replace('-', '_')}"
     await seed_crawl(mongo_uri, source_db)
 
     prepared = await flows.prepare_corpus_flow(tenant, source_db, "crawl_pages")
-    loaded, counts = await flows.load_graph_flow(tenant)
+    loaded, counts, duplicates, _ = await flows.load_graph_flow(tenant)
 
     assert (prepared.documents, prepared.pages, prepared.links, prepared.pages_written) == (
         6,
@@ -315,6 +326,43 @@ async def test_prepare_and_load_flows_ingest_a_crawl_into_mongo_and_neo4j(
     assert (loaded.pages, loaded.links, counts.pages) == (6, 6, 6)
     [pricing] = await graph.get_pages(tenant, ["example.com/pricing"])
     assert pricing.menu_inlinks == 5
+    assert (duplicates.tenant_id, duplicates.groups) == (tenant, ())
+
+
+@pytest.mark.integration
+async def test_the_load_flow_groups_exact_duplicates_and_logs_them_to_mlflow(
+    graph: GraphRepo,
+    mongo_uri: str,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    source_db = f"crawl_{tenant.replace('-', '_')}"
+    await seed_crawl(mongo_uri, source_db, copies=("blog/a", "news/a"))
+    # Page a's sentence is on three of eight pages: keep it out of the boilerplate.
+    await flows.prepare_corpus_flow(tenant, source_db, "crawl_pages", boilerplate_share=0.5)
+
+    loaded, _, duplicates, run_id = await flows.load_graph_flow(tenant)
+
+    # a is linked from pricing and e, its copies from nowhere.
+    copies = ("example.com/blog/a", "example.com/news/a")
+    assert loaded.pages == 8
+    assert duplicates.groups == (
+        DuplicateGroup(group_id=0, canonical="example.com/a", copies=copies),
+    )
+    assert await graph.non_canonical_copies(tenant) == set(copies)
+    [canonical] = await graph.get_pages(tenant, ["example.com/a"])
+    assert (canonical.duplicate_group, canonical.is_canonical) == (0, True)
+    run = MlflowClient(uri).get_run(run_id)
+    assert (run.data.tags["tenant_id"], run.data.tags["stage"]) == (tenant, "duplicates")
+    assert run.data.tags["mlflow.note.content"] == summarise_duplicates(duplicates)
+    assert run.data.metrics["non_canonical"] == 2
+    assert load_dict(f"runs:/{run_id}/groups.json") == {
+        "groups": [{"group_id": 0, "canonical": "example.com/a", "copies": list(copies)}]
+    }
 
 
 @pytest.mark.integration

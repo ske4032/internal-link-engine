@@ -19,7 +19,8 @@ import numpy as np
 import pytest
 
 from linking_engine.discovery.candidates import retrieve_candidates
-from linking_engine.models import CandidateSet, Link, Page
+from linking_engine.models import CandidateSet, DuplicateGroup, Link, Page
+from linking_engine.pipeline.duplicates import find_duplicates
 
 if TYPE_CHECKING:
     from linking_engine.graph.repo import GraphRepo
@@ -197,3 +198,74 @@ async def test_the_gnn_index_reads_only_gnn_vectors(graph: GraphRepo, tenant: st
     assert by_url[topic_url(0, 1)].sources == (topic_url(0, 2), NOINDEX)
     assert by_url[topic_url(0, 2)].sources == (NOINDEX,)
     assert (by_url[topic_url(0, 2)].linked, by_url[topic_url(0, 2)].eligible) == (1, 1)
+
+
+# One article served at three urls with one body, beside ten pages of its topic. The blog url has
+# the most inbound links, so it is the canonical copy.
+ARTICLE = ("example.com/blog/article", "example.com/article", "example.com/news/article")
+ARTICLE_TOPIC = [f"example.com/topic/p{i:02d}" for i in range(10)]
+ARTICLE_LINKS = [
+    (ARTICLE_TOPIC[0], ARTICLE[0]),
+    (ARTICLE_TOPIC[1], ARTICLE[0]),
+    (ARTICLE_TOPIC[2], ARTICLE[1]),
+    (ARTICLE_TOPIC[3], ARTICLE_TOPIC[4]),
+]
+
+
+async def seed_article(graph: GraphRepo, tenant: str) -> None:
+    rng = np.random.default_rng(72)
+    centre = rng.normal(size=DIM)
+    article = centre + 0.3 * rng.normal(size=DIM)
+    vectors = {u: centre + 0.3 * rng.normal(size=DIM) for u in ARTICLE_TOPIC}
+    vectors |= dict.fromkeys(ARTICLE, article)
+    hashes = {u: f"{i:064x}" for i, u in enumerate(ARTICLE_TOPIC, start=1)}
+    hashes |= dict.fromkeys(ARTICLE, "a" * 64)
+    await graph.upsert_pages(
+        tenant,
+        [
+            Page(url=u, status_code=200, body_hash=hashes[u], language="en", word_count=200)
+            for u in [*ARTICLE_TOPIC, *ARTICLE]
+        ],
+    )
+    await graph.replace_links(
+        tenant,
+        sorted({s for s, _ in ARTICLE_LINKS}),
+        [
+            Link(source_url=s, target_url=t, position=i, anchor_text="x", surrounding_text="")
+            for i, (s, t) in enumerate(ARTICLE_LINKS)
+        ],
+    )
+    await graph._auto(
+        "UNWIND $rows AS row MATCH (p:Page {tenantId: $t, url: row.url}) "
+        "SET p.content_embedding = row.vec",
+        t=tenant,
+        rows=[{"url": u, "vec": (v / np.linalg.norm(v)).tolist()} for u, v in vectors.items()],
+    )
+
+
+def joins_two_copies(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    return [(s, t) for s, t in pairs if s in ARTICLE and t in ARTICLE]
+
+
+@pytest.mark.integration
+async def test_one_article_at_three_urls_is_one_target_never_linked_from_its_copies(
+    graph: GraphRepo, tenant: str
+) -> None:
+    await seed_article(graph, tenant)
+    before = await retrieve_candidates(graph, tenant, per_target=5)
+    assert joins_two_copies(pairs_of(before)), "the copies were never each other's candidates"
+
+    duplicates = await find_duplicates(graph, tenant)
+    found = await retrieve_candidates(graph, tenant, per_target=5)
+
+    assert duplicates.groups == (
+        DuplicateGroup(group_id=0, canonical=ARTICLE[0], copies=(ARTICLE[1], ARTICLE[2])),
+    )
+    pairs = pairs_of(found)
+    assert joins_two_copies(pairs) == []
+    targets = {t.target_url for t in found.targets}
+    assert targets & set(ARTICLE) == {ARTICLE[0]}, "only the canonical copy is a target"
+    assert {s for s, _ in pairs} & set(ARTICLE) == {ARTICLE[0]}, "copies are never sources"
+    report = found.report
+    assert (report.targets, report.source_pages, report.non_canonical_excluded) == (11, 11, 2)
+    assert (before.report.targets, before.report.non_canonical_excluded) == (13, 0)

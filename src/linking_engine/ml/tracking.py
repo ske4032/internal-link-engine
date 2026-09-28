@@ -37,6 +37,7 @@ if TYPE_CHECKING:
         CandidateSet,
         CentralityReport,
         CommunityReport,
+        DuplicateReport,
         FeatureReport,
         HubReport,
         KeywordReport,
@@ -304,4 +305,40 @@ def log_features(report: FeatureReport, summary: str) -> str:
         mlflow.log_dict(report.model_dump(mode="json"), "report.json")
         mlflow.log_text(summary, "summary.md")
         mlflow.log_dict({"feature_columns": list(report.columns)}, "columns.json")
+        return str(run.info.run_id)
+
+
+def duplicate_metrics(report: DuplicateReport) -> dict[str, float]:
+    """Counts of the run, flat."""
+    return {
+        "groups": float(len(report.groups)),
+        "pages_in_groups": float(report.pages_in_groups),
+        "non_canonical": float(report.non_canonical),
+        "largest_group": float(report.largest_group),
+        "seconds": report.seconds,
+    }
+
+
+def log_duplicates(report: DuplicateReport, summary: str) -> str:
+    """Log one duplicate grouping run with its description and every group's canonical and
+    copies; returns the MLflow run id."""
+    mlflow.set_experiment(analytics_experiment(report.tenant_id))
+    with mlflow.start_run(
+        run_name="duplicate pages",
+        tags={
+            "tenant_id": report.tenant_id,
+            "kind": "pipeline",
+            "stage": "duplicates",
+            "mlflow.note.content": summary,
+        },
+    ) as run:
+        mlflow.log_metrics(duplicate_metrics(report))
+        mlflow.log_dict(
+            {**report.model_dump(mode="json", exclude={"groups"}), "groups": len(report.groups)},
+            "report.json",
+        )
+        mlflow.log_text(summary, "summary.md")
+        mlflow.log_dict(
+            {"groups": [group.model_dump(mode="json") for group in report.groups]}, "groups.json"
+        )
         return str(run.info.run_id)

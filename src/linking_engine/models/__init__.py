@@ -33,6 +33,7 @@ from linking_engine.models.corpus import (
     TemplateInlinks,
     TemplateLink,
 )
+from linking_engine.models.duplicates import DuplicateGroup, DuplicateInput, DuplicateReport
 from linking_engine.models.embedding import (
     AnchorKeyUpdate,
     EdgeRef,
@@ -109,6 +110,9 @@ __all__ = [
     "ContentGapFinding",
     "CrawlPage",
     "CtrCurve",
+    "DuplicateGroup",
+    "DuplicateInput",
+    "DuplicateReport",
     "EdgeRef",
     "EmbedRunReport",
     "EmbeddingBatch",
