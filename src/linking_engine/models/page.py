@@ -81,6 +81,12 @@ class Page(BaseModel):
     # real assignment meaning "in no dense region", not a missing value.
     hub_id: int | None = None
 
+    # ── exact duplicates ────────────────────────────────────────────────────
+    # The group of crawled pages serving this page's body in its language, and whether this is
+    # the group's canonical copy; both None outside any group.
+    duplicate_group: int | None = Field(default=None, ge=0)
+    is_canonical: bool | None = None
+
     # ── embedding ───────────────────────────────────────────────────────────
     # Reserved: chunked embedding is not in the MVP and this is always False.
     is_chunked: bool = False

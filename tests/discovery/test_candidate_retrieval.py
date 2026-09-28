@@ -60,6 +60,8 @@ class FakeGraph:
     placeholders: tuple[str, ...] = ()
     # Crawled pages' languages; a page left out has none, as on a tenant without languages.
     languages: dict[str, str] = field(default_factory=dict)
+    # Pages stored as non-canonical duplicate copies.
+    copies: frozenset[str] = frozenset()
     reads: list[tuple[str, str, str | None]] = field(default_factory=list)
 
     async def candidate_targets(
@@ -81,6 +83,10 @@ class FakeGraph:
     ) -> dict[str, npt.NDArray[np.float32]]:
         self.reads.append(("page_vectors", tenant_id, index))
         return {u: np.asarray(self.vectors[u], dtype=np.float32) for u in sorted(self.vectors)}
+
+    async def non_canonical_copies(self, tenant_id: str) -> frozenset[str]:
+        self.reads.append(("non_canonical_copies", tenant_id, None))
+        return self.copies
 
     async def page_languages(self, tenant_id: str) -> dict[str, str | None]:
         self.reads.append(("page_languages", tenant_id, None))
@@ -372,6 +378,7 @@ async def test_the_tenant_and_index_reach_every_read() -> None:
     assert sorted(graph.reads) == [
         ("candidate_targets", TENANT, "page_gnn"),
         ("link_graph", TENANT, None),
+        ("non_canonical_copies", TENANT, None),
         ("page_languages", TENANT, None),
         ("page_vectors", TENANT, "page_gnn"),
     ]
@@ -613,6 +620,41 @@ def test_the_summary_states_what_ran_and_what_it_found() -> None:
     assert "example.com" not in summary
 
 
+def test_duplicate_copies_count_as_excluded_and_are_not_targets() -> None:
+    a, b = kept(page("a"), 1), kept(page("b"), 1)
+
+    report = candidate_report(
+        TENANT,
+        "page_content",
+        2,
+        64,
+        selection_of(a, b, assumed=2),
+        3,
+        (a,),
+        non_canonical=frozenset({page("b"), page("not-a-target")}),
+        load_seconds=0.0,
+        search_seconds=0.0,
+        seconds=0.0,
+    )
+
+    assert (report.targets, report.indexable_assumed, report.non_canonical_excluded) == (1, 1, 2)
+    assert "2 non-canonical duplicate copies left out" in summarise_candidates(report)
+    with pytest.raises(ValueError, match="exactly the selection's targets"):
+        candidate_report(
+            TENANT,
+            "page_content",
+            2,
+            64,
+            selection_of(a, b),
+            3,
+            (a, b),
+            non_canonical=frozenset({page("b")}),
+            load_seconds=0.0,
+            search_seconds=0.0,
+            seconds=0.0,
+        )
+
+
 def test_targets_that_differ_from_the_selection_are_refused() -> None:
     a, b = kept(page("a"), 1), kept(page("b"), 1)
     with pytest.raises(ValueError, match="exactly the selection's targets"):
@@ -687,3 +729,53 @@ async def test_a_page_without_a_language_only_meets_pages_without_one() -> None:
 
     assert found[page("a")].sources == (page("b"),)
     assert found[page("c")].sources == (page("d"),)
+
+
+# ── duplicate copies ────────────────────────────────────────────────────────
+
+
+def one_article_at_three_urls() -> FakeGraph:
+    """An article at three urls with one vector, a near neighbour and an unrelated page."""
+    article = [1.0, 0.0, 0.0]
+    vectors = {
+        page("blog/post"): article,
+        page("post"): article,
+        page("news/post"): article,
+        page("near"): [0.9, 0.1, 0.0],
+        page("far"): [0.0, 0.0, 1.0],
+    }
+    return FakeGraph(
+        vectors,
+        links=[(page("post"), page("near")), (page("near"), page("far"))],
+        copies=frozenset({page("post"), page("news/post"), page("elsewhere")}),
+    )
+
+
+async def test_non_canonical_copies_are_neither_targets_nor_sources() -> None:
+    found = await retrieve(one_article_at_three_urls())
+
+    targets = by_url(found)
+    assert sorted(targets) == [page("blog/post"), page("far"), page("near")]
+    pairs = {(s, t) for t, candidates in targets.items() for s in candidates.sources}
+    assert pairs == {
+        (page("near"), page("blog/post")),
+        (page("far"), page("blog/post")),
+        (page("blog/post"), page("near")),
+        (page("far"), page("near")),
+        (page("blog/post"), page("far")),
+    }
+    # The copy's link to /near left with the copy: nothing else links there.
+    assert (targets[page("near")].linked, targets[page("near")].eligible) == (0, 2)
+    assert (targets[page("far")].linked, targets[page("far")].eligible) == (1, 1)
+    report = found.report
+    assert (report.source_pages, report.targets, report.non_canonical_excluded) == (3, 3, 2)
+
+
+async def test_without_stored_copies_every_duplicate_url_stays_in_the_pool() -> None:
+    graph = one_article_at_three_urls()
+    graph.copies = frozenset()
+
+    found = await retrieve(graph)
+
+    assert found.report.non_canonical_excluded == 0
+    assert by_url(found)[page("post")].sources[:2] == (page("blog/post"), page("news/post"))

@@ -1,5 +1,6 @@
 """Candidate retrieval: exact cosine search of every target against the tenant's own pages,
-keeping the nearest eligible sources per target only."""
+keeping the nearest eligible sources per target only. Non-canonical duplicate copies are
+left out of the pool, so they are neither targets nor sources."""
 
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ from linking_engine.errors import DatabaseReadError
 from linking_engine.models import CandidateReport, CandidateSet, TargetCandidates
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sequence
+    from collections.abc import Iterable, Mapping, Sequence, Set
 
     import numpy.typing as npt
 
@@ -173,12 +174,16 @@ def candidate_report(
     source_pages: int,
     targets: Sequence[TargetCandidates],
     *,
+    non_canonical: Set[str] = frozenset(),
     load_seconds: float,
     search_seconds: float,
     seconds: float,
 ) -> CandidateReport:
-    if sorted(t.target_url for t in targets) != sorted(t.url for t in selection.targets):
-        raise ValueError("targets must be exactly the selection's targets")
+    """``non_canonical`` are the duplicate copies left out of the pool; the selection's targets
+    among them are not targets."""
+    kept = [t for t in selection.targets if t.url not in non_canonical]
+    if sorted(t.target_url for t in targets) != sorted(t.url for t in kept):
+        raise ValueError("targets must be exactly the selection's targets that are not copies")
     counts = [len(t.sources) for t in targets]
     candidates = sum(counts)
     linked_nearer = sum(t.linked_nearer for t in targets)
@@ -191,8 +196,9 @@ def candidate_report(
         not_indexable=selection.not_indexable,
         without_vector=selection.without_vector,
         targets=len(targets),
-        indexable_assumed=sum(t.indexable_assumed for t in selection.targets),
+        indexable_assumed=sum(t.indexable_assumed for t in kept),
         source_pages=source_pages,
+        non_canonical_excluded=len(non_canonical),
         candidates=candidates,
         full_targets=sum(1 for count in counts if count >= per_target),
         short_targets=sum(1 for count in counts if 0 < count < per_target),
@@ -249,25 +255,29 @@ async def retrieve_candidates(
 
     started = time.perf_counter()
     selection = await graph.candidate_targets(tenant_id, index=index)
-    urls, pool = _pool(await graph.page_vectors(tenant_id, index=index), tenant_id, index)
+    vectors = await graph.page_vectors(tenant_id, index=index)
+    copies = await graph.non_canonical_copies(tenant_id)
     languages = await graph.page_languages(tenant_id)
     snapshot = await graph.link_graph(tenant_id)
     loaded = time.perf_counter()
 
     # Separate reads, so a page can lose its vector between them.
-    in_pool = set(urls)
-    missing = [t.url for t in selection.targets if t.url not in in_pool]
+    missing = [t.url for t in selection.targets if t.url not in vectors]
     if missing:
         raise DatabaseReadError(
             "neo4j",
             f"{len(missing)} targets of {tenant_id!r} have no vector in {index}, "
             f"first {missing[0]!r}",
         )
+    dropped = vectors.keys() & copies
+    urls, pool = _pool(
+        {url: vector for url, vector in vectors.items() if url not in dropped}, tenant_id, index
+    )
     targets = await asyncio.to_thread(
         nearest_eligible,
         urls,
         pool,
-        sorted(t.url for t in selection.targets),
+        sorted(t.url for t in selection.targets if t.url not in dropped),
         snapshot.links,
         per_target=per_target,
         chunk_size=chunk_size,
@@ -282,6 +292,7 @@ async def retrieve_candidates(
         selection,
         len(urls),
         targets,
+        non_canonical=dropped,
         load_seconds=round(loaded - started, 3),
         search_seconds=round(searched - loaded, 3),
         seconds=round(time.perf_counter() - started, 3),
@@ -296,8 +307,9 @@ def summarise_candidates(report: CandidateReport) -> str:
         f"Candidate retrieval for tenant {report.tenant_id}, exact search over the "
         f"{report.index} vectors: {report.targets} targets and {report.source_pages} source "
         f"pages of {report.crawled_pages} crawled ({report.not_indexable} not indexable, "
-        f"{report.without_vector} indexable without a vector; {report.indexable_assumed} of "
-        "the targets assumed indexable from a 2xx status)."
+        f"{report.without_vector} indexable without a vector, {report.non_canonical_excluded} "
+        f"non-canonical duplicate copies left out; {report.indexable_assumed} of the targets "
+        "assumed indexable from a 2xx status)."
     )
     timing = (
         f"{report.seconds:.1f} s: {report.load_seconds:.1f} s loading, "

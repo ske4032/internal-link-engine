@@ -14,10 +14,12 @@ from linking_engine.ml.tracking import (
     analytics_metrics,
     candidate_metrics,
     candidate_table,
+    duplicate_metrics,
     feature_metrics,
     keyword_metrics,
     log_analytics,
     log_candidates,
+    log_duplicates,
     log_features,
     log_keywords,
 )
@@ -26,6 +28,8 @@ from linking_engine.models import (
     CandidateSet,
     CentralityReport,
     CommunityReport,
+    DuplicateGroup,
+    DuplicateReport,
     FeatureReport,
     HubReport,
     KeywordReport,
@@ -231,6 +235,7 @@ def test_candidate_metrics_are_the_runs_results_without_settings_or_missing_valu
         "not_indexable": 1,
         "without_vector": 1,
         **COUNTS,
+        "non_canonical_excluded": 0,
         "load_seconds": 0.5,
         "search_seconds": 0.125,
         "seconds": 0.75,
@@ -483,3 +488,79 @@ def test_a_feature_run_logs_its_column_order_but_never_the_matrix(local_mlflow: 
         "columns.json",
     }
     assert load_dict(f"runs:/{run_id}/columns.json") == {"feature_columns": list(report.columns)}
+
+
+# ── duplicate pages ─────────────────────────────────────────────────────────
+
+
+def duplicate_report(tenant: str = "acme") -> DuplicateReport:
+    return DuplicateReport(
+        tenant_id=tenant,
+        groups=(
+            DuplicateGroup(
+                group_id=0,
+                canonical="example.com/blog/post",
+                copies=("example.com/news/post", "example.com/post"),
+            ),
+            DuplicateGroup(group_id=1, canonical="example.com/guide", copies=("example.com/g",)),
+        ),
+        pages_in_groups=5,
+        non_canonical=3,
+        largest_group=3,
+        seconds=0.25,
+        finished_at=datetime(2026, 9, 28, tzinfo=UTC),
+    )
+
+
+def test_duplicate_metrics_are_the_runs_counts() -> None:
+    assert duplicate_metrics(duplicate_report()) == {
+        "groups": 2,
+        "pages_in_groups": 5,
+        "non_canonical": 3,
+        "largest_group": 3,
+        "seconds": 0.25,
+    }
+
+
+def test_a_duplicate_run_logs_every_group_to_the_tenants_experiment(local_mlflow: str) -> None:
+    report = duplicate_report()
+
+    run_id = log_duplicates(report, "Exact duplicate pages of tenant acme.")
+
+    client = MlflowClient(local_mlflow)
+    run = client.get_run(run_id)
+    assert client.get_experiment(run.info.experiment_id).name == analytics_experiment("acme")
+    assert run.info.run_name == "duplicate pages"
+    assert {k: v for k, v in run.data.tags.items() if not k.startswith("mlflow.")} == {
+        "tenant_id": "acme",
+        "kind": "pipeline",
+        "stage": "duplicates",
+    }
+    assert run.data.tags["mlflow.note.content"] == "Exact duplicate pages of tenant acme."
+    assert run.data.metrics == duplicate_metrics(report)
+    assert {a.path for a in client.list_artifacts(run_id)} == {
+        "report.json",
+        "summary.md",
+        "groups.json",
+    }
+    artifacts = f"runs:/{run_id}"
+    assert load_dict(f"{artifacts}/report.json") == {
+        "tenant_id": "acme",
+        "groups": 2,
+        "pages_in_groups": 5,
+        "non_canonical": 3,
+        "largest_group": 3,
+        "seconds": 0.25,
+        "finished_at": "2026-09-28T00:00:00Z",
+    }
+    assert load_dict(f"{artifacts}/groups.json") == {
+        "groups": [
+            {
+                "group_id": 0,
+                "canonical": "example.com/blog/post",
+                "copies": ["example.com/news/post", "example.com/post"],
+            },
+            {"group_id": 1, "canonical": "example.com/guide", "copies": ["example.com/g"]},
+        ]
+    }
+    assert load_text(f"{artifacts}/summary.md") == "Exact duplicate pages of tenant acme."

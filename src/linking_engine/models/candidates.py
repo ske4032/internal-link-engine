@@ -1,8 +1,8 @@
 """Candidate retrieval: the pages that could link to each target, before any ranking.
 
-Eligibility is three hard constraints and nothing else: the target is indexable, the
-source is not the target, and the source does not already link to the target. Every
-other consideration is a ranker feature.
+Eligibility is four hard constraints and nothing else: the target is indexable, the
+source is not the target, the source does not already link to the target, and neither
+is a non-canonical duplicate copy. Every other consideration is a ranker feature.
 
 Urls are kept verbatim, as stored, because some tenants store bare paths that are not
 url keys.
@@ -96,8 +96,10 @@ class CandidateReport(BaseModel):
     without_vector: int = Field(ge=0)
     targets: int = Field(ge=0)
     indexable_assumed: int = Field(ge=0)
-    # Crawled pages with a vector: every one is a possible source.
+    # Crawled pages with a vector: every one is a possible source, except non-canonical
+    # duplicate copies, which are neither sources nor targets.
     source_pages: int = Field(ge=0)
+    non_canonical_excluded: int = Field(default=0, ge=0)
     candidates: int = Field(ge=0)
     # Targets that reached the cap, got fewer, and got none.
     full_targets: int = Field(ge=0)

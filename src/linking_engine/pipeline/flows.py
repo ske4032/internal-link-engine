@@ -24,11 +24,18 @@ from linking_engine.graph.repo import GraphRepo
 from linking_engine.ingest.graph_load import load_tenant_graph
 from linking_engine.ingest.mongo_repo import CrawlSource, MongoRepo
 from linking_engine.ingest.prepare import BOILERPLATE_SHARE, NAV_SHARE, prepare_tenant
-from linking_engine.ml.tracking import log_analytics, log_candidates, log_features, log_keywords
+from linking_engine.ml.tracking import (
+    log_analytics,
+    log_candidates,
+    log_duplicates,
+    log_features,
+    log_keywords,
+)
 from linking_engine.models import (
     CandidateSet,
     CentralityReport,
     CommunityReport,
+    DuplicateReport,
     EmbedRunReport,
     FeatureReport,
     GraphLoadReport,
@@ -46,6 +53,7 @@ from linking_engine.pipeline.analytics import (
     compute_hubs,
     summarise,
 )
+from linking_engine.pipeline.duplicates import find_duplicates, summarise_duplicates
 from linking_engine.pipeline.embed import FLUSH_SIZE, embed_tenant
 from linking_engine.pipeline.embed_links import embed_links
 from linking_engine.pipeline.features import CACHE_DIR, assemble_features
@@ -350,6 +358,25 @@ async def load_graph_task(tenant_id: str) -> tuple[GraphLoadReport, TenantGraphC
         return report, await graph.counts(tenant_id)
 
 
+# Regrouped from the stored graph and written in one transaction, so a retry converges.
+@task(
+    name="find-duplicates",
+    retries=1,
+    retry_delay_seconds=30,
+    retry_condition_fn=is_transient,
+    cache_policy=NONE,
+)
+async def duplicates_task(tenant_id: str) -> DuplicateReport:
+    async with await neo4j() as graph:
+        await graph.check_server()
+        return await find_duplicates(graph, tenant_id)
+
+
+@task(name="mlflow-log-duplicates", cache_policy=NONE)
+def log_duplicates_task(report: DuplicateReport) -> str:
+    return log_duplicates(report, summarise_duplicates(report))
+
+
 # Separate flows, like embedding: a failure shows as either the prepare or the load flow.
 @flow(name="prepare-corpus")
 async def prepare_corpus_flow(
@@ -385,14 +412,21 @@ async def prepare_corpus_flow(
 
 
 @flow(name="load-graph")
-async def load_graph_flow(tenant_id: str) -> tuple[GraphLoadReport, TenantGraphCounts]:
+async def load_graph_flow(
+    tenant_id: str,
+) -> tuple[GraphLoadReport, TenantGraphCounts, DuplicateReport, str]:
+    """Pages and body links loaded into Neo4j, then exact duplicates grouped, which needs the
+    inbound links; the duplicate groups are logged to MLflow."""
     logger = get_run_logger()
     with bound_contextvars(run_id=str(flow_run.id)):
         logger.info("loading the graph of tenant %s", tenant_id)
         report, counts = await load_graph_task(tenant_id)
+        duplicates = await duplicates_task(tenant_id)
+        mlflow_run = log_duplicates_task(duplicates)
     logger.info(
         "%d pages, %d placeholders, %d links; skipped %d external and %d self links; "
-        "%d stale links deleted; %d broken pages, %d FIX links",
+        "%d stale links deleted; %d broken pages, %d FIX links; %d duplicate groups over %d "
+        "pages, %d non-canonical copies; mlflow run %s",
         report.pages,
         report.placeholders,
         report.links,
@@ -401,8 +435,12 @@ async def load_graph_flow(tenant_id: str) -> tuple[GraphLoadReport, TenantGraphC
         report.stale_links_deleted,
         counts.broken_pages,
         counts.fix_links,
+        len(duplicates.groups),
+        duplicates.pages_in_groups,
+        duplicates.non_canonical,
+        mlflow_run,
     )
-    return report, counts
+    return report, counts, duplicates, mlflow_run
 
 
 # Each source's keyword edges are replaced whole, so a retry converges on the same edges.

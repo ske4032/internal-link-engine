@@ -31,6 +31,7 @@ from linking_engine.errors import (
 )
 from linking_engine.models import (
     CommunityContext,
+    DuplicateInput,
     EmbeddingModelCount,
     EmbeddingSelection,
     EmbeddingTarget,
@@ -55,6 +56,7 @@ if TYPE_CHECKING:
 
     from linking_engine.models import (
         AnchorKeyUpdate,
+        DuplicateGroup,
         EdgeRef,
         HubCentroid,
         KeywordTarget,
@@ -113,6 +115,8 @@ PAGE_PROPERTIES: Final = {
     "is_dead_end": "isDeadEnd",
     "orphan_label": "orphanLabel",
     "hub_id": "hubId",
+    "duplicate_group": "duplicateGroup",
+    "is_canonical": "isCanonical",
     "is_chunked": "isChunked",
     "embedding_model": "embeddingModel",
     "embedding_dimensions": "embeddingDimensions",
@@ -411,6 +415,48 @@ _PAGE_LANGUAGES: Final = """
 MATCH (p:Page {tenantId: $tenant})
 WHERE NOT coalesce(p.isPlaceholder, false)
 RETURN p.url AS url, p.language AS language
+"""
+# Crawled 2xx pages with a body, grouped by (body, language) in the query so inbound links are
+# counted for pages sharing a body only. Null languages group together. Indexable follows the
+# candidate-target rule, and every page here is 2xx, so a page without a flag is indexable.
+_DUPLICATE_INPUTS: Final = """
+MATCH (p:Page {tenantId: $tenant})
+WHERE NOT coalesce(p.isPlaceholder, false)
+  AND 200 <= p.statusCode <= 299
+  AND p.bodyHash IS NOT NULL
+  AND coalesce(p.wordCount, 0) > 0
+WITH p.bodyHash AS body_hash, p.language AS language, collect(p) AS pages
+WHERE size(pages) > 1
+UNWIND pages AS p
+RETURN p.url AS url,
+       body_hash,
+       language,
+       coalesce(p.isIndexable, true) AS indexable,
+       COUNT {
+         MATCH (s:Page {tenantId: $tenant})-[:LINKS_TO]->(p)
+         WHERE s <> p AND NOT coalesce(s.isPlaceholder, false)
+         RETURN DISTINCT s
+       } AS inbound
+ORDER BY url
+"""
+_WRITE_DUPLICATES: Final = """
+UNWIND $rows AS row
+MATCH (p:Page {tenantId: $tenant, url: row.url})
+WHERE NOT coalesce(p.isPlaceholder, false)
+SET p.duplicateGroup = row.group, p.isCanonical = row.canonical
+RETURN count(p) AS n
+"""
+# Pages outside every group keep no stale group or flag.
+_CLEAR_DUPLICATES: Final = """
+MATCH (p:Page {tenantId: $tenant})
+WHERE (p.duplicateGroup IS NOT NULL OR p.isCanonical IS NOT NULL) AND NOT p.url IN $urls
+REMOVE p.duplicateGroup, p.isCanonical
+RETURN count(p) AS n
+"""
+_NON_CANONICAL_COPIES: Final = """
+MATCH (p:Page {tenantId: $tenant})
+WHERE p.isCanonical = false AND NOT coalesce(p.isPlaceholder, false)
+RETURN p.url AS url
 """
 _KEYWORD_EDGE_PAGES: Final = """
 MATCH (p:Page {tenantId: $tenant})-[:TARGETS_KEYWORD {source: $source}]->()
@@ -1000,6 +1046,37 @@ class GraphRepo:
             _WRITE_COMMUNITIES, _CLEAR_PLACEHOLDER_COMMUNITIES, tenant_id, chunks
         )
 
+    async def write_duplicate_groups(
+        self,
+        tenant_id: str,
+        groups: Sequence[DuplicateGroup],
+        *,
+        batch_size: int = CENTRALITY_BATCH,
+    ) -> int:
+        """Store every group's pages and canonical flags, and clear both on every other page,
+        in one transaction; a url that is not a crawled page rolls it all back. Returns the
+        pages written."""
+        _require_tenant(tenant_id)
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        ids = [group.group_id for group in groups]
+        if len(set(ids)) != len(ids):
+            raise ValueError("one row per group: duplicate group ids")
+        rows: list[Row] = [
+            {"url": url, "group": group.group_id, "canonical": url == group.canonical}
+            for group in groups
+            for url in (group.canonical, *group.copies)
+        ]
+        urls = [row["url"] for row in rows]
+        if len(set(urls)) != len(urls):
+            raise ValueError("a page can belong to one group only")
+        chunks = [list(chunk) for chunk in batched(rows, batch_size)]
+        try:
+            async with self._driver.session(default_access_mode=WRITE_ACCESS) as session:
+                return await session.execute_write(_write_duplicate_rows, tenant_id, chunks)
+        except (Neo4jError, DriverError) as error:
+            raise _translate(error, write=True) from error
+
     async def _write_pages(
         self,
         write: LiteralString,
@@ -1254,6 +1331,25 @@ class GraphRepo:
             languages[url] = language
         return languages
 
+    async def duplicate_inputs(self, tenant_id: str) -> list[DuplicateInput]:
+        """The crawled 2xx pages with a non-empty body that share their body hash with another
+        such page of their language, whether each is indexable, and their inbound body links
+        from distinct crawled pages; ordered by url."""
+        _require_tenant(tenant_id)
+        rows = await self._read(_DUPLICATE_INPUTS, tenant=tenant_id)
+        try:
+            return [DuplicateInput.model_validate(row) for row in rows]
+        except ValidationError as error:
+            raise DatabaseReadError(
+                "neo4j", f"duplicate inputs of {tenant_id!r}: {error}"
+            ) from error
+
+    async def non_canonical_copies(self, tenant_id: str) -> frozenset[str]:
+        """Urls of the tenant's crawled pages stored as non-canonical duplicate copies."""
+        _require_tenant(tenant_id)
+        rows = await self._read(_NON_CANONICAL_COPIES, tenant=tenant_id)
+        return frozenset(str(row["url"]) for row in rows)
+
     async def community_context(self, tenant_id: str) -> list[CommunityContext]:
         """Template inlink counts and the previous run's community ids of every crawled page."""
         _require_tenant(tenant_id)
@@ -1464,6 +1560,23 @@ async def _write_page_rows(
             "rows whose page is missing or a placeholder are dropped",
         )
     await _collect(tx, clear, {"tenant": tenant_id})
+    return written
+
+
+async def _write_duplicate_rows(
+    tx: AsyncManagedTransaction, tenant_id: str, chunks: list[list[Row]]
+) -> int:
+    urls = [row["url"] for rows in chunks for row in rows]
+    await _collect(tx, _CLEAR_DUPLICATES, {"tenant": tenant_id, "urls": urls})
+    written = 0
+    for rows in chunks:
+        written += _int(await _collect(tx, _WRITE_DUPLICATES, {"tenant": tenant_id, "rows": rows}))
+    if written != len(urls):
+        raise DatabaseWriteError(
+            "neo4j",
+            f"wrote {written} of {len(urls)} duplicate pages, rolled back; "
+            "rows whose page is missing or a placeholder are dropped",
+        )
     return written
 
 
