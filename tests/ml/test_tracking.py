@@ -10,6 +10,8 @@ from mlflow import MlflowClient
 from mlflow.artifacts import load_dict, load_text
 
 from linking_engine.ml.tracking import (
+    EXPERIMENT_KIND,
+    EXPERIMENT_KIND_TAG,
     analytics_experiment,
     analytics_metrics,
     candidate_metrics,
@@ -152,12 +154,26 @@ def test_a_run_is_logged_to_the_tenants_experiment_with_its_description(local_ml
     run = client.get_run(run_id)
     experiment = client.get_experiment(run.info.experiment_id)
     assert experiment.name == analytics_experiment("acme") == "analytics-acme"
+    assert experiment.tags[EXPERIMENT_KIND_TAG] == EXPERIMENT_KIND == "custom_model_development"
     assert run.data.tags["mlflow.note.content"] == "Graph analytics for tenant acme."
     assert run.data.tags["tenant_id"] == "acme"
     assert run.data.params["resolution"] == "1.0"
     assert run.data.metrics["content_pages"] == 30
     assert run.data.params["hub_min_samples"] == "1"
     assert {a.path for a in client.list_artifacts(run_id)} == {"report.json", "summary.md"}
+
+
+def test_an_existing_experiment_without_a_kind_is_tagged_for_the_model_training_view(
+    local_mlflow: str,
+) -> None:
+    client = MlflowClient(local_mlflow)
+    experiment_id = client.create_experiment(analytics_experiment("acme"))
+    assert EXPERIMENT_KIND_TAG not in client.get_experiment(experiment_id).tags
+
+    run_id = log_analytics(*reports(), "Graph analytics for tenant acme.")
+
+    assert client.get_run(run_id).info.experiment_id == experiment_id
+    assert client.get_experiment(experiment_id).tags[EXPERIMENT_KIND_TAG] == EXPERIMENT_KIND
 
 
 def test_reports_from_two_tenants_are_refused(local_mlflow: str) -> None:
