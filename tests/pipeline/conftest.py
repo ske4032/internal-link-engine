@@ -6,10 +6,12 @@ from pathlib import Path
 
 import pytest
 
-# voyage_fakes lives beside the client tests; pytest only puts a test file's own directory on sys.path.
-_FAKES_DIR = str(Path(__file__).resolve().parent.parent / "embedding")
-if _FAKES_DIR not in sys.path:
-    sys.path.insert(0, _FAKES_DIR)
+# voyage_fakes lives beside the client tests and quality_factories beside the model tests;
+# pytest only puts a test file's own directory on sys.path.
+for _name in ("embedding", "models"):
+    _dir = str(Path(__file__).resolve().parent.parent / _name)
+    if _dir not in sys.path:
+        sys.path.insert(0, _dir)
 
 
 @pytest.fixture(autouse=True)

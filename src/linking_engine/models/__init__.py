@@ -10,6 +10,7 @@ neo4j, motor, voyageai, prefect, mlflow and igraph: models describe data, they d
 not fetch it, compute it, or log it.
 """
 
+from linking_engine.models.anchors import AnchorMatch, AnchorReport, ExtractionSettings
 from linking_engine.models.audit import LinkAuditResult
 from linking_engine.models.bridges import BridgeLink, BridgeReport, HubPair
 from linking_engine.models.candidates import (
@@ -51,6 +52,7 @@ from linking_engine.models.embedding import (
 )
 from linking_engine.models.enums import (
     ActionType,
+    AnchorRung,
     AnchorType,
     BridgeReason,
     ClusterAgreement,
@@ -81,6 +83,26 @@ from linking_engine.models.page import (
     PassReport,
     TenantGraphCounts,
 )
+from linking_engine.models.quality import (
+    AnchorMatchCheck,
+    CheckName,
+    CoverageCheck,
+    FeatureAuc,
+    FeatureSignalCheck,
+    KeywordCheck,
+    KeywordExtractability,
+    KeywordRelevance,
+    LinkRelevanceCheck,
+    QualityAlert,
+    QualityBaseline,
+    QualityReport,
+    QualityVersions,
+    RankRelevance,
+    RecallAtK,
+    RelevanceGroup,
+    RetrievalCheck,
+    ScorerCheck,
+)
 from linking_engine.models.recommendation import AnchorCandidate, Recommendation
 from linking_engine.models.relevance import LinkRelevance, LinkRelevanceReport, ScoreDistribution
 from linking_engine.models.scoring import FeatureWeight, ScoreReport, ScorerWeights
@@ -100,7 +122,11 @@ __all__ = [
     "ActionType",
     "AnchorCandidate",
     "AnchorKeyUpdate",
+    "AnchorMatch",
+    "AnchorMatchCheck",
+    "AnchorReport",
     "AnchorRules",
+    "AnchorRung",
     "AnchorType",
     "AnchorTypeProfile",
     "BridgeLink",
@@ -110,11 +136,13 @@ __all__ = [
     "CandidateSet",
     "CandidateTarget",
     "CentralityReport",
+    "CheckName",
     "CleanedPage",
     "ClusterAgreement",
     "CommunityContext",
     "CommunityReport",
     "ContentGapFinding",
+    "CoverageCheck",
     "CrawlPage",
     "CtrCurve",
     "DuplicateGroup",
@@ -127,7 +155,10 @@ __all__ = [
     "EmbeddingSelection",
     "EmbeddingTarget",
     "ExtractedLink",
+    "ExtractionSettings",
+    "FeatureAuc",
     "FeatureReport",
+    "FeatureSignalCheck",
     "FeatureWeight",
     "GraphLoadReport",
     "GscMetrics",
@@ -139,6 +170,9 @@ __all__ = [
     "HubReport",
     "IssueFlag",
     "Keyword",
+    "KeywordCheck",
+    "KeywordExtractability",
+    "KeywordRelevance",
     "KeywordReport",
     "KeywordRung",
     "KeywordSource",
@@ -151,6 +185,7 @@ __all__ = [
     "LinkGraphSnapshot",
     "LinkRecord",
     "LinkRelevance",
+    "LinkRelevanceCheck",
     "LinkRelevanceReport",
     "LinkText",
     "OrphanLabel",
@@ -169,12 +204,21 @@ __all__ = [
     "PairSignals",
     "PassReport",
     "PrepareReport",
+    "QualityAlert",
+    "QualityBaseline",
+    "QualityReport",
+    "QualityVersions",
     "QueryParamEvidence",
+    "RankRelevance",
+    "RecallAtK",
     "Recommendation",
     "RecommendationStatus",
+    "RelevanceGroup",
     "ResolvedKeyword",
+    "RetrievalCheck",
     "ScoreDistribution",
     "ScoreReport",
+    "ScorerCheck",
     "ScorerWeights",
     "SentenceTarget",
     "SignalReport",

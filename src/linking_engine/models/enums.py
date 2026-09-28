@@ -108,6 +108,15 @@ class ClusterAgreement(StrEnum):
     UNKNOWN_TOPIC = "UNKNOWN_TOPIC"
 
 
+class AnchorRung(StrEnum):
+    """Which rung of the extraction ladder found an anchor phrase in the source copy, in order:
+    the keyword verbatim, a stemmed variant, then an overlapping set of stems."""
+
+    EXACT = "EXACT"
+    STEMMED = "STEMMED"
+    STEM_SET = "STEM_SET"
+
+
 class BridgeReason(StrEnum):
     """Why a hub pair is proposed a bridge."""
 

@@ -254,6 +254,40 @@ async def test_page_records_read_back_whole_with_language_and_depth(
 
 
 @pytest.mark.integration
+async def test_page_records_read_only_the_given_urls_a_batch_at_a_time(
+    mongo: MongoRepo, tenant: str
+) -> None:
+    other = f"{tenant}-other"
+    pages = [record(f"/p{i}") for i in range(5)]
+    await mongo.write_pages(tenant, pages, [])
+    await mongo.write_pages(other, [record("/p0"), record("/p1")], [])
+    wanted = [url("/p3"), url("/p0"), url("/p3"), url("/p1"), url("/missing")]
+
+    batches = [b async for b in mongo.iter_page_records(tenant, batch_size=2, urls=wanted)]
+
+    # Four distinct urls, two per lookup; /missing is simply absent.
+    assert sorted((r for b in batches for r in b), key=lambda r: str(r.url)) == [
+        pages[0],
+        pages[1],
+        pages[3],
+    ]
+    assert max(len(b) for b in batches) <= 2
+    assert [b async for b in mongo.iter_page_records(tenant, urls=[])] == []
+    await mongo.delete_tenant(other)
+
+
+@pytest.mark.parametrize("urls", [None, [url("/a")]])
+async def test_page_records_refuse_an_empty_batch_before_any_read(urls: list[str] | None) -> None:
+    offline = MongoRepo(
+        AsyncMongoClient("mongodb://127.0.0.1:1", serverSelectionTimeoutMS=200),
+        "linking_engine_test",
+    )
+    with pytest.raises(ValueError, match="batch_size"):
+        _ = [b async for b in offline.iter_page_records("acme", batch_size=0, urls=urls)]
+    await offline.close()
+
+
+@pytest.mark.integration
 async def test_tenants_are_isolated(mongo: MongoRepo, tenant: str) -> None:
     other = f"{tenant}-other"
     for t in (tenant, other):

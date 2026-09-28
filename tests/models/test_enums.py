@@ -15,6 +15,7 @@ import pytest
 
 from linking_engine.models.enums import (
     ActionType,
+    AnchorRung,
     AnchorType,
     BridgeReason,
     ClusterAgreement,
@@ -49,6 +50,7 @@ ENUM_CASES = [
     (KeywordSource, ("CLIENT_STRATEGIC", "GSC_OBSERVED", "INFERRED")),
     (KeywordRung, ("STRATEGIC", "GSC", "H1", "TITLE")),
     (BridgeReason, ("SPANNING_TREE", "NEAREST_HUB", "BRIDGE_GAP")),
+    (AnchorRung, ("EXACT", "STEMMED", "STEM_SET")),
     (
         ClusterAgreement,
         (

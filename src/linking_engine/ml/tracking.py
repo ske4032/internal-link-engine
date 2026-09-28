@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 import time
 from importlib.metadata import version
 from typing import TYPE_CHECKING
@@ -11,6 +12,13 @@ from typing import TYPE_CHECKING
 import mlflow
 from mlflow.entities import Metric
 
+from linking_engine.anchor.extraction import (
+    MAX_INNER_STOP_WORDS,
+    MAX_SPAN,
+    MIN_SHARED_STEMS,
+    MIN_SPAN,
+    SNOWBALL,
+)
 from linking_engine.anchor.keywords import (
     BRAND_SUFFIX_SHARE,
     MAX_KEYWORD_TOKENS,
@@ -30,6 +38,7 @@ from linking_engine.discovery.bridges import (
     SHARED_QUERIES,
     TOP_GAP_PAIRS,
 )
+from linking_engine.discovery.candidates import PER_TARGET
 from linking_engine.discovery.features import POSITION_BANDS
 from linking_engine.graph.algorithms import (
     DAMPING,
@@ -44,6 +53,20 @@ from linking_engine.graph.algorithms import (
     STABILITY_SEEDS,
 )
 from linking_engine.gsc import MIN_CURVE_IMPRESSIONS, MIN_CURVE_ROWS
+from linking_engine.ml.quality import (
+    ALERT_BAND,
+    ANCHOR_JACCARD,
+    HIDE_SEED,
+    HIDE_SHARE,
+    LINK_DERIVED_COLUMNS,
+    QUALITY_STAGE,
+    RECALL_KS,
+    SIGNAL_MARGIN,
+    has_signal,
+    quality_metrics,
+)
+from linking_engine.models import QualityBaseline
+from linking_engine.models.anchors import SENTENCE_INDEX_BINS
 from linking_engine.models.relevance import HISTOGRAM_BINS
 from linking_engine.models.scoring import SCORE_HISTOGRAM_BINS
 
@@ -51,6 +74,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from linking_engine.models import (
+        AnchorReport,
         BridgeReport,
         CandidateReport,
         CandidateSet,
@@ -62,6 +86,7 @@ if TYPE_CHECKING:
         HubReport,
         KeywordReport,
         LinkRelevanceReport,
+        QualityReport,
         ScoreDistribution,
         ScoreReport,
     )
@@ -174,6 +199,8 @@ def log_analytics(
 
 
 _CANDIDATE_PARAMS = ("index", "per_target", "chunk_size")
+# Finished quality-eval runs looked at for the tenant's latest.
+_BASELINE_CANDIDATES = 10
 
 
 def candidate_metrics(report: CandidateReport) -> dict[str, float]:
@@ -622,3 +649,290 @@ def log_bridges(report: BridgeReport, pairs: Sequence[HubPair], summary: str) ->
         mlflow.log_dict(report.model_dump(mode="json"), "report.json")
         mlflow.log_text(summary, "summary.md")
         return str(run.info.run_id)
+
+
+def anchor_metrics(report: AnchorReport) -> dict[str, float]:
+    """Every count of the run, flat: per rung (``rung_<rung>``), per best rung
+    (``best_rung_<rung>``) and per keyword rank (``keyword_rank_<n>``), plus the match shares
+    of the pairs with a ranked keyword set."""
+    metrics: dict[str, float] = {
+        name: float(value)
+        for name, value in report.model_dump(
+            exclude={
+                "tenant_id",
+                "stem_set_threshold",
+                "by_rung",
+                "best_rung",
+                "by_keyword_rank",
+                "by_rung_and_rank",
+                "stem_jaccard_histogram",
+                "sentence_index_histogram",
+                "stemmed_languages",
+                "unstemmed_languages",
+                "finished_at",
+            }
+        ).items()
+    }
+    metrics.update({f"rung_{rung.value.lower()}": float(n) for rung, n in report.by_rung.items()})
+    metrics.update(
+        {f"best_rung_{rung.value.lower()}": float(n) for rung, n in report.best_rung.items()}
+    )
+    metrics.update({f"keyword_rank_{rank}": float(n) for rank, n in report.by_keyword_rank.items()})
+    if report.pairs_with_keywords:
+        metrics["matched_share"] = report.pairs_matched / report.pairs_with_keywords
+        metrics["primary_matched_share"] = report.primary_matched / report.pairs_with_keywords
+    return metrics
+
+
+def anchor_language_table(report: AnchorReport) -> dict[str, list[object]]:
+    """Source pages per language, and whether a stemmer covered it."""
+    rows = sorted(
+        [(language, True, n) for language, n in report.stemmed_languages.items()]
+        + [(language, False, n) for language, n in report.unstemmed_languages.items()]
+    )
+    return {
+        "language": [language for language, _, _ in rows],
+        "stemmed": [stemmed for _, stemmed, _ in rows],
+        "source_pages": [n for _, _, n in rows],
+    }
+
+
+def anchor_rank_table(report: AnchorReport) -> dict[str, list[object]]:
+    """Matches per rung and keyword rank, one row each."""
+    rows = [
+        (rung.value, rank, count)
+        for rung, ranks in report.by_rung_and_rank.items()
+        for rank, count in ranks.items()
+    ]
+    return {
+        "rung": [rung for rung, _, _ in rows],
+        "keyword_rank": [rank for _, rank, _ in rows],
+        "matches": [count for _, _, count in rows],
+    }
+
+
+def log_anchors(report: AnchorReport, summary: str) -> str:
+    """Log one anchor extraction run from its report: counts, shares, the stem set Jaccard and
+    sentence position histograms as step-indexed metrics (step = bin), and tables; never urls,
+    phrases or sentences. Returns the MLflow run id."""
+    use_analytics_experiment(report.tenant_id)
+    with mlflow.start_run(
+        run_name="anchor extraction",
+        tags={
+            "tenant_id": report.tenant_id,
+            "kind": "pipeline",
+            "stage": "anchor-extraction",
+            "mlflow.note.content": summary,
+        },
+    ) as run:
+        mlflow.log_params(
+            {
+                "stem_set_threshold": report.stem_set_threshold,
+                "min_span": MIN_SPAN,
+                "max_span": MAX_SPAN,
+                "min_shared_stems": MIN_SHARED_STEMS,
+                "max_inner_stop_words": MAX_INNER_STOP_WORDS,
+                "stemmer_languages": ",".join(sorted(SNOWBALL)),
+                "sentence_index_bins": ",".join(map(str, SENTENCE_INDEX_BINS)),
+            }
+        )
+        mlflow.log_metrics(anchor_metrics(report))
+        now = int(time.time() * 1000)
+        mlflow.MlflowClient().log_batch(
+            run.info.run_id,
+            metrics=[
+                Metric(name, float(count), now, step)
+                for name, histogram in (
+                    ("stem_jaccard_hist", report.stem_jaccard_histogram),
+                    ("sentence_index_hist", report.sentence_index_histogram),
+                )
+                for step, count in enumerate(histogram)
+            ],
+        )
+        mlflow.log_table(anchor_rank_table(report), "rung_by_rank.json")
+        mlflow.log_table(anchor_language_table(report), "languages.json")
+        mlflow.log_dict(report.model_dump(mode="json"), "report.json")
+        mlflow.log_text(summary, "summary.md")
+        return str(run.info.run_id)
+
+
+def _joined(names: Sequence[str]) -> str:
+    return ",".join(names) or "none"
+
+
+def quality_step_metrics(report: QualityReport) -> dict[str, tuple[int, ...]]:
+    """The report's distributions, each logged as a metric whose step is the bin and whose
+    value is the count."""
+    steps: dict[str, tuple[int, ...]] = {}
+    if report.scorer is not None:
+        steps["score_hist_hidden"] = report.scorer.hidden_histogram
+        steps["score_hist_other"] = report.scorer.other_histogram
+    if report.link_relevance is not None:
+        steps["context_relevance_hist"] = report.link_relevance.context.histogram
+        if report.link_relevance.anchor is not None:
+            steps["anchor_target_fit_hist"] = report.link_relevance.anchor.histogram
+    return steps
+
+
+def quality_tables(report: QualityReport) -> dict[str, dict[str, list[object]]]:
+    """The report's per-item results as MLflow tables, keyed by artifact file; column names,
+    ranks and counts only, never urls or keyword texts."""
+    tables: dict[str, dict[str, list[object]]] = {}
+    if (retrieval := report.retrieval) is not None:
+        tables["recall.json"] = {
+            "k": [entry.k for entry in retrieval.recall],
+            "recall": [entry.recall for entry in retrieval.recall],
+            "random": [entry.random for entry in retrieval.recall],
+        }
+    if (signal := report.feature_signal) is not None:
+        tables["feature_auc.json"] = {
+            "column": [entry.column for entry in signal.columns],
+            "auc": [entry.auc for entry in signal.columns],
+            "coverage": [entry.coverage for entry in signal.columns],
+            "ranker_auc": [entry.ranker_auc for entry in signal.columns],
+            "signal": [has_signal(entry, signal.margin) for entry in signal.columns],
+            "link_derived": [entry.column in LINK_DERIVED_COLUMNS for entry in signal.columns],
+        }
+    if (scorer := report.scorer) is not None:
+        width = 100 / SCORE_HISTOGRAM_BINS
+        tables["score_histogram.json"] = {
+            "bin": list(range(SCORE_HISTOGRAM_BINS)),
+            "low": [round(i * width, 6) for i in range(SCORE_HISTOGRAM_BINS)],
+            "high": [round((i + 1) * width, 6) for i in range(SCORE_HISTOGRAM_BINS)],
+            "hidden": list(scorer.hidden_histogram),
+            "other": list(scorer.other_histogram),
+        }
+    if (keywords := report.keywords) is not None:
+        tables["keyword_rungs.json"] = {
+            "rung": [rung.value for rung in keywords.by_rung],
+            "pages": list(keywords.by_rung.values()),
+        }
+        if keywords.fallbacks_rejected:
+            tables["keyword_rejections.json"] = {
+                "reason": list(keywords.fallbacks_rejected),
+                "fallbacks": list(keywords.fallbacks_rejected.values()),
+            }
+        if (relevance := keywords.relevance) is not None:
+            tables["keyword_relevance.json"] = {
+                "rank": [entry.rank for entry in relevance.ranks],
+                "keywords": [entry.keywords for entry in relevance.ranks],
+                "mean": [entry.mean for entry in relevance.ranks],
+                "p10": [entry.p10 for entry in relevance.ranks],
+                "p50": [entry.p50 for entry in relevance.ranks],
+                "p90": [entry.p90 for entry in relevance.ranks],
+            }
+            for name, column, groups in (
+                ("keyword_relevance_by_origin.json", "origin", relevance.by_origin),
+                ("keyword_relevance_by_length.json", "words", relevance.by_length),
+            ):
+                tables[name] = {
+                    column: [entry.group for entry in groups],
+                    "keywords": [entry.keywords for entry in groups],
+                    "mean": [entry.mean for entry in groups],
+                    "median": [entry.p50 for entry in groups],
+                }
+    if (links := report.link_relevance) is not None:
+        width = 1 / HISTOGRAM_BINS
+        scores = {"context_relevance": links.context}
+        if links.anchor is not None:
+            scores["anchor_target_fit"] = links.anchor
+        tables["relevance_histogram.json"] = {
+            "score": [name for name in scores for _ in range(HISTOGRAM_BINS)],
+            "bin": [step for _ in scores for step in range(HISTOGRAM_BINS)],
+            "low": [round(step * width, 6) for _ in scores for step in range(HISTOGRAM_BINS)],
+            "high": [
+                round((step + 1) * width, 6) for _ in scores for step in range(HISTOGRAM_BINS)
+            ],
+            "count": [count for found in scores.values() for count in found.histogram],
+        }
+    if report.alerts:
+        tables["alerts.json"] = {
+            "metric": [alert.metric for alert in report.alerts],
+            "previous": [alert.previous for alert in report.alerts],
+            "current": [alert.current for alert in report.alerts],
+            "change": [alert.change for alert in report.alerts],
+            "band": [alert.band for alert in report.alerts],
+            "relative": [alert.relative for alert in report.alerts],
+        }
+    return tables
+
+
+def previous_quality_run(tenant_id: str) -> QualityBaseline | None:
+    """The tenant's latest finished quality-eval run by end time, from its own experiment
+    only; None before the first. Read-only: a missing experiment is not created."""
+    experiment = mlflow.get_experiment_by_name(analytics_experiment(tenant_id))
+    if experiment is None:
+        return None
+    runs = mlflow.MlflowClient().search_runs(
+        [experiment.experiment_id],
+        filter_string=f"tags.stage = '{QUALITY_STAGE}' and attributes.status = 'FINISHED'",
+        order_by=["attributes.end_time DESC"],
+        max_results=_BASELINE_CANDIDATES,
+    )
+    for run in runs:
+        if run.data.tags.get("tenant_id") == tenant_id:
+            return QualityBaseline(
+                run_id=run.info.run_id,
+                metrics={
+                    name: float(value)
+                    for name, value in run.data.metrics.items()
+                    if math.isfinite(value)
+                },
+            )
+    return None
+
+
+def log_quality(report: QualityReport, summary: str) -> str:
+    """Log one quality evaluation: the flat metrics, the distributions as step-indexed
+    metrics (step = bin), tables, the report, the metrics and the description; not
+    applicable checks and alerts as comma-joined tags. Returns the MLflow run id."""
+    versions = report.versions
+    use_analytics_experiment(report.tenant_id)
+    with mlflow.start_run(
+        run_name="quality eval",
+        tags={
+            "tenant_id": report.tenant_id,
+            "kind": "eval",
+            "stage": QUALITY_STAGE,
+            "git_sha": versions.git_sha,
+            "feature_digest": versions.feature_digest,
+            "weights_version": versions.weights_version,
+            "weights_hash": versions.weights_hash,
+            "not_applicable": _joined(report.not_applicable),
+            "alerts": _joined([alert.metric for alert in report.alerts]),
+            "baseline_run": report.baseline_run_id or "none",
+            "mlflow.note.content": summary,
+        },
+    ) as run:
+        run_id = str(run.info.run_id)
+        mlflow.log_params(
+            {
+                "hide_share": HIDE_SHARE,
+                "hide_seed": HIDE_SEED,
+                "recall_ks": ",".join(map(str, RECALL_KS)),
+                "per_target": PER_TARGET,
+                "signal_margin": SIGNAL_MARGIN,
+                "anchor_jaccard": ANCHOR_JACCARD,
+                "alert_band": ALERT_BAND,
+                "link_derived_columns": ",".join(LINK_DERIVED_COLUMNS),
+            }
+        )
+        metrics = quality_metrics(report)
+        mlflow.log_metrics(metrics)
+        steps = quality_step_metrics(report)
+        if steps:
+            now = int(time.time() * 1000)
+            mlflow.MlflowClient().log_batch(
+                run_id,
+                metrics=[
+                    Metric(name, float(count), now, step)
+                    for name, counts in steps.items()
+                    for step, count in enumerate(counts)
+                ],
+            )
+        mlflow.log_dict(report.model_dump(mode="json"), "report.json")
+        mlflow.log_dict(metrics, "metrics.json")
+        mlflow.log_text(summary, "summary.md")
+        for artifact, table in quality_tables(report).items():
+            mlflow.log_table(table, artifact)
+        return run_id

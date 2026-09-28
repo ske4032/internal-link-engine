@@ -6,7 +6,13 @@ import pytest
 from mlflow import MlflowClient
 from mlflow.artifacts import load_dict, load_text
 from prefect.states import Failed
+from pydantic import ValidationError
 from pymongo import AsyncMongoClient
+from quality_seed import KEYWORDS, URLS, seed_quality
+from quality_seed import voyage as keyword_voyage
+from store_state import graph_state, mongo_state
+from test_anchor_stage import GUIDE
+from test_anchor_stage import seed as seed_anchors
 from test_bridge_stage import HUB_PAGES
 from test_bridge_stage import seed as seed_bridges
 from test_bridge_stage import url as bridge_url
@@ -772,3 +778,194 @@ async def test_hub_bridges_flow_writes_both_files_and_logs_one_run_without_urls(
     )
     pages = [bridge_url(name) for names in HUB_PAGES.values() for name in names]
     assert [u for u in pages if u in logged] == [], "page urls reached the MLflow run"
+
+
+@pytest.mark.integration
+async def test_anchor_extraction_flow_writes_the_anchors_and_logs_one_run_without_text(
+    graph: GraphRepo,
+    mongo: MongoRepo,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    await seed_anchors(graph, mongo, tenant)
+
+    report, path, run_id = await flows.anchor_extraction_flow(tenant, tmp_path / "anchors")
+
+    assert path == tmp_path / "anchors" / tenant / "anchors.parquet"
+    assert path.is_file()
+    assert report.matches > 0
+    client = MlflowClient(uri)
+    run = client.get_run(run_id)
+    assert (run.data.tags["tenant_id"], run.data.tags["stage"]) == (tenant, "anchor-extraction")
+    assert run.data.metrics["matches"] == report.matches
+    assert len(client.get_metric_history(run_id, "sentence_index_hist")) == 7
+    logged = " ".join(
+        [
+            *map(str, run.data.params.values()),
+            *map(str, run.data.tags.values()),
+            str(load_dict(f"runs:/{run_id}/rung_by_rank.json")),
+            str(load_dict(f"runs:/{run_id}/languages.json")),
+            load_text(f"runs:/{run_id}/report.json"),
+            load_text(f"runs:/{run_id}/summary.md"),
+        ]
+    )
+    texts = ["example.com/g", "example.com/s", "trail shoes", "running shoes", GUIDE]
+    assert [text for text in texts if text in logged] == [], "text reached the MLflow run"
+
+
+# ── quality eval ────────────────────────────────────────────────────────────
+
+# A deliberately low-entropy stand-in for a Voyage API key.
+VOYAGE_KEY = "f" * 64
+
+
+def test_keyword_voyage_is_none_without_an_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(flows, "voyage_client", lambda _tenant: pytest.fail("no key, no client"))
+    assert flows.keyword_voyage("test-tenant") is None
+
+
+def test_keyword_voyage_is_the_tenants_client_with_a_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VOYAGE_API_KEY", VOYAGE_KEY)
+    voyage = flows.keyword_voyage("test-tenant")
+    assert voyage is not None
+    assert (voyage.model, voyage.dimension) == ("voyage-4-large", 2048)
+
+
+@pytest.mark.parametrize("with_key", [True, False], ids=["with-key", "without-key"])
+def test_keyword_voyage_raises_on_any_other_settings_error(
+    monkeypatch: pytest.MonkeyPatch, with_key: bool
+) -> None:
+    if with_key:
+        monkeypatch.setenv("VOYAGE_API_KEY", VOYAGE_KEY)
+    monkeypatch.setenv("VOYAGE_MAX_ATTEMPTS", "0")
+    with pytest.raises(ValidationError, match="max_attempts"):
+        flows.keyword_voyage("test-tenant")
+
+
+def run_text(client: MlflowClient, run_id: str) -> str:
+    """Every tag, param, metric name and artifact of a run, joined."""
+    run = client.get_run(run_id)
+    return " ".join(
+        [
+            *run.data.tags.values(),
+            *run.data.params.values(),
+            *run.data.metrics,
+            *(load_text(f"runs:/{run_id}/{a.path}") for a in client.list_artifacts(run_id)),
+        ]
+    )
+
+
+@pytest.mark.integration
+async def test_quality_eval_flow_logs_one_read_only_run_without_urls_or_keywords(
+    graph: GraphRepo,
+    mongo: MongoRepo,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    monkeypatch.setenv("GIT_SHA", "c" * 40)
+    monkeypatch.setenv("VOYAGE_API_KEY", VOYAGE_KEY)
+    fake = keyword_voyage()
+    use(monkeypatch, fake)
+    await seed_quality(graph, mongo, tenant)
+    stored_graph, stored_mongo = await graph_state(graph, tenant), await mongo_state(mongo)
+
+    report, run_id = await flows.quality_eval_flow(tenant, tmp_path / "features")
+
+    assert await graph_state(graph, tenant) == stored_graph
+    assert await mongo_state(mongo) == stored_mongo
+    assert report.not_applicable == ()
+    assert fake.call_count > 0
+    client = MlflowClient(uri)
+    run = client.get_run(run_id)
+    assert client.get_experiment(run.info.experiment_id).name == f"analytics-{tenant}"
+    assert {
+        name: run.data.tags[name] for name in ("stage", "git_sha", "alerts", "baseline_run")
+    } == {
+        "stage": "quality-eval",
+        "git_sha": "c" * 40,
+        "alerts": "none",
+        "baseline_run": "none",
+    }
+    assert run.data.metrics["recall_at_10"] == 1.0
+    assert "no baseline" in load_text(f"runs:/{run_id}/summary.md")
+    logged = run_text(client, run_id)
+    assert [u for u in URLS if u in logged] == [], "page urls reached the MLflow run"
+    folded = logged.casefold()
+    assert [k for k in KEYWORDS if k.casefold() in folded] == [], "keywords reached the run"
+
+
+@pytest.mark.integration
+async def test_quality_eval_compares_with_the_previous_run_and_an_alert_never_fails_it(
+    graph: GraphRepo,
+    mongo: MongoRepo,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    monkeypatch.setenv("VOYAGE_API_KEY", VOYAGE_KEY)
+    use(monkeypatch, keyword_voyage())
+    await seed_quality(graph, mongo, tenant)
+    cache = tmp_path / "features"
+    _, first = await flows.quality_eval_flow(tenant, cache)
+
+    report, second = await flows.quality_eval_flow(tenant, cache)
+
+    client = MlflowClient(uri)
+    tags = client.get_run(second).data.tags
+    assert (tags["baseline_run"], tags["alerts"]) == (first, "none")
+    assert report.keywords is not None
+    assert report.keywords.relevance is not None
+    assert report.keywords.relevance.embedded == 0, "cached keyword vectors were embedded again"
+    assert "no headline metric moved" in load_text(f"runs:/{second}/summary.md")
+
+    # A later finished run where held-out recall was far lower.
+    experiment = client.get_experiment_by_name(f"analytics-{tenant}")
+    assert experiment is not None
+    doctored = client.create_run(
+        experiment.experiment_id, tags={"stage": "quality-eval", "tenant_id": tenant}
+    )
+    client.log_metric(doctored.info.run_id, "recall_at_10", 0.25)
+    client.set_terminated(doctored.info.run_id)
+
+    moved, third = await flows.quality_eval_flow(tenant, cache)
+
+    assert [alert.metric for alert in moved.alerts] == ["recall_at_10"]
+    tags = client.get_run(third).data.tags
+    assert (tags["baseline_run"], tags["alerts"]) == (doctored.info.run_id, "recall_at_10")
+    assert "- recall_at_10: 0.25 -> 1 (+300.0%, band 0.2 relative)" in load_text(
+        f"runs:/{third}/summary.md"
+    )
+    assert "alerts.json" in {a.path for a in client.list_artifacts(third)}
+
+
+@pytest.mark.integration
+async def test_quality_eval_without_a_voyage_key_reports_keyword_relevance_not_applicable(
+    graph: GraphRepo,
+    mongo: MongoRepo,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    monkeypatch.setattr(flows, "voyage_client", lambda _tenant: pytest.fail("no key, no client"))
+    await seed_quality(graph, mongo, tenant)
+
+    report, run_id = await flows.quality_eval_flow(tenant, tmp_path / "features")
+
+    assert report.not_applicable == ("keyword_relevance",)
+    run = MlflowClient(uri).get_run(run_id)
+    assert run.data.tags["not_applicable"] == "keyword_relevance"
+    assert not [name for name in run.data.metrics if name.startswith("keyword_relevance")]

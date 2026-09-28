@@ -14,6 +14,9 @@ from linking_engine.ml.tracking import (
     EXPERIMENT_KIND_TAG,
     analytics_experiment,
     analytics_metrics,
+    anchor_language_table,
+    anchor_metrics,
+    anchor_rank_table,
     bridge_metrics,
     candidate_metrics,
     candidate_table,
@@ -23,6 +26,7 @@ from linking_engine.ml.tracking import (
     keyword_metrics,
     link_relevance_metrics,
     log_analytics,
+    log_anchors,
     log_bridges,
     log_candidates,
     log_duplicates,
@@ -33,6 +37,8 @@ from linking_engine.ml.tracking import (
     score_metrics,
 )
 from linking_engine.models import (
+    AnchorReport,
+    AnchorRung,
     BridgeReason,
     BridgeReport,
     CandidateReport,
@@ -950,3 +956,145 @@ def test_a_bridge_run_logs_counts_and_the_pair_table_but_no_queries_or_urls(
         ]
     )
     assert not [query for query in SHARED if query in logged], "shared queries leaked into the run"
+
+
+# ── anchor extraction ───────────────────────────────────────────────────────
+
+EXACT, STEMMED, STEM_SET = AnchorRung.EXACT, AnchorRung.STEMMED, AnchorRung.STEM_SET
+JACCARD_BINS = (*([0] * 10), 1, *([0] * 8), 1)
+SENTENCE_BINS = (2, 1, 1, 1, 1, 1, 1)
+
+
+def anchors_report() -> AnchorReport:
+    return AnchorReport(
+        tenant_id="acme",
+        stem_set_threshold=0.5,
+        pairs=10,
+        bridge_pairs=2,
+        pairs_with_keywords=8,
+        pairs_matched=5,
+        primary_matched=4,
+        matches=8,
+        by_rung={EXACT: 4, STEMMED: 2, STEM_SET: 2},
+        best_rung={EXACT: 3, STEMMED: 1, STEM_SET: 1},
+        by_keyword_rank={1: 4, 2: 3, 3: 1},
+        by_rung_and_rank={EXACT: {1: 3, 2: 1}, STEMMED: {1: 1, 2: 1}, STEM_SET: {2: 1, 3: 1}},
+        stem_jaccard_histogram=JACCARD_BINS,
+        sentence_index_histogram=SENTENCE_BINS,
+        overlapping_existing_anchors=3,
+        existing_anchors_located=4,
+        existing_anchors_unlocated=2,
+        single_token_keywords=2,
+        source_pages=6,
+        sources_without_body=1,
+        stemmed_languages={"en": 4, "de": 1},
+        unstemmed_languages={"und": 1},
+        seconds=0.5,
+        finished_at=datetime(2026, 9, 28, tzinfo=UTC),
+    )
+
+
+def test_anchor_metrics_are_counts_rungs_ranks_and_match_shares() -> None:
+    assert anchor_metrics(anchors_report()) == {
+        "pairs": 10,
+        "bridge_pairs": 2,
+        "pairs_with_keywords": 8,
+        "pairs_matched": 5,
+        "primary_matched": 4,
+        "matches": 8,
+        "overlapping_existing_anchors": 3,
+        "existing_anchors_located": 4,
+        "existing_anchors_unlocated": 2,
+        "single_token_keywords": 2,
+        "source_pages": 6,
+        "sources_without_body": 1,
+        "seconds": 0.5,
+        "rung_exact": 4,
+        "rung_stemmed": 2,
+        "rung_stem_set": 2,
+        "best_rung_exact": 3,
+        "best_rung_stemmed": 1,
+        "best_rung_stem_set": 1,
+        "keyword_rank_1": 4,
+        "keyword_rank_2": 3,
+        "keyword_rank_3": 1,
+        "matched_share": 5 / 8,
+        "primary_matched_share": 4 / 8,
+    }
+    empty = AnchorReport(
+        tenant_id="acme",
+        stem_set_threshold=0.5,
+        pairs=3,
+        bridge_pairs=0,
+        pairs_with_keywords=0,
+        pairs_matched=0,
+        primary_matched=0,
+        matches=0,
+        by_rung=dict.fromkeys(AnchorRung, 0),
+        best_rung=dict.fromkeys(AnchorRung, 0),
+        by_keyword_rank={},
+        by_rung_and_rank={rung: {} for rung in AnchorRung},
+        stem_jaccard_histogram=(0,) * 20,
+        sentence_index_histogram=(0,) * 7,
+        overlapping_existing_anchors=0,
+        existing_anchors_located=0,
+        existing_anchors_unlocated=0,
+        single_token_keywords=0,
+        source_pages=2,
+        sources_without_body=0,
+        stemmed_languages={"en": 2},
+        unstemmed_languages={},
+        seconds=0.1,
+        finished_at=datetime(2026, 9, 28, tzinfo=UTC),
+    )
+    none = anchor_metrics(empty)
+    assert (none["pairs"], none["matches"]) == (3, 0)
+    assert "matched_share" not in none, "no share without a pair that has keywords"
+    assert "primary_matched_share" not in none
+
+
+def test_the_anchor_tables_count_rung_by_rank_and_pages_by_language() -> None:
+    report = anchors_report()
+
+    assert anchor_rank_table(report) == {
+        "rung": ["EXACT", "EXACT", "STEMMED", "STEMMED", "STEM_SET", "STEM_SET"],
+        "keyword_rank": [1, 2, 1, 2, 2, 3],
+        "matches": [3, 1, 1, 1, 1, 1],
+    }
+    assert anchor_language_table(report) == {
+        "language": ["de", "en", "und"],
+        "stemmed": [True, True, False],
+        "source_pages": [1, 4, 1],
+    }
+
+
+def test_an_anchor_run_logs_counts_histograms_and_tables_but_no_text(local_mlflow: str) -> None:
+    report = anchors_report()
+
+    run_id = log_anchors(report, "Anchor extraction for tenant acme.")
+
+    client = MlflowClient(local_mlflow)
+    run = client.get_run(run_id)
+    assert client.get_experiment(run.info.experiment_id).name == analytics_experiment("acme")
+    assert (run.info.run_name, run.data.tags["stage"]) == ("anchor extraction", "anchor-extraction")
+    params = run.data.params
+    assert {
+        name: params[name]
+        for name in ("stem_set_threshold", "min_span", "max_span", "min_shared_stems")
+    } == {"stem_set_threshold": "0.5", "min_span": "2", "max_span": "5", "min_shared_stems": "2"}
+    assert params["max_inner_stop_words"] == "1"
+    assert params["sentence_index_bins"] == "0,1,2,3,6,11,21"
+    assert {"en", "de", "fr", "es"} <= set(params["stemmer_languages"].split(","))
+    assert anchor_metrics(report).items() <= run.data.metrics.items()
+    for name, bins in (("stem_jaccard_hist", JACCARD_BINS), ("sentence_index_hist", SENTENCE_BINS)):
+        history = sorted(client.get_metric_history(run_id, name), key=lambda m: m.step)
+        assert [(m.step, m.value) for m in history] == list(enumerate(map(float, bins))), name
+    assert {a.path for a in client.list_artifacts(run_id)} == {
+        "rung_by_rank.json",
+        "languages.json",
+        "report.json",
+        "summary.md",
+    }
+    assert table(run_id, "rung_by_rank.json") == anchor_rank_table(report)
+    assert table(run_id, "languages.json") == anchor_language_table(report)
+    assert load_dict(f"runs:/{run_id}/report.json") == report.model_dump(mode="json")
