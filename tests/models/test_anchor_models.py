@@ -1,5 +1,5 @@
-"""Validators of the #20/#21 anchor extraction models: each rejection beside the boundary
-that passes."""
+"""Validators of the #20/#21 anchor extraction models, and of the semantic rung's fields (#22):
+each rejection beside the boundary that passes."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from linking_engine.models import (
 from linking_engine.models.anchors import NO_LANGUAGE, SENTENCE_INDEX_BINS, STEM_JACCARD_BINS
 
 SENTENCE = "Our trail shoes grip wet rock."
-EXACT, STEMMED, STEM_SET = AnchorRung.EXACT, AnchorRung.STEMMED, AnchorRung.STEM_SET
+EXACT, STEMMED, STEM_SET, SEMANTIC = tuple(AnchorRung)
 
 
 def only_error(exc_info: pytest.ExceptionInfo[ValidationError]) -> dict[str, object]:
@@ -46,6 +46,19 @@ def test_the_stem_set_threshold_is_in_the_half_open_unit_interval(threshold: flo
     with pytest.raises(ValidationError) as exc_info:
         ExtractionSettings(stem_set_threshold=threshold)
     assert only_error(exc_info)["loc"] == ("stem_set_threshold",)
+
+
+def test_the_semantic_threshold_is_derived_unless_a_cosine_is_set() -> None:
+    assert ExtractionSettings().semantic_threshold is None
+    assert ExtractionSettings(semantic_threshold=-1.0).semantic_threshold == -1.0
+    assert ExtractionSettings(semantic_threshold=1.0).semantic_threshold == 1.0
+
+
+@pytest.mark.parametrize("threshold", [-1.01, 1.01])
+def test_the_semantic_threshold_is_a_cosine(threshold: float) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        ExtractionSettings(semantic_threshold=threshold)
+    assert only_error(exc_info)["loc"] == ("semantic_threshold",)
 
 
 def test_settings_forbid_unknown_fields() -> None:
@@ -81,6 +94,9 @@ def test_a_valid_match_builds_on_every_rung() -> None:
     assert match().phrase == SENTENCE[4:15]
     assert match(rung=STEMMED, keyword="trail shoe").rung is STEMMED
     assert match(rung=STEM_SET, keyword="shoes trail", stem_jaccard=1.0).stem_jaccard == 1.0
+    for cosine in (-1.0, 1.0):
+        semantic = match(rung=SEMANTIC, keyword="hiking footwear", semantic_similarity=cosine)
+        assert semantic.semantic_similarity == cosine
 
 
 def test_a_phrase_at_the_very_start_of_its_sentence_is_valid() -> None:
@@ -124,6 +140,29 @@ def test_offsets_must_locate_the_phrase_in_its_sentence(
 def test_stem_jaccard_belongs_to_the_stem_set_rung_only(fields: dict[str, object]) -> None:
     with pytest.raises(ValidationError, match="stem set rung only"):
         match(**fields)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        pytest.param({"semantic_similarity": 0.8}, id="exact-with-similarity"),
+        pytest.param(
+            {"rung": STEM_SET, "stem_jaccard": 1.0, "semantic_similarity": 0.8},
+            id="stem-set-with-similarity",
+        ),
+        pytest.param({"rung": SEMANTIC}, id="semantic-without-similarity"),
+    ],
+)
+def test_semantic_similarity_belongs_to_the_semantic_rung_only(fields: dict[str, object]) -> None:
+    with pytest.raises(ValidationError, match="semantic rung only"):
+        match(**fields)
+
+
+@pytest.mark.parametrize("cosine", [-1.01, 1.01])
+def test_semantic_similarity_is_a_cosine(cosine: float) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        match(rung=SEMANTIC, semantic_similarity=cosine)
+    assert ("semantic_similarity",) in [error["loc"] for error in exc_info.value.errors()]
 
 
 @pytest.mark.parametrize(
@@ -304,6 +343,7 @@ def test_report_counts_must_be_consistent(fields: dict[str, object], message: st
         ("seconds", -1.0),
         ("existing_anchors_located", -1),
         ("existing_anchors_unlocated", -1),
+        ("identifier_mismatches", -1),
     ],
 )
 def test_report_field_bounds(field: str, value: object) -> None:

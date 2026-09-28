@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from structlog.contextvars import bound_contextvars
 
 from linking_engine.anchor.extraction import summarise_anchors
+from linking_engine.anchor.scoring import summarise_selection
 from linking_engine.discovery.bridges import summarise_bridges
 from linking_engine.discovery.candidates import retrieve_candidates, summarise_candidates
 from linking_engine.discovery.features import CHUNK_PAIRS, summarise_features
@@ -30,6 +31,7 @@ from linking_engine.ingest.mongo_repo import CrawlSource, MongoRepo
 from linking_engine.ingest.prepare import BOILERPLATE_SHARE, NAV_SHARE, prepare_tenant
 from linking_engine.ml.tracking import (
     log_analytics,
+    log_anchor_selection,
     log_anchors,
     log_bridges,
     log_candidates,
@@ -43,6 +45,7 @@ from linking_engine.ml.tracking import (
 )
 from linking_engine.models import (
     AnchorReport,
+    AnchorSelectionReport,
     BridgeReport,
     CandidateSet,
     CentralityReport,
@@ -69,6 +72,7 @@ from linking_engine.pipeline.analytics import (
     compute_hubs,
     summarise,
 )
+from linking_engine.pipeline.anchor_selection import select_anchors
 from linking_engine.pipeline.anchors import extract_anchors
 from linking_engine.pipeline.bridges import HUB_PAIRS_FILE, find_bridges, read_hub_pairs
 from linking_engine.pipeline.duplicates import find_duplicates, summarise_duplicates
@@ -817,3 +821,64 @@ async def quality_eval_flow(
         mlflow_run,
     )
     return report, mlflow_run
+
+
+# Read-only against both stores; the vector caches are rewritten whole and both output files
+# renamed into place only when complete, so a retry repeats the run.
+@task(
+    name="anchor-selection",
+    retries=1,
+    retry_delay_seconds=30,
+    retry_condition_fn=is_transient,
+    cache_policy=NONE,
+)
+async def anchor_selection_task(
+    tenant_id: str, cache_dir: Path
+) -> tuple[AnchorSelectionReport, Path]:
+    voyage = keyword_voyage(tenant_id)
+    async with await neo4j() as graph, await mongo() as repo:
+        await graph.check_server()
+        return await select_anchors(graph, repo, tenant_id, cache_dir=cache_dir, voyage=voyage)
+
+
+@task(name="mlflow-log-anchor-selection", cache_policy=NONE)
+def log_anchor_selection_task(report: AnchorSelectionReport) -> str:
+    return log_anchor_selection(report, summarise_selection(report))
+
+
+@flow(name="anchor-selection")
+async def anchor_selection_flow(
+    tenant_id: str, cache_dir: Path = CACHE_DIR
+) -> tuple[AnchorSelectionReport, Path, str]:
+    """Every pair's anchor chosen from the lexical and semantic rungs, with its alternatives and
+    placement features, written under ``cache_dir`` with the pairs left without one; nothing is written to
+    the stores, the run is logged to MLflow without urls, phrases, sentences or keywords."""
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
+        logger.info("anchor selection of tenant %s", tenant_id)
+        report, path = await anchor_selection_task(tenant_id, cache_dir)
+        mlflow_run = log_anchor_selection_task(report)
+    logger.info(
+        "%d pairs, %d lexical, %d sent to the semantic rung (%d matched, %s); "
+        "%d chosen, %d alternatives, unanchored %s; %d of %d targets with an anchor; %s; %.1fs; "
+        "mlflow run %s",
+        report.pairs,
+        report.lexical_pairs,
+        report.semantic_invocations,
+        report.semantic_matched,
+        (
+            f"skipped: {report.semantic_skipped_reason}"
+            if report.semantic_skipped_reason
+            else f"{'configured ' if report.threshold.overridden else ''}threshold "
+            f"{report.threshold.value:.3f}"
+        ),
+        report.chosen,
+        report.alternatives,
+        {reason.value: count for reason, count in report.unanchored.items()},
+        report.targets_with_anchor,
+        report.targets,
+        path,
+        report.seconds,
+        mlflow_run,
+    )
+    return report, path, mlflow_run

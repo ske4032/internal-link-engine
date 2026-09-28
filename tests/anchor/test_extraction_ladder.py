@@ -44,7 +44,7 @@ def find(
     existing: tuple[tuple[int, int], ...] = (),
     threshold: float = 0.5,
 ) -> AnchorMatch | None:
-    matches, _ = extract(
+    matches, _, _ = extract(
         index(body, language=language, headings=headings),
         TARGET,
         [(1, keyword, KeywordSource.CLIENT_STRATEGIC)],
@@ -442,14 +442,14 @@ def test_an_existing_anchor_pushes_the_match_to_the_next_occurrence() -> None:
     body = "Trail shoes rock. Buy trail shoes today."
     first = (0, len("Trail shoes"))
 
-    matches, skipped = extract(
+    matches, skipped, _ = extract(
         index(body), TARGET, [(1, "trail shoes", KeywordSource.CLIENT_STRATEGIC)], existing=(first,)
     )
 
     [found] = matches
     assert (found.sentence_index, found.phrase, skipped) == (1, "trail shoes", frozenset({first}))
     covered = (first, (body.index("trail shoes today"), body.index(" today")))
-    none, skipped_all = extract(
+    none, skipped_all, _ = extract(
         index(body), TARGET, [(1, "trail shoes", KeywordSource.CLIENT_STRATEGIC)], existing=covered
     )
     assert (none, skipped_all) == ([], frozenset(covered))
@@ -464,7 +464,7 @@ def test_an_existing_anchor_blocking_several_keywords_counts_once() -> None:
         (2, "trail shoe", KeywordSource.GSC_OBSERVED),
     ]
 
-    matches, blocking = extract(index(body), TARGET, keywords, existing=(first, unrelated))
+    matches, blocking, _ = extract(index(body), TARGET, keywords, existing=(first, unrelated))
 
     assert [(m.keyword, m.sentence_index) for m in matches] == [
         ("trail shoes", 1),
@@ -481,7 +481,7 @@ def test_each_found_keyword_is_one_match_carrying_its_rank_and_source() -> None:
         (3, "stoves", KeywordSource.INFERRED),
     ]
 
-    matches, skipped = extract(index(body), TARGET, keywords)
+    matches, skipped, _ = extract(index(body), TARGET, keywords)
 
     assert [(m.keyword, m.keyword_rank, m.keyword_source, m.rung) for m in matches] == [
         ("trail shoes", 1, KeywordSource.CLIENT_STRATEGIC, EXACT),
@@ -795,12 +795,15 @@ def test_the_summary_states_the_counts_without_urls_or_phrases() -> None:
         keywords=[("trail shoes", "en")],
         source_languages={"example.com/a": "en"},
         sources_without_body=0,
+        identifier_mismatches=4,
         started=0.0,
     )
 
     summary = summarise_anchors(report)
 
-    for fact in ("acme", "2 pairs", "1 from hub bridges", "1 pairs matched", "Stemmed: en 1"):
+    assert report.identifier_mismatches == 4
+    facts = ("acme", "2 pairs", "1 from hub bridges", "1 pairs matched", "Stemmed: en 1")
+    for fact in (*facts, "4 stemmed or stem set places refused"):
         assert fact in summary, f"{fact!r} missing from:\n{summary}"
     assert not [
         text

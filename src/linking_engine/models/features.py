@@ -140,6 +140,9 @@ class FeatureReport(BaseModel):
     null_share: dict[str, float]
     has_gsc_data_share: float | None = Field(default=None, ge=0, le=1)
     cache_key: str = Field(min_length=1)
+    # Digest of the tenant's anchor choices file the placement features came from; None without
+    # one, which leaves context_relevance and anchor_target_fit empty for candidate pairs.
+    anchor_choices_digest: str | None = None
     cache_hit: bool
     seconds: float = Field(ge=0)
     finished_at: datetime

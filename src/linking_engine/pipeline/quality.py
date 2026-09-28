@@ -19,7 +19,13 @@ import numpy as np
 import pandas
 import structlog
 
-from linking_engine.anchor.extraction import DEFAULT_THRESHOLD, SourceIndex, Stems, extract
+from linking_engine.anchor.extraction import (
+    DEFAULT_THRESHOLD,
+    SourceIndex,
+    Stems,
+    extract,
+    keyword_tokens,
+)
 from linking_engine.anchor.generic import is_generic
 from linking_engine.audit.relevance import score_distribution
 from linking_engine.discovery.candidates import retrieve_candidates
@@ -95,8 +101,8 @@ from linking_engine.models import (
 )
 from linking_engine.models.scoring import SCORE_HISTOGRAM_BINS
 from linking_engine.pipeline.embed import NO_MODEL
-from linking_engine.pipeline.keyword_vectors import keyword_vectors
 from linking_engine.pipeline.keywords import plan_keywords
+from linking_engine.pipeline.text_vectors import text_vectors
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence, Set
@@ -417,6 +423,7 @@ def _extractability(
     keywords: Mapping[str, Sequence[tuple[int, str, KeywordSource]]],
     sources: Mapping[str, _SourcePage],
     threshold: float,
+    brand: frozenset[str],
 ) -> KeywordExtractability | None:
     """The ladder over every (source, target) pair in ``wanted``, source to its targets; a
     source without a stored body carries nothing."""
@@ -431,7 +438,9 @@ def _extractability(
         if page is not None and page.body.strip():
             if page.language not in stems:
                 stems[page.language] = Stems(page.language)
-            index = SourceIndex(source_url, page.body, page.headings, stems[page.language])
+            index = SourceIndex(
+                source_url, page.body, page.headings, stems[page.language], brand=brand
+            )
             present = copy_words(page.body)
         for target in targets:
             ranked = keywords[target]
@@ -443,7 +452,7 @@ def _extractability(
             words_set += any(bool(found) and found <= present for found in words)
             if index is None:
                 continue
-            matches, _ = extract(index, target, ranked, threshold=threshold)
+            matches, _, _ = extract(index, target, ranked, threshold=threshold)
             if not matches:
                 continue
             found_set += 1
@@ -471,11 +480,13 @@ async def keyword_extractability(
     keywords: Mapping[str, Sequence[tuple[int, str, KeywordSource]]],
     *,
     threshold: float = DEFAULT_THRESHOLD,
+    brand: frozenset[str] = frozenset(),
 ) -> KeywordExtractability | None:
     """Over the candidate pairs whose target has a ranked keyword set, as (rank, text, source)
     rank ascending: does the extraction ladder find the target's primary keyword, or any
     keyword of its set, in the source copy? Existing anchors are not passed, so this asks
-    whether the copy carries the keyword at all. None without such pairs."""
+    whether the copy carries the keyword at all; ``brand`` tokens are no identifiers, as in
+    anchor selection. None without such pairs."""
     wanted: defaultdict[str, list[str]] = defaultdict(list)
     for entry in targets:
         if keywords.get(entry.target_url):
@@ -491,7 +502,7 @@ async def keyword_extractability(
                 tuple(heading.text for heading in record.headings),
                 record.language,
             )
-    return await asyncio.to_thread(_extractability, wanted, keywords, sources, threshold)
+    return await asyncio.to_thread(_extractability, wanted, keywords, sources, threshold, brand)
 
 
 def _anchor_counts(
@@ -624,11 +635,13 @@ async def keyword_relevance(
         )
     if reason is None:
         try:
-            found = await keyword_vectors(
+            found = await text_vectors(
                 voyage,
                 tenant_id,
+                "keywords",
                 (keyword for keywords in pages.values() for keyword in keywords),
                 cache_dir=cache_dir,
+                stage=STAGE,
             )
         except EmbeddingAuthError as error:
             reason = f"Voyage refused the key ({error.error_type})"
@@ -772,8 +785,19 @@ async def evaluate_quality(
         production = await retrieve_candidates(
             graph, tenant_id, links=snapshot.links, vectors=vectors, stage=STAGE
         )
+        brand = frozenset(
+            token
+            for affix in (plan.brand_prefix, plan.brand_suffix)
+            if affix
+            for token in keyword_tokens(affix)
+        )
         extract = await keyword_extractability(
-            mongo, tenant_id, production.targets, ranked, threshold=settings.stem_set_threshold
+            mongo,
+            tenant_id,
+            production.targets,
+            ranked,
+            threshold=settings.stem_set_threshold,
+            brand=brand,
         )
         del production
     del vectors

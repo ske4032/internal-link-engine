@@ -110,11 +110,13 @@ class ClusterAgreement(StrEnum):
 
 class AnchorRung(StrEnum):
     """Which rung of the extraction ladder found an anchor phrase in the source copy, in order:
-    the keyword verbatim, a stemmed variant, then an overlapping set of stems."""
+    the keyword verbatim, a stemmed variant, an overlapping set of stems, then a phrase whose
+    meaning is close to the keyword's."""
 
     EXACT = "EXACT"
     STEMMED = "STEMMED"
     STEM_SET = "STEM_SET"
+    SEMANTIC = "SEMANTIC"
 
 
 class BridgeReason(StrEnum):
@@ -159,6 +161,18 @@ class ContentGapFinding(StrEnum):
 
     NO_TOPICAL_MENTION = "NO_TOPICAL_MENTION"
     AWKWARD_PHRASING = "AWKWARD_PHRASING"
+
+
+class UnanchoredReason(StrEnum):
+    """Why a candidate pair got no anchor, named for the person who has to act on it. The first
+    two are content gaps in the source page and the third a gap in the target page; the last two
+    say the pair was not fully searched in this run, which is no finding about either page."""
+
+    SOURCE_DOES_NOT_MENTION_TOPIC = "SOURCE_DOES_NOT_MENTION_TOPIC"
+    TOPIC_MENTIONED_BUT_NO_GOOD_PHRASE = "TOPIC_MENTIONED_BUT_NO_GOOD_PHRASE"
+    TARGET_PAGE_HAS_NO_KEYWORD = "TARGET_PAGE_HAS_NO_KEYWORD"
+    SOURCE_PAGE_TEXT_UNAVAILABLE = "SOURCE_PAGE_TEXT_UNAVAILABLE"
+    MEANING_SEARCH_NOT_RUN = "MEANING_SEARCH_NOT_RUN"
 
 
 class RecommendationStatus(StrEnum):

@@ -26,6 +26,7 @@ from linking_engine.models.enums import (
     LifecycleStage,
     PageType,
     RecommendationStatus,
+    UnanchoredReason,
 )
 
 ENUM_CASES = [
@@ -50,7 +51,7 @@ ENUM_CASES = [
     (KeywordSource, ("CLIENT_STRATEGIC", "GSC_OBSERVED", "INFERRED")),
     (KeywordRung, ("STRATEGIC", "GSC", "H1", "TITLE")),
     (BridgeReason, ("SPANNING_TREE", "NEAREST_HUB", "BRIDGE_GAP")),
-    (AnchorRung, ("EXACT", "STEMMED", "STEM_SET")),
+    (AnchorRung, ("EXACT", "STEMMED", "STEM_SET", "SEMANTIC")),
     (
         ClusterAgreement,
         (
@@ -62,6 +63,16 @@ ENUM_CASES = [
         ),
     ),
     (ContentGapFinding, ("NO_TOPICAL_MENTION", "AWKWARD_PHRASING")),
+    (
+        UnanchoredReason,
+        (
+            "SOURCE_DOES_NOT_MENTION_TOPIC",
+            "TOPIC_MENTIONED_BUT_NO_GOOD_PHRASE",
+            "TARGET_PAGE_HAS_NO_KEYWORD",
+            "SOURCE_PAGE_TEXT_UNAVAILABLE",
+            "MEANING_SEARCH_NOT_RUN",
+        ),
+    ),
     (RecommendationStatus, ("PENDING", "ACCEPTED", "MODIFIED", "DISMISSED")),
 ]
 

@@ -1,0 +1,22 @@
+# Month names (full and abbreviated), casefolded, one per line as <month>\t<name>. From the
+# Unicode CLDR locale data (Indonesian added by hand); compared on the language's stems.
+1	янв
+1	января
+2	февр
+2	февраля
+3	марта
+4	апр
+4	апреля
+5	мая
+6	июня
+7	июля
+8	авг
+8	августа
+9	сент
+9	сентября
+10	окт
+10	октября
+11	нояб
+11	ноября
+12	дек
+12	декабря

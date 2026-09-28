@@ -254,8 +254,14 @@ def _ctr_gap(row: GscMetrics | None, curve: CtrCurve | None) -> float | None:
     return actual - ctr_at(curve, row.avg_position)
 
 
-def pair_features(source: PageContext, target: PageContext, similarity: float) -> PairFeatures:
-    """The features of one source -> target pair; ``similarity`` is their content cosine."""
+def pair_features(
+    source: PageContext,
+    target: PageContext,
+    similarity: float,
+    placement: tuple[float | None, float | None] = (None, None),
+) -> PairFeatures:
+    """The features of one source -> target pair; ``similarity`` is their content cosine and
+    ``placement`` the context relevance and anchor-target fit of its chosen anchor."""
     found = pair_signals(source.signals, target.signals)
     s, t = source.structure, target.structure
     return PairFeatures(
@@ -301,6 +307,8 @@ def pair_features(source: PageContext, target: PageContext, similarity: float) -
         cluster_agreement=found.cluster_agreement,
         content_agreement=found.content_agreement,
         content_cosine=similarity,
+        context_relevance=placement[0],
+        anchor_target_fit=placement[1],
     )
 
 
@@ -317,15 +325,25 @@ def feature_chunks(
     pages: Mapping[str, PageContext],
     *,
     chunk_pairs: int = CHUNK_PAIRS,
+    placements: Mapping[tuple[str, str], tuple[float | None, float | None]] | None = None,
 ) -> Iterator[list[PairFeatures]]:
-    """Every candidate pair's features in candidate order, ``chunk_pairs`` at a time."""
+    """Every candidate pair's features in candidate order, ``chunk_pairs`` at a time; a pair in
+    ``placements``, (source, target) to the features of its chosen anchor, gets them."""
     if chunk_pairs < 1:
         raise ValueError("chunk_pairs must be at least 1")
+    placed = placements or {}
     chunk: list[PairFeatures] = []
     for entry in targets:
         target = _context(pages, entry.target_url)
         for source_url, similarity in zip(entry.sources, entry.similarities, strict=True):
-            chunk.append(pair_features(_context(pages, source_url), target, similarity))
+            chunk.append(
+                pair_features(
+                    _context(pages, source_url),
+                    target,
+                    similarity,
+                    placed.get((source_url, entry.target_url), (None, None)),
+                )
+            )
             if len(chunk) == chunk_pairs:
                 yield chunk
                 chunk = []
@@ -358,11 +376,15 @@ def code_digest() -> str:
 
 
 def cache_key(
-    tenant_id: str, targets: Iterable[TargetCandidates], pages: Mapping[str, PageContext]
+    tenant_id: str,
+    targets: Iterable[TargetCandidates],
+    pages: Mapping[str, PageContext],
+    *,
+    anchor_choices_digest: str | None = None,
 ) -> str:
-    """sha256 over the tenant, the feature code, the matrix columns, the candidate pairs in
-    order and every page context; sets are hashed sorted, so the key does not depend on the
-    process."""
+    """sha256 over the tenant, the feature code, the matrix columns, the anchor choices file
+    when there is one, the candidate pairs in order and every page context; sets are hashed
+    sorted, so the key does not depend on the process."""
     digest = hashlib.sha256()
 
     def add(value: object) -> None:
@@ -370,6 +392,9 @@ def cache_key(
         digest.update(b"\n")
 
     add([tenant_id, code_digest(), KEY_COLUMNS, FEATURE_COLUMNS])
+    # Only when present, so a tenant without anchor choices keeps its cached matrix.
+    if anchor_choices_digest is not None:
+        add(["anchor_choices", anchor_choices_digest])
     for entry in targets:
         add([entry.target_url, entry.sources, entry.similarities])
     for url in sorted(pages):
@@ -406,6 +431,7 @@ def feature_report(
     cache_key: str,
     cache_hit: bool,
     started: float,
+    anchor_choices_digest: str | None = None,
 ) -> FeatureReport:
     """The data gaps of the matrix, summarised one frame at a time so it is never held whole.
 
@@ -445,6 +471,7 @@ def feature_report(
         null_share={name: count / rows for name, count in counts.items()} if rows else {},
         has_gsc_data_share=with_gsc / rows if rows else None,
         cache_key=cache_key,
+        anchor_choices_digest=anchor_choices_digest,
         cache_hit=cache_hit,
         seconds=round(time.perf_counter() - started, 3),
         finished_at=datetime.now(UTC),

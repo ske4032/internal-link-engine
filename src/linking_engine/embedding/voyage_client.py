@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from typing import TYPE_CHECKING, Final, NamedTuple, Protocol, Self
 
 import numpy as np
@@ -68,6 +69,10 @@ class VoyageSettings(BaseSettings):
     # ~8% under the 120k cap: headroom for the server-side input_type prompt and tokenizer drift.
     request_token_budget: int = Field(default=110_000, ge=1)
     max_batch_items: int = Field(default=1_000, ge=1)
+    # Requests in flight at once; batches still come back in input order.
+    max_concurrent_requests: int = Field(default=16, ge=1)
+    # The account's token rate limit; Voyage sends no rate-limit headers to read it from.
+    tokens_per_minute: int = Field(default=3_000_000, ge=1)
     # Jittered wait caps 1+2+4+8+16+32+60 = 123s over 7 retries: outlasts a per-minute limit.
     max_attempts: int = Field(default=8, ge=1)
     backoff_initial_s: float = Field(default=1.0, ge=0)
@@ -130,9 +135,75 @@ def token_batches(counts: Sequence[int], *, budget: int, max_items: int) -> Iter
         yield range(start, len(counts))
 
 
+async def _first(pending: deque[asyncio.Task[EmbeddingBatch]]) -> EmbeddingBatch:
+    """The earliest batch in input order, once done. While it is still in flight, a later
+    request that fails raises at once rather than after the requests before it; the wait is
+    only ever on requests still running, so finished ones never wake it again."""
+    while not pending[0].done():
+        for task in pending:
+            if task.done() and not task.cancelled() and (error := task.exception()) is not None:
+                raise error
+        running = [task for task in pending if not task.done()]
+        await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+    return pending.popleft().result()
+
+
 async def backoff_sleep(seconds: float) -> None:
     """Wait between retries; patch this module attribute in tests to skip real sleeps."""
     await asyncio.sleep(seconds)
+
+
+def pace_clock() -> float:
+    """Seconds on a monotonic clock for request pacing; patch this module attribute in tests."""
+    return time.monotonic()
+
+
+async def pace_sleep(seconds: float) -> None:
+    """Wait for the token budget; patch this module attribute in tests with a fake clock."""
+    await asyncio.sleep(seconds)
+
+
+class TokenPacer:
+    """Keeps the tokens of the requests started in any 60 seconds within ``per_minute``.
+
+    A request starts once the requests of the last minute leave room for its tokens; one
+    larger than the whole budget waits for a minute without requests rather than failing.
+    Requests are admitted in the order they ask.
+    """
+
+    WINDOW_S: Final = 60.0
+
+    def __init__(self, per_minute: int) -> None:
+        if per_minute < 1:
+            raise ValueError("per_minute must be positive")
+        self._budget = per_minute
+        self._started: deque[tuple[float, int]] = deque()
+        self._used = 0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, tokens: int) -> float:
+        """Wait until ``tokens`` fit the last minute's budget and record them; returns the
+        seconds waited, queueing behind earlier requests included."""
+        need = min(max(tokens, 0), self._budget)
+        asked = pace_clock()
+        async with self._lock:
+            while True:
+                now = pace_clock()
+                while self._started and self._started[0][0] <= now - self.WINDOW_S:
+                    self._used -= self._started.popleft()[1]
+                excess = self._used + need - self._budget
+                if excess <= 0:
+                    self._started.append((now, need))
+                    self._used += need
+                    return now - asked
+                freed = 0
+                delay = self.WINDOW_S
+                for started, spent in self._started:
+                    freed += spent
+                    if freed >= excess:
+                        delay = max(started + self.WINDOW_S - now, 0.0)
+                        break
+                await pace_sleep(delay)
 
 
 class VoyageClient:
@@ -163,6 +234,8 @@ class VoyageClient:
             )
         self._sdk = sdk
         self._tokenizer = tokenizer
+        # One budget per client, shared by every call through it.
+        self._pacer = TokenPacer(settings.tokens_per_minute)
 
     @property
     def model(self) -> str:
@@ -181,7 +254,13 @@ class VoyageClient:
         return [item async for batch in self.iter_embed(pages) for item in batch.embeddings]
 
     async def iter_embed(self, pages: Sequence[PageText]) -> AsyncGenerator[EmbeddingBatch]:
-        """One batch of unit-norm vectors per Voyage request, in input order."""
+        """One batch of unit-norm vectors per Voyage request, in input order.
+
+        Up to ``max_concurrent_requests`` requests are under way, each paced to the token budget
+        and retried on its own; batches are yielded in order as they complete, so memory stays
+        bounded by the window. The first request failing after its retries cancels the others
+        and raises.
+        """
         if not pages:
             return
         encodings = await asyncio.to_thread(self._encode, [page.text for page in pages])
@@ -190,12 +269,25 @@ class VoyageClient:
         ]
         # Release token/offset arrays before the network-bound batches.
         del encodings
-        for span in token_batches(
+        spans = token_batches(
             [item.tokens for item in prepared],
             budget=self._settings.request_token_budget,
             max_items=self._settings.max_batch_items,
-        ):
-            yield await self._embed_batch(prepared[span.start : span.stop])
+        )
+        pending: deque[asyncio.Task[EmbeddingBatch]] = deque()
+        try:
+            for span in spans:
+                pending.append(
+                    asyncio.create_task(self._embed_batch(prepared[span.start : span.stop]))
+                )
+                if len(pending) >= self._settings.max_concurrent_requests:
+                    yield await _first(pending)
+            while pending:
+                yield await _first(pending)
+        finally:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
     def _encode(self, texts: Sequence[str]) -> list[Encoding]:
         return self._load_tokenizer().encode_batch(list(texts))
@@ -228,6 +320,8 @@ class VoyageClient:
 
     async def _embed_batch(self, batch: Sequence[_Prepared]) -> EmbeddingBatch:
         texts = [item.text for item in batch]
+        tokens = sum(item.tokens for item in batch)
+        throttled = await self._pacer.acquire(tokens)
         started = time.perf_counter()
         result, retries = await self._call(texts)
         latency_ms = round((time.perf_counter() - started) * 1000)
@@ -235,8 +329,9 @@ class VoyageClient:
         log.info(
             "embedding.batch",
             items=len(batch),
-            tokens=sum(item.tokens for item in batch),
+            tokens=tokens,
             api_tokens=result.total_tokens,
+            throttle_ms=round(throttled * 1000),
             latency_ms=latency_ms,
             retries=retries,
             truncated=sum(item.truncated for item in batch),
