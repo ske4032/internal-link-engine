@@ -187,6 +187,8 @@ class ScorerName(StrEnum):
     BASELINE = "baseline"
     # The registered model currently holding the production alias.
     HOLDER = "holder"
+    # The learned ranker without monotone constraints and with orphan-target rows kept.
+    PLAIN = "plain"
 
 
 class RecommendationStatus(StrEnum):

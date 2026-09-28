@@ -112,6 +112,9 @@ class HeldOutRounds:
     # Crawled pages, and the distinct body links between them that rounds hide from.
     pages: int
     body_links: int
+    # Crawled pages without an inbound body link on the full graph: no round can hide a link to
+    # them, so as targets they are labelled 0 by construction.
+    orphan_targets: frozenset[str]
 
 
 async def held_out_rounds(
@@ -271,6 +274,7 @@ async def held_out_rounds(
         cache_hit=tuple(hits),
         pages=len(crawled),
         body_links=len(body_links),
+        orphan_targets=frozenset(crawled - {target for _, target in body_links}),
     )
 
 

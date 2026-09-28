@@ -13,6 +13,8 @@ from linking_engine.models.enums import ScorerName
 
 NDCG_HISTOGRAM_BINS: Final = 10
 _SHARE_TOLERANCE: Final = 1e-9
+# NDCG@10 over a set of test groups, then the low and high end of its 95% interval.
+NdcgInterval = tuple[float, float, float]
 
 
 class RankerParams(BaseModel):
@@ -28,6 +30,19 @@ class RankerParams(BaseModel):
     early_stopping_rounds: int = Field(default=50, ge=1)
     eval_at: int = Field(default=10, ge=1)
     seed: int = 42
+    # Columns a pair's score never falls with, the others fixed; empty turns constraints off.
+    monotone_increasing: tuple[str, ...] = (
+        "content_cosine",
+        "anchor_target_fit",
+        "context_relevance",
+    )
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Self:
+        names = self.monotone_increasing
+        if len(set(names)) != len(names) or not all(name.strip() for name in names):
+            raise ValueError("monotone columns are distinct names")
+        return self
 
 
 class HeldOutSettings(BaseModel):
@@ -47,12 +62,19 @@ class HeldOutSettings(BaseModel):
     # Share of source pages held out for the test, then of the rest for early stopping.
     test_share: float = Field(default=0.2, gt=0, lt=1)
     valid_share: float = Field(default=0.1, gt=0, lt=1)
+    # The split every model is trained on and the promotion gate compares on.
     split_seed: int = 7
+    # Split seeds the held-out evaluation is repeated over, since one split is noisy.
+    evaluation_seeds: tuple[int, ...] = (7, 11, 23, 42, 99)
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
         if self.rounds * self.share > 1 + _SHARE_TOLERANCE:
             raise ValueError("rounds * share must not exceed 1")
+        if len(set(self.evaluation_seeds)) != len(self.evaluation_seeds):
+            raise ValueError("evaluation seeds are distinct")
+        if self.split_seed not in self.evaluation_seeds:
+            raise ValueError("evaluation seeds must include the split seed")
         return self
 
 
@@ -172,6 +194,70 @@ class PromotionDecision(BaseModel):
         return self
 
 
+def _interval_ok(found: NdcgInterval) -> bool:
+    _, low, high = found
+    return all(0 <= x <= 1 for x in found) and low <= high
+
+
+class SeedResult(BaseModel):
+    """The held-out evaluation on one split seed: the test sources re-drawn, the learned and
+    plain models retrained, every scorer on that seed's test groups without orphan targets."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    seed: int
+    test_pages: int = Field(ge=1)
+    learned: NdcgInterval
+    plain: NdcgInterval
+    baseline: NdcgInterval
+    # learned - plain NDCG@10, paired per group, and its 95% interval over source pages.
+    delta: float = Field(ge=-1, le=1)
+    delta_ci_low: float = Field(ge=-1, le=1)
+    delta_ci_high: float = Field(ge=-1, le=1)
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Self:
+        if not all(_interval_ok(found) for found in (self.learned, self.plain, self.baseline)):
+            raise ValueError("NDCG@10 and its interval are in [0, 1], low <= high")
+        if self.delta_ci_low > self.delta_ci_high:
+            raise ValueError("delta_ci_low must not exceed delta_ci_high")
+        return self
+
+    @property
+    def significantly_worse(self) -> bool:
+        return self.delta_ci_high < 0
+
+    @property
+    def significantly_better(self) -> bool:
+        return self.delta_ci_low > 0
+
+
+class ProductMeasures(BaseModel):
+    """One scorer on the tenant's production candidate pairs, over the first ``k`` pairs of
+    every source page: what an editor would be shown."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    scorer: ScorerName
+    k: int = Field(ge=1)
+    # Mean content cosine of those pairs; None when none has one.
+    top_relevance: float | None = Field(ge=-1, le=1)
+    # Share of those pairs whose two pages share a hub.
+    same_hub_share: float = Field(ge=0, le=1)
+    # Share of those pairs whose target is an orphan, against the orphans' share of the
+    # candidate target pages.
+    orphan_slot_share: float = Field(ge=0, le=1)
+    orphan_page_share: float = Field(ge=0, le=1)
+    # Share of the orphan target pages in some source page's first k; None without any.
+    orphans_reached: float | None = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Self:
+        if (self.orphans_reached is None) != (self.orphan_page_share == 0):
+            raise ValueError("orphans_reached is None exactly without orphan target pages")
+        return self
+
+
 class RankerReport(BaseModel):
     """One training run of a tenant's ranker. A skipped run names its reason and carries no
     model, metrics or promotion."""
@@ -204,11 +290,42 @@ class RankerReport(BaseModel):
     promotion: PromotionDecision | None = None
     model_version: str | None = None
     skipped_reason: str | None = Field(default=None, min_length=1)
+    # Orphan targets, candidate targets without an inbound body link on the full graph, are
+    # negatives by construction: their rows are left out of training and evaluation.
+    unlabelable_targets: int = Field(ge=0)
+    unlabelable_rows: int = Field(ge=0)
+    seed_results: tuple[SeedResult, ...] = ()
+    # Evaluation seeds whose split could not be evaluated, with the reason.
+    skipped_seeds: dict[int, str] = Field(default_factory=dict)
+    product_measures: tuple[ProductMeasures, ...] = ()
+    product_skipped_reason: str | None = Field(default=None, min_length=1)
     seconds: float = Field(ge=0)
     finished_at: AwareDatetime
 
+    @property
+    def seeds_worse(self) -> int:
+        """Seeds where the learned model is significantly worse than the plain one."""
+        return sum(result.significantly_worse for result in self.seed_results)
+
+    @property
+    def seeds_better(self) -> int:
+        """Seeds where the learned model is significantly better than the plain one."""
+        return sum(result.significantly_better for result in self.seed_results)
+
     @model_validator(mode="after")
     def _consistent(self) -> Self:
+        seeds = [result.seed for result in self.seed_results]
+        if len(set(seeds)) != len(seeds) or not set(seeds) <= set(self.settings.evaluation_seeds):
+            raise ValueError("seed results are for distinct evaluation seeds")
+        if not set(self.skipped_seeds) <= set(self.settings.evaluation_seeds) or set(
+            self.skipped_seeds
+        ) & set(seeds):
+            raise ValueError("skipped seeds are evaluation seeds without a result")
+        if not all(reason.strip() for reason in self.skipped_seeds.values()):
+            raise ValueError("a skipped seed names its reason")
+        measured = [entry.scorer for entry in self.product_measures]
+        if len(set(measured)) != len(measured):
+            raise ValueError("a scorer is measured twice")
         ids = [summary.round for summary in self.rounds]
         if ids != sorted(set(ids)) or any(r >= self.settings.rounds for r in ids):
             raise ValueError("rounds are unique, ascending and within the settings")
@@ -237,8 +354,16 @@ class RankerReport(BaseModel):
             model = (self.best_iteration, self.promotion, self.model_version, self.dominant_feature)
             if any(value is not None for value in model) or self.metrics or self.importance:
                 raise ValueError("a skipped run has no model, metrics or promotion")
+            if self.seed_results or self.skipped_seeds or self.product_measures:
+                raise ValueError(
+                    "a skipped run has no seed results, skipped seeds or product measures"
+                )
         elif self.best_iteration is None or not self.metrics:
             raise ValueError("a trained run has a best iteration and metrics")
+        elif {*seeds, *self.skipped_seeds} != set(self.settings.evaluation_seeds):
+            raise ValueError("a trained run has a result or a skip reason for every seed")
+        elif (not self.product_measures) != (self.product_skipped_reason is not None):
+            raise ValueError("a trained run has product measures or the reason it has none")
         return self
 
 

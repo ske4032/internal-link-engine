@@ -117,12 +117,15 @@ from linking_engine.models.quality import (
 from linking_engine.models.ranking import (
     HeldOutSettings,
     ImportanceEntry,
+    NdcgInterval,
+    ProductMeasures,
     PromotionDecision,
     RankerParams,
     RankerReport,
     RankingMetrics,
     RankReport,
     RoundSummary,
+    SeedResult,
 )
 from linking_engine.models.recommendation import AnchorCandidate, Recommendation
 from linking_engine.models.relevance import LinkRelevance, LinkRelevanceReport, ScoreDistribution
@@ -214,6 +217,7 @@ __all__ = [
     "LinkRelevanceCheck",
     "LinkRelevanceReport",
     "LinkText",
+    "NdcgInterval",
     "OrphanLabel",
     "Page",
     "PageCentrality",
@@ -230,6 +234,7 @@ __all__ = [
     "PairSignals",
     "PassReport",
     "PrepareReport",
+    "ProductMeasures",
     "PromotionDecision",
     "QualityAlert",
     "QualityBaseline",
@@ -253,6 +258,7 @@ __all__ = [
     "ScorerCheck",
     "ScorerName",
     "ScorerWeights",
+    "SeedResult",
     "SemanticThreshold",
     "SentenceTarget",
     "SignalReport",

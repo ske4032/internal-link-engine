@@ -34,23 +34,29 @@ from linking_engine.ml.ranking import (
     MODEL_COLUMNS,
     PLACEMENT_COLUMNS,
     PREDICT_CHUNK,
+    PRODUCT_COLUMNS,
     Trained,
     bootstrap_ci,
     dominant_feature,
     group_ndcg,
     importance,
     ndcg_at,
+    params_for,
     placement_gain_share,
     placement_shares,
     positive_groups,
     precision_at,
     predict,
+    product_measures,
     promotion,
     ranking_metrics,
+    seed_result,
+    seed_split,
     split_sources,
     summarise_ranker,
     train,
     with_groups,
+    without_orphan_targets,
 )
 from linking_engine.models import HeldOutSettings, RankerParams, ScorerName
 
@@ -65,7 +71,10 @@ PLANTED_COLUMNS = (
     "target_hub_size",
     "target_inbound_count",
 )
-PARAMS = RankerParams(max_rounds=300, early_stopping_rounds=30)
+# #24's grades are not relevance-monotone by design: the bridge gap outranks the same topic.
+PARAMS = RankerParams(max_rounds=300, early_stopping_rounds=30, monotone_increasing=())
+RELEVANCE = ("content_cosine", "anchor_target_fit", "context_relevance")
+HUMP_COLUMNS = (*RELEVANCE, "same_hub")
 LOG3 = math.log2(3)
 
 
@@ -380,6 +389,241 @@ def test_predict_1_25m_rows_bounded_memory(planted: pandas.DataFrame) -> None:
     )
 
 
+# ── relevance-monotone constraints ──────────────────────────────────────────
+
+
+def humped_frame(sources: int = 60, targets: int = 40) -> pandas.DataFrame:
+    """Groups whose grades peak at mid values of each relevance column, like near-duplicates
+    that are never linked: an unconstrained model learns to lower the score at the top."""
+    rng = np.random.default_rng(94)
+    rows = sources * targets
+    frame = pandas.DataFrame(
+        {
+            "round": np.zeros(rows, dtype=np.int16),
+            "source_url": [f"example.com/s{i // targets}" for i in range(rows)],
+            "target_url": [f"example.com/t{i % targets}" for i in range(rows)],
+            **{column: rng.random(rows) for column in RELEVANCE},
+            "same_hub": rng.integers(0, 2, rows).astype(np.float64),
+        }
+    )
+    hump = sum(4 * frame[c] * (1 - frame[c]) for c in RELEVANCE) + frame["same_hub"]
+    frame["hump"] = hump + rng.normal(0, 0.2, rows)
+    rank = frame.groupby("source_url")["hump"].rank(ascending=False, method="first")
+    frame["label"] = np.select([rank <= 3, rank <= 8], [2, 1], 0)
+    return frame.drop(columns="hump")
+
+
+def largest_drop_and_rise(
+    model: Trained, frame: pandas.DataFrame, column: str
+) -> tuple[float, float]:
+    """Each of 50 pairs scored with ``column`` swept over [0, 1], the rest fixed: the largest fall
+    and the largest rise of a score from one step to the next."""
+    grid = np.linspace(0.0, 1.0, 41)
+    base = frame.iloc[:50].loc[:, list(model.columns)]
+    swept = base.loc[base.index.repeat(len(grid))].assign(**{column: np.tile(grid, len(base))})
+    scores = model.booster.predict(swept.to_numpy(dtype=np.float64)).reshape(len(base), len(grid))
+    steps = np.diff(scores, axis=1)
+    return float(-steps.min()), float(steps.max())
+
+
+@pytest.fixture(scope="module")
+def humped() -> tuple[pandas.DataFrame, pandas.DataFrame]:
+    frame = humped_frame()
+    valid = frame["source_url"].isin(split_sources(frame["source_url"], share=0.3, seed=7))
+    return frame[~valid], frame[valid]
+
+
+def test_monotone_columns_only_raise_a_score(
+    humped: tuple[pandas.DataFrame, pandas.DataFrame],
+) -> None:
+    constrained = train(*humped, HUMP_COLUMNS, RankerParams(max_rounds=200))
+    free = train(*humped, HUMP_COLUMNS, RankerParams(max_rounds=200, monotone_increasing=()))
+
+    assert RankerParams().monotone_increasing == RELEVANCE
+    free_drops = [largest_drop_and_rise(free, humped[1], c)[0] for c in RELEVANCE]
+    assert max(free_drops) > 1e-3, "the fixture never makes a free model lower a score"
+    for column in RELEVANCE:
+        drop, rise = largest_drop_and_rise(constrained, humped[1], column)
+        assert drop <= 1e-12, f"raising {column} lowered a score by {drop:.3g}"
+        assert rise > 0, f"the constrained model ignores {column}"
+
+
+def test_empty_monotone_turns_constraints_off(
+    humped: tuple[pandas.DataFrame, pandas.DataFrame],
+) -> None:
+    constrained = train(*humped, HUMP_COLUMNS, RankerParams(max_rounds=20)).booster
+    free = train(*humped, HUMP_COLUMNS, RankerParams(max_rounds=20, monotone_increasing=()))
+
+    settings = constrained.model_to_string()
+    assert "[monotone_constraints: 1,1,1,0]" in settings
+    assert "[monotone_constraints_method: advanced]" in settings
+    unset = free.booster.model_to_string()
+    assert "[monotone_constraints: ]" in unset
+    assert "monotone_constraints=" not in unset, "a constraint reached the trees"
+    only_cosine = train(
+        *humped, HUMP_COLUMNS, RankerParams(max_rounds=20, monotone_increasing=("content_cosine",))
+    )
+    assert "[monotone_constraints: 1,0,0,0]" in only_cosine.booster.model_to_string()
+
+
+def test_unknown_monotone_column_raises(
+    humped: tuple[pandas.DataFrame, pandas.DataFrame],
+) -> None:
+    with pytest.raises(ValueError, match="anchor_target_fit"):
+        train(*humped, ("content_cosine", "same_hub"), RankerParams(max_rounds=5))
+    with pytest.raises(ValueError, match="no_such_column"):
+        train(
+            *humped,
+            HUMP_COLUMNS,
+            RankerParams(max_rounds=5, monotone_increasing=("content_cosine", "no_such_column")),
+        )
+
+
+def test_reduced_models_keep_the_constraints_on_the_columns_they_have() -> None:
+    reduced = params_for(RankerParams(), EXCL_PLACEMENT_COLUMNS)
+
+    assert reduced.monotone_increasing == ("content_cosine",)
+    assert params_for(RankerParams(), MODEL_COLUMNS).monotone_increasing == RELEVANCE
+    assert params_for(RankerParams(monotone_increasing=()), MODEL_COLUMNS).monotone_increasing == ()
+    with pytest.raises(ValueError, match="no_such_column"):
+        params_for(RankerParams(monotone_increasing=("no_such_column",)), MODEL_COLUMNS)
+
+
+# ── orphan targets, split seeds and seed results ────────────────────────────
+
+
+def test_orphan_target_rows_are_left_out_and_nothing_else() -> None:
+    frame = metric_frame().assign(target_url=["a", "b", "o", "b", "b", "a"])
+
+    kept = without_orphan_targets(frame, {"o", "never-a-target"})
+
+    assert kept["target_url"].tolist() == ["a", "b", "b", "b", "a"]
+    assert without_orphan_targets(frame, set()).equals(frame)
+
+
+def test_the_split_seed_gives_the_fixed_split_and_other_seeds_redraw_it() -> None:
+    sources = [f"example.com/p{i}" for i in range(400)]
+    settings = HeldOutSettings()
+
+    test, valid = seed_split(sources, settings, settings.split_seed)
+
+    assert test == split_sources(sources, share=0.2, seed=7)
+    assert valid == split_sources(set(sources) - test, share=0.1, seed=8)
+    for seed in settings.evaluation_seeds:
+        other_test, other_valid = seed_split(sources, settings, seed)
+        assert not other_test & other_valid, f"seed {seed}: a source on both sides"
+        if seed != settings.split_seed:
+            assert other_test != test, f"seed {seed} does not redraw the test sources"
+
+
+def test_a_seed_result_pairs_learned_with_plain_over_the_seeds_test_groups() -> None:
+    frame = metric_frame().assign(plain=[0.1, 0.9, 0.9, 0.1, 0.4, 0.6], baseline=0.5)
+
+    found = seed_result(
+        frame, seed=11, learned="score", plain="plain", baseline="baseline", bootstrap_seed=3
+    )
+
+    learned = [1.0, 1 / LOG3, 1.0]
+    plain = [1 / LOG3, 1.0, 1 / LOG3]
+    assert (found.seed, found.test_pages) == (11, 2)
+    assert found.learned[0] == pytest.approx(np.mean(learned))
+    assert found.plain[0] == pytest.approx(np.mean(plain))
+    # Ties keep target order: "a" first, the positive in two of three groups.
+    assert found.baseline[0] == pytest.approx((1 + 1 / LOG3 + 1) / 3)
+    assert found.delta == pytest.approx(np.mean(np.subtract(learned, plain)))
+    assert found.delta_ci_low <= found.delta <= found.delta_ci_high
+    for triple in (found.learned, found.plain, found.baseline):
+        assert triple[1] <= triple[0] <= triple[2]
+    again = seed_result(
+        frame, seed=11, learned="score", plain="plain", baseline="baseline", bootstrap_seed=3
+    )
+    assert again == found
+    with pytest.raises(ValueError, match="without a positive"):
+        seed_result(
+            frame.assign(label=0),
+            seed=11,
+            learned="score",
+            plain="plain",
+            baseline="baseline",
+            bootstrap_seed=3,
+        )
+
+
+# ── product measures ────────────────────────────────────────────────────────
+
+
+def product_frame() -> pandas.DataFrame:
+    """Three source pages. s2 ties "o2" with "a" (target order puts "a" first); s3 has a pair
+    without a score (last) and an orphan without a cosine or a hub."""
+    nan = math.nan
+    rows = [
+        ("s1", "a", 0.9, 0.8, 1.0),
+        ("s1", "b", 0.5, 0.4, 0.0),
+        ("s1", "o1", 0.7, 0.6, 0.0),
+        ("s2", "c", 0.8, 0.9, 1.0),
+        ("s2", "o2", 0.3, nan, 0.0),
+        ("s2", "a", 0.3, 0.2, 1.0),
+        ("s3", "b", nan, 0.3, 0.0),
+        ("s3", "o1", 0.2, nan, nan),
+    ]
+    return pandas.DataFrame(
+        rows, columns=["source_url", "target_url", "score", "content_cosine", "same_hub"]
+    )
+
+
+def test_product_measures_known_values() -> None:
+    orphans = {"o1", "o2", "never-a-candidate"}
+
+    two = product_measures(product_frame(), "score", ScorerName.LEARNED, orphans, k=2)
+    one = product_measures(product_frame(), "score", ScorerName.PLAIN, orphans, k=1)
+
+    # First two: s1 a, o1; s2 c, a; s3 o1, b.
+    assert (two.scorer, two.k) == (ScorerName.LEARNED, 2)
+    assert two.top_relevance == pytest.approx((0.8 + 0.6 + 0.9 + 0.2 + 0.3) / 5)
+    assert two.same_hub_share == pytest.approx(3 / 6)
+    assert two.orphan_slot_share == pytest.approx(2 / 6)
+    assert two.orphan_page_share == pytest.approx(2 / 5), "orphans among the candidate targets"
+    assert two.orphans_reached == pytest.approx(1 / 2), "o2 is never shown"
+    # First one: s1 a, s2 c, s3 o1.
+    assert one.top_relevance == pytest.approx((0.8 + 0.9) / 2)
+    assert one.same_hub_share == pytest.approx(2 / 3)
+    assert one.orphan_slot_share == pytest.approx(1 / 3)
+    assert product_measures(product_frame(), "score", ScorerName.LEARNED, orphans).k == 10
+    # A second frame, worked by hand independently: the tie at 2.0 goes to "o1", which sorts
+    # before "t2"; a pair without a score comes last.
+    nan = math.nan
+    rows = [
+        ("s1", "t1", 3.0, 0.9, 1.0),
+        ("s1", "t2", 2.0, 0.5, 0.0),
+        ("s1", "o1", 2.0, 0.4, 1.0),
+        ("s1", "t3", 1.0, 0.1, nan),
+        ("s2", "t1", nan, 0.8, 1.0),
+        ("s2", "o1", 5.0, nan, 0.0),
+        ("s2", "o2", 4.0, 0.2, 0.0),
+    ]
+    frame = pandas.DataFrame(rows, columns=["source_url", "target_url", "s", *PRODUCT_COLUMNS])
+    found = product_measures(frame, "s", ScorerName.LEARNED, {"o1", "o2", "zz"}, k=2)
+    assert (found.top_relevance, found.same_hub_share, found.orphan_slot_share) == (
+        pytest.approx(0.5),
+        0.5,
+        0.75,
+    )
+    assert (found.orphan_page_share, found.orphans_reached) == (pytest.approx(0.4), 1.0)
+    none = product_measures(product_frame(), "score", ScorerName.BASELINE, set(), k=2)
+    assert (none.orphan_slot_share, none.orphan_page_share, none.orphans_reached) == (0, 0, None)
+
+
+def test_product_measures_refuse_what_they_cannot_measure() -> None:
+    with pytest.raises(ValueError, match="same_hub"):
+        product_measures(
+            product_frame().drop(columns="same_hub"), "score", ScorerName.LEARNED, set()
+        )
+    with pytest.raises(ValueError, match="no candidate pairs"):
+        product_measures(product_frame().iloc[:0], "score", ScorerName.LEARNED, set())
+    with pytest.raises(ValueError, match="k must be at least 1"):
+        product_measures(product_frame(), "score", ScorerName.LEARNED, set(), k=0)
+
+
 # ── importance and promotion ────────────────────────────────────────────────
 
 
@@ -585,11 +829,43 @@ def test_the_summary_states_what_ran_what_it_achieved_and_the_limitations() -> N
     )
     assert "rests mostly on whether a pair has an anchor" in summarise_ranker(placed)
     assert "50% of the body links hidden once, the rest never" in summarise_ranker(
-        make.report(settings=HeldOutSettings(rounds=5), rounds=(), positives=0)
+        make.report(
+            settings=HeldOutSettings(rounds=5, evaluation_seeds=(7, 11)), rounds=(), positives=0
+        )
     )
     assert "every body link hidden in exactly one round" in summarise_ranker(
-        make.report(settings=HeldOutSettings(), rounds=(), positives=0)
+        make.report(settings=HeldOutSettings(evaluation_seeds=(7, 11)), rounds=(), positives=0)
     )
+    # #94: what the orphan rule, the constraints and the seeds did, in plain words.
+    assert (
+        "Orphan targets: 6 candidate target pages have no inbound body link on the full graph"
+        in text
+    )
+    assert "480 candidate rows are unlabelable" in text
+    assert (
+        "Monotone-increasing columns: content_cosine, anchor_target_fit, context_relevance" in text
+    )
+    assert "Across 2 evaluated split seeds (7, 11)" in text
+    assert "the split seed (7) reuses the fixed-split models" in text
+    assert "significantly worse in 1 of 2 evaluated seeds and better in 0" in text
+    skipping = summarise_ranker(
+        make.report(
+            seed_results=(make.seed_result(7),),
+            skipped_seeds={11: "24 test groups with a hidden link, fewer than 30"},
+        )
+    )
+    assert "seed 11 skipped: 24 test groups with a hidden link, fewer than 30" in skipping
+    assert "On the production candidates, the first 10 pairs of every source page" in text
+    assert "held-out NDCG says nothing about how orphans are ranked" in text
+    unconstrained = summarise_ranker(
+        make.report(
+            params=RankerParams(monotone_increasing=()),
+            product_measures=(),
+            product_skipped_reason="no anchor choices for the tenant",
+        )
+    )
+    assert "No monotone constraints." in unconstrained
+    assert "Product measures skipped: no anchor choices for the tenant" in unconstrained
     skipped = summarise_ranker(make.skipped(tenant_id="acme"))
     assert "Skipped: 12 training groups" in skipped
     assert "mean average precision" in skipped
