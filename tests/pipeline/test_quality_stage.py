@@ -64,7 +64,6 @@ from linking_engine.pipeline.analytics import (
     compute_hubs,
     load_link_graphs,
 )
-from linking_engine.pipeline.keyword_vectors import FILE
 from linking_engine.pipeline.quality import (
     evaluate_quality,
     git_sha,
@@ -581,7 +580,9 @@ async def test_a_planted_tenant_gets_every_check_and_nothing_is_written(
     assert await mongo_state(mongo) == stored_mongo, "Mongo changed"
     after = files(cache)
     assert {name: after[name] for name in matrices} == matrices, "a cached matrix changed"
-    assert set(after) - set(matrices) == {f"{tenant}/{FILE}"}, "held-out data reached the cache"
+    assert set(after) - set(matrices) == {f"{tenant}/keyword_vectors.parquet"}, (
+        "held-out data reached the cache"
+    )
 
     assert report.tenant_id == tenant
     assert report.not_applicable == ()
@@ -977,7 +978,8 @@ async def test_a_voyage_failure_leaves_only_keyword_relevance_not_applicable(
             mongo,
             tenant,
             cache_dir=tmp_path,
-            voyage=client(voyage, settings(max_attempts=1)),
+            # One request at a time, so the failure is provably the only call made.
+            voyage=client(voyage, settings(max_attempts=1, max_concurrent_requests=1)),
         )
 
     assert voyage.call_count == 1

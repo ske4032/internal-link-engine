@@ -288,6 +288,47 @@ async def test_page_records_refuse_an_empty_batch_before_any_read(urls: list[str
 
 
 @pytest.mark.integration
+async def test_page_titles_read_every_title_of_the_tenant_only(
+    mongo: MongoRepo, tenant: str
+) -> None:
+    other = f"{tenant}-other"
+    await mongo.write_pages(
+        tenant,
+        [record("/a", meta_title="Boots | Summit"), record("/b", meta_title=None), record("/c")],
+        [],
+    )
+    await mongo.write_pages(other, [record("/a", meta_title="Tents | Other")], [])
+
+    titles = await mongo.page_titles(tenant, batch_size=2)
+
+    assert sorted(titles, key=str) == ["Boots | Summit", None, "Title /c"]
+    assert await mongo.page_titles(f"{tenant}-empty") == []
+    await mongo.delete_tenant(other)
+
+
+@pytest.mark.integration
+async def test_a_non_text_title_fails_the_read(mongo: MongoRepo, tenant: str) -> None:
+    await mongo.write_pages(tenant, [record("/a")], [])
+    await mongo._db["pages"].update_one(
+        {"tenantId": tenant, "url": url("/a")}, {"$set": {"metaTitle": 42}}
+    )
+
+    with pytest.raises(DatabaseReadError, match="non-text title"):
+        await mongo.page_titles(tenant)
+
+
+@pytest.mark.parametrize("tenant_id", ["", " "])
+async def test_page_titles_refuse_a_blank_tenant_before_any_read(tenant_id: str) -> None:
+    offline = MongoRepo(
+        AsyncMongoClient("mongodb://127.0.0.1:1", serverSelectionTimeoutMS=200),
+        "linking_engine_test",
+    )
+    with pytest.raises(ValueError, match="tenant_id"):
+        await offline.page_titles(tenant_id)
+    await offline.close()
+
+
+@pytest.mark.integration
 async def test_tenants_are_isolated(mongo: MongoRepo, tenant: str) -> None:
     other = f"{tenant}-other"
     for t in (tenant, other):

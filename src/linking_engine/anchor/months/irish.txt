@@ -1,0 +1,24 @@
+# Month names (full and abbreviated), casefolded, one per line as <month>\t<name>. From the
+# Unicode CLDR locale data (Indonesian added by hand); compared on the language's stems.
+1	ean
+1	eanair
+2	fea
+2	feabhra
+3	mhárta
+3	már
+4	abr
+4	aibreáin
+5	bea
+5	bealtaine
+6	mei
+6	mheithimh
+7	iul
+7	iúil
+8	lún
+8	lúnasa
+9	mnf
+10	drf
+11	sam
+11	samhna
+12	nol
+12	nollag

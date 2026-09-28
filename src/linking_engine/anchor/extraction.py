@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import resources
 from itertools import pairwise
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
 import numpy as np
@@ -78,7 +79,8 @@ SNOWBALL: Final = {
     "tr": "turkish",
     "yi": "yiddish",
 }
-_LADDER: Final = tuple(AnchorRung)
+# The lexical rungs, in order; the semantic rung (#22) is not part of the ladder.
+_LADDER: Final = (AnchorRung.EXACT, AnchorRung.STEMMED, AnchorRung.STEM_SET)
 
 _APOSTROPHES: Final = (
     "\N{RIGHT SINGLE QUOTATION MARK}"
@@ -196,6 +198,28 @@ def _stop_words(algorithm: str) -> frozenset[str]:
     return frozenset(word.casefold().translate(_FOLD) for word in words)
 
 
+@functools.cache
+def _month_stems(algorithm: str) -> Mapping[str, int]:
+    listed = resources.files("linking_engine.anchor").joinpath("months", f"{algorithm}.txt")
+    if not listed.is_file():
+        return MappingProxyType({})
+    stem = snowballstemmer.stemmer(algorithm).stemWord
+    found: dict[str, int] = {}
+    for line in listed.read_text(encoding="utf-8").splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        number, name = line.split("\t")
+        found.setdefault(str(stem(name.casefold().translate(_FOLD))), int(number))
+    return MappingProxyType(found)
+
+
+def month_stems(language: str | None) -> Mapping[str, int]:
+    """The packaged month names (full and abbreviated) of the language's stemmer algorithm, as
+    stems to month numbers; none for a language without a list."""
+    algorithm = algorithm_for(language)
+    return _month_stems(algorithm) if algorithm else MappingProxyType({})
+
+
 def stop_words_for(language: str | None) -> frozenset[str]:
     """The packaged stop words of the language's stemmer algorithm, as token keys; none for a
     language without a list."""
@@ -207,11 +231,13 @@ class Stems:
     """One language's token stems, cached for the run, and its stop words; casefolded tokens as
     they are when the language has no stemmer."""
 
-    __slots__ = ("_cache", "_stem", "language", "stop_words")
+    __slots__ = ("_cache", "_stem", "language", "months", "stop_words")
 
     def __init__(self, language: str | None) -> None:
         self.language = language
         self.stop_words = stop_words_for(language)
+        # Month name stems -> month number; empty for a language without a list.
+        self.months = month_stems(language)
         self._stem = stemmer_for(language)
         self._cache: dict[str, str] = {}
 
@@ -257,6 +283,59 @@ def keyword_tokens(keyword: str) -> list[str]:
     return [token.folded for token in tokens(keyword)]
 
 
+def _block_ids(gaps: Sequence[str]) -> list[int]:
+    """The block of each token from the gap before it ("" before the first): a block ends at
+    punctuation with whitespace around it (", ", " - "), as in `SourceIndex`."""
+    block = 0
+    found: list[int] = []
+    for i, gap in enumerate(gaps):
+        if i and not _compound(gap) and gap != " ":
+            block += 1
+        found.append(block)
+    return found
+
+
+# A four-digit number of this form is a year, which many texts share.
+_YEAR: Final = re.compile(r"(?:19|20)\d\d")
+
+
+def strong_identifier(identifier: str) -> bool:
+    """A code that names one thing: letters with digits (KB5034441, 22H2), or a number of four
+    or more digits that is not a year (16856). Years, small numbers and months are not."""
+    if identifier.startswith("month:"):
+        return False
+    if any(char.isalpha() for char in identifier) and any(char.isdigit() for char in identifier):
+        return True
+    return identifier.isdigit() and len(identifier) >= 4 and not _YEAR.fullmatch(identifier)
+
+
+def _identifiers(
+    folded: Sequence[str], blocks: Sequence[int], stems: Stems, brand: frozenset[str]
+) -> frozenset[str]:
+    """Tokens holding a digit, and ``month:<n>`` for a month name next to one in its block;
+    ``brand`` tokens are neither."""
+    digit = [token not in brand and any(char.isdigit() for char in token) for token in folded]
+    found = {token for token, has in zip(folded, digit, strict=True) if has}
+    if stems.months:
+        for i, token in enumerate(folded):
+            month = stems.months.get(stems(token)) if token not in brand else None
+            if month is not None and any(
+                0 <= j < len(folded) and digit[j] and blocks[j] == blocks[i] for j in (i - 1, i + 1)
+            ):
+                found.add(f"month:{month}")
+    return frozenset(found)
+
+
+def identifiers(text: str, stems: Stems, brand: frozenset[str] = frozenset()) -> frozenset[str]:
+    """What a text names that a synonym cannot stand in for: its tokens holding a digit (ids,
+    versions, years), folded, and its month names next to one of them ("July 2024", "2 July"),
+    as ``month:<n>``. A phrase stands for a keyword only when both hold the same ones. The
+    tenant's ``brand`` tokens (folded) never count, even with a digit ("Acme7")."""
+    found = tokens(text)
+    gaps = ["", *(_gap(text[a.end : b.start]) for a, b in pairwise(found))]
+    return _identifiers([token.folded for token in found], _block_ids(gaps), stems, brand)
+
+
 def content_stems(keyword: Sequence[str], stems: Stems) -> frozenset[str]:
     """The distinct stems of a keyword's tokens that are not stop words, what the stem set rung
     compares."""
@@ -287,9 +366,10 @@ class _Keyword:
     variants: tuple[_Needle, ...]
     # The distinct stems of its content tokens, what the stem set rung compares.
     stems: frozenset[str]
+    identifiers: frozenset[str]
 
 
-def _keyword(keyword: str, stems: Stems) -> _Keyword:
+def _keyword(keyword: str, stems: Stems, brand: frozenset[str] = frozenset()) -> _Keyword:
     """The keyword verbatim, its stemmed variants (whole, then with one modifier dropped at
     either end), and its content stems.
 
@@ -313,6 +393,7 @@ def _keyword(keyword: str, stems: Stems) -> _Keyword:
         exact=exact,
         variants=tuple(variants),
         stems=frozenset(stem for stem, kept in zip(stemmed, content, strict=True) if kept),
+        identifiers=_identifiers(folded, _block_ids(["", *gaps]), stems, brand),
     )
 
 
@@ -331,15 +412,26 @@ class SourceIndex:
         "_tokens",
         "_words",
         "body",
+        "brand",
         "sentences",
         "stems",
         "url",
     )
 
-    def __init__(self, url: str, body: str, headings: Iterable[str], stems: Stems) -> None:
+    def __init__(
+        self,
+        url: str,
+        body: str,
+        headings: Iterable[str],
+        stems: Stems,
+        *,
+        brand: frozenset[str] = frozenset(),
+    ) -> None:
         self.url = url
         self.body = body
         self.stems = stems
+        # The tenant's brand tokens (folded), which never count as identifiers.
+        self.brand = brand
         self.sentences = sentences(body, headings)
         self._tokens: list[list[Token]] = []
         self._folded: list[list[str]] = []
@@ -412,13 +504,18 @@ class SourceIndex:
         return runs
 
     def _stem_sets(
-        self, stems: frozenset[str], threshold: float
+        self,
+        stems: frozenset[str],
+        threshold: float,
+        identifiers: frozenset[str] = frozenset(),
     ) -> list[tuple[float, int, int, int]]:
         """(Jaccard, sentence position, first token, last token) of every span inside one block
         whose first and last tokens are content words with a keyword stem, with at most one stop
         word between them and no compound cut, reaching the threshold. The keyword stems it holds
-        lie in at least two of its words (a compound is one), unless it holds all of them. Stop
-        words count in neither set."""
+        lie in at least two of its words (a compound is one), unless it holds all of them or the
+        keyword has a strong identifier and the span holds exactly the keyword's ``identifiers``
+        (a code written as one compound, as CVE-2026-16856). Stop words count in neither set."""
+        strong = any(strong_identifier(identifier) for identifier in identifiers)
         spans: list[tuple[float, int, int, int]] = []
         for stem in sorted(stems):
             for position, first in self._by_stem.get(stem, ()):
@@ -444,8 +541,12 @@ class SourceIndex:
                     jaccard = shared / len(span | stems)
                     if (
                         shared >= MIN_SHARED_STEMS
-                        and (len(sharing) >= MIN_SHARED_STEMS or stems <= span)
                         and jaccard >= threshold
+                        and (
+                            len(sharing) >= MIN_SHARED_STEMS
+                            or stems <= span
+                            or (strong and self._agrees(position, first, last, identifiers))
+                        )
                     ):
                         spans.append((jaccard, position, first, last))
         return spans
@@ -454,6 +555,36 @@ class SourceIndex:
         row = self._tokens[position]
         return row[first].start, row[last].end
 
+    def _agrees(self, position: int, first: int, last: int, wanted: frozenset[str]) -> bool:
+        """Whether the span holds exactly the keyword's identifiers."""
+        span = slice(first, last + 1)
+        found = _identifiers(
+            self._folded[position][span], self._blocks[position][span], self.stems, self.brand
+        )
+        return found == wanted
+
+    def phrase_spans(self, position: int) -> list[tuple[int, int, int]]:
+        """(first token, last token, content tokens) of every span of a sentence the ladder
+        accepts as a phrase, whatever the keyword: MIN_SPAN to MAX_SPAN tokens inside one block,
+        content words at both edges, at most MAX_INNER_STOP_WORDS stop words between them and
+        no compound cut; in token order."""
+        content, blocks = self._content[position], self._blocks[position]
+        spans: list[tuple[int, int, int]] = []
+        for first in range(len(content)):
+            if not content[first]:
+                continue
+            for last in range(first + MIN_SPAN - 1, min(first + MAX_SPAN, len(content))):
+                if blocks[last] != blocks[first]:
+                    break
+                inner = content[first : last + 1].count(False)
+                if (
+                    content[last]
+                    and inner <= MAX_INNER_STOP_WORDS
+                    and self._whole(position, first, last)
+                ):
+                    spans.append((first, last, last - first + 1 - inner))
+        return spans
+
     def find(
         self,
         keyword: str,
@@ -461,9 +592,13 @@ class SourceIndex:
         existing: Sequence[tuple[int, int]],
         threshold: float,
         blocking: set[tuple[int, int]],
+        mismatched: set[tuple[int, int]],
     ) -> _Found | None:
         """The ladder for one keyword: the lowest rung that finds it, its earliest free place
-        there. The existing anchor spans that took a place go into ``blocking``."""
+        there. The existing anchor spans that took a place go into ``blocking``. Below the
+        exact rung a place must hold exactly the keyword's identifiers, so a modifier drop
+        cannot lose one and a stem set cannot swap one; a place refused so goes into
+        ``mismatched``."""
 
         def free(position: int, first: int, last: int) -> bool:
             start, end = self.span(position, first, last)
@@ -471,27 +606,33 @@ class SourceIndex:
             blocking.update(taken)
             return not taken
 
-        prepared = _keyword(keyword, self.stems)
+        def agrees(position: int, first: int, last: int) -> bool:
+            if self._agrees(position, first, last, prepared.identifiers):
+                return True
+            mismatched.add(self.span(position, first, last))
+            return False
+
+        prepared = _keyword(keyword, self.stems, self.brand)
         for position, first, last in self._runs(prepared.exact, stemmed=False):
             if free(position, first, last):
                 return _Found(AnchorRung.EXACT, position, first, last)
 
         runs = sorted(
-            (run for variant in prepared.variants for run in self._runs(variant, stemmed=True)),
+            {run for variant in prepared.variants for run in self._runs(variant, stemmed=True)},
             key=lambda run: (run[0], run[1], run[1] - run[2]),
         )
         for position, first, last in runs:
-            if free(position, first, last):
+            if agrees(position, first, last) and free(position, first, last):
                 return _Found(AnchorRung.STEMMED, position, first, last)
 
         if len(prepared.stems) < MIN_SHARED_STEMS:
             return None
         ranked = sorted(
-            self._stem_sets(prepared.stems, threshold),
+            self._stem_sets(prepared.stems, threshold, prepared.identifiers),
             key=lambda span: (-span[0], span[1], span[3] - span[2], span[2]),
         )
         for jaccard, position, first, last in ranked:
-            if free(position, first, last):
+            if agrees(position, first, last) and free(position, first, last):
                 return _Found(AnchorRung.STEM_SET, position, first, last, jaccard)
         return None
 
@@ -503,15 +644,19 @@ def extract(
     *,
     existing: Sequence[tuple[int, int]] = (),
     threshold: float = DEFAULT_THRESHOLD,
-) -> tuple[list[AnchorMatch], frozenset[tuple[int, int]]]:
+) -> tuple[list[AnchorMatch], frozenset[tuple[int, int]], frozenset[tuple[int, int]]]:
     """The target's ranked keywords, as (rank, text, source), found in the source page: one
-    match per keyword found, and the ``existing`` anchor spans that blocked a place."""
+    match per keyword found, the ``existing`` anchor spans that blocked a place, and the spans
+    refused because their identifiers disagreed with the keyword's."""
     if not 0 < threshold <= 1:
         raise ValueError("threshold must be in (0, 1]")
     matches: list[AnchorMatch] = []
     blocking: set[tuple[int, int]] = set()
+    mismatched: set[tuple[int, int]] = set()
     for rank, text, source in keywords:
-        found = index.find(text, existing=existing, threshold=threshold, blocking=blocking)
+        found = index.find(
+            text, existing=existing, threshold=threshold, blocking=blocking, mismatched=mismatched
+        )
         if found is None:
             continue
         sentence = index.sentences[found.sentence]
@@ -533,7 +678,7 @@ def extract(
                 stem_jaccard=found.jaccard,
             )
         )
-    return matches, frozenset(blocking)
+    return matches, frozenset(blocking), frozenset(mismatched)
 
 
 def anchor_report(
@@ -545,6 +690,7 @@ def anchor_report(
     bridge_pairs: int,
     pairs_with_keywords: int,
     overlapping: int,
+    identifier_mismatches: int = 0,
     located_anchors: int,
     unlocated_anchors: int,
     keywords: Iterable[tuple[str, str | None]],
@@ -589,16 +735,17 @@ def anchor_report(
         pairs_matched=len(best),
         primary_matched=len(primary),
         matches=len(matches),
-        by_rung={rung: rungs[rung] for rung in AnchorRung},
-        best_rung={rung: best_rungs[rung] for rung in AnchorRung},
+        by_rung={rung: rungs[rung] for rung in _LADDER},
+        best_rung={rung: best_rungs[rung] for rung in _LADDER},
         by_keyword_rank=dict(sorted(Counter(match.keyword_rank for match in matches).items())),
         by_rung_and_rank={
             rung: {rank: n for (found, rank), n in sorted(rung_ranks.items()) if found is rung}
-            for rung in AnchorRung
+            for rung in _LADDER
         },
         stem_jaccard_histogram=tuple(int(count) for count in jaccards),
         sentence_index_histogram=tuple(positions[i] for i in range(len(SENTENCE_INDEX_BINS))),
         overlapping_existing_anchors=overlapping,
+        identifier_mismatches=identifier_mismatches,
         existing_anchors_located=located_anchors,
         existing_anchors_unlocated=unlocated_anchors,
         single_token_keywords=_short_keywords(keywords),
@@ -648,6 +795,8 @@ def summarise_anchors(report: AnchorReport) -> str:
             f"({report.existing_anchors_located} located, {report.existing_anchors_unlocated} "
             f"not found in the body); {report.single_token_keywords} keywords with fewer than "
             "two content stems skip the stem set rung.",
+            f"{report.identifier_mismatches} stemmed or stem set places refused because their "
+            "numbers (ids, versions, years) disagreed with the keyword's.",
             f"{report.source_pages} source pages, {report.sources_without_body} without body "
             f"text. Stemmed: {languages or 'none'}. Casefolded only: {fallback or 'none'}.",
             f"{report.seconds:.1f} s.",

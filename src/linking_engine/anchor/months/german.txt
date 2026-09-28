@@ -1,0 +1,23 @@
+# Month names (full and abbreviated), casefolded, one per line as <month>\t<name>. From the
+# Unicode CLDR locale data (Indonesian added by hand); compared on the language's stems.
+1	jan
+1	januar
+2	feb
+2	februar
+3	maerz
+3	märz
+4	apr
+4	april
+5	mai
+6	juni
+7	juli
+8	aug
+8	august
+9	sep
+9	september
+10	okt
+10	oktober
+11	nov
+11	november
+12	dez
+12	dezember

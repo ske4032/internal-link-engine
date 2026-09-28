@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pyarrow.parquet as pq
 import pytest
 from mlflow import MlflowClient
 from mlflow.artifacts import load_dict, load_text
@@ -857,6 +858,51 @@ def run_text(client: MlflowClient, run_id: str) -> str:
             *(load_text(f"runs:/{run_id}/{a.path}") for a in client.list_artifacts(run_id)),
         ]
     )
+
+
+@pytest.mark.integration
+async def test_anchor_selection_flow_writes_both_files_and_logs_one_run_without_text(
+    graph: GraphRepo,
+    mongo: MongoRepo,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    monkeypatch.setenv("VOYAGE_API_KEY", VOYAGE_KEY)
+    fake = keyword_voyage()
+    use(monkeypatch, fake)
+    await seed_quality(graph, mongo, tenant)
+    stored_graph, stored_mongo = await graph_state(graph, tenant), await mongo_state(mongo)
+
+    report, path, run_id = await flows.anchor_selection_flow(tenant, tmp_path / "features")
+
+    assert await graph_state(graph, tenant) == stored_graph
+    assert await mongo_state(mongo) == stored_mongo
+    assert path == tmp_path / "features" / tenant / "anchor_choices.parquet"
+    assert (path.parent / "unanchored_pairs.parquet").is_file()
+    assert (report.semantic_skipped_reason, report.embedding_skipped_reason) == (None, None)
+    assert fake.call_count > 0
+    assert report.chosen > 0
+    client = MlflowClient(uri)
+    run = client.get_run(run_id)
+    assert client.get_experiment(run.info.experiment_id).name == f"analytics-{tenant}"
+    assert (run.data.tags["tenant_id"], run.data.tags["stage"]) == (tenant, "anchor-selection")
+    assert run.data.metrics["chosen"] == report.chosen
+    for name in ("anchor_score_hist", "semantic_similarity_hist"):
+        assert len(client.get_metric_history(run_id, name)) == 20, name
+    choices = pq.read_table(path).to_pandas()
+    texts = {
+        *URLS,
+        *KEYWORDS,
+        *choices["phrase"],
+        *choices["sentence"],
+        *choices["keyword"],
+    }
+    logged = run_text(client, run_id)
+    assert [text for text in texts if text in logged] == [], "text reached the MLflow run"
 
 
 @pytest.mark.integration

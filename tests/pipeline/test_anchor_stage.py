@@ -80,6 +80,7 @@ ANCHORS = [
     "sentence_index",
     "sentence_start",
     "stem_jaccard",
+    "semantic_similarity",
 ]
 
 
@@ -140,6 +141,7 @@ def write_bridges(cache_dir: Path, tenant: str, pairs: list[tuple[str, str]]) ->
                 "source_url": [url(s) for s, _ in pairs],
                 "target_url": [url(t) for _, t in pairs],
                 "rank": list(range(1, len(pairs) + 1)),
+                "similarity": [0.5] * len(pairs),
             }
         ),
         folder / "bridges.parquet",
@@ -238,6 +240,65 @@ async def test_without_a_bridges_file_only_the_candidates_source_pages_are_read(
     assert report.bridge_pairs == 0
     assert report.stem_set_threshold == 1.0, "the tenant's own threshold applies"
     assert path.is_file()
+
+
+async def seed_branded(graph: GraphRepo, mongo: MongoRepo, tenant: str, *, suffix: str) -> None:
+    """A guide whose copy names the target's keyword without the brand word that opens it."""
+    pages = {"/guide": "Our hydraulic presses ship fast.", "/presses": "Presses in stock."}
+    await graph.upsert_pages(
+        tenant,
+        [Page(url=url(p), status_code=200, is_indexable=True, language="en") for p in pages],
+    )
+    await graph._auto(
+        "UNWIND $rows AS row MATCH (p:Page {tenantId: $t, url: row.url}) "
+        "SET p.content_embedding = row.vec",
+        t=tenant,
+        rows=[
+            {"url": url("/guide"), "vec": [1.0, 0.1]},
+            {"url": url("/presses"), "vec": [1.0, 0.0]},
+        ],
+    )
+    strategic = KeywordSource.CLIENT_STRATEGIC
+    await graph.replace_keyword_targets(
+        tenant,
+        strategic,
+        [
+            KeywordTarget(
+                url=url("/presses"),
+                text="Acme7 hydraulic press",
+                language="en",
+                source=strategic,
+                rung=KeywordRung.STRATEGIC,
+            )
+        ],
+    )
+    await mongo.write_pages(
+        tenant,
+        [
+            page_record(p, 200, f"{p[1:].title()}{suffix}", None, body, "en")
+            for p, body in pages.items()
+        ],
+        [],
+    )
+
+
+@pytest.mark.integration
+async def test_a_brand_with_a_digit_is_no_identifier_the_ladder_must_keep(
+    graph: GraphRepo, mongo: MongoRepo, tenant: str, tmp_path: Path
+) -> None:
+    branded, plain = tenant, f"{tenant}-plain"
+    await seed_branded(graph, mongo, branded, suffix=" | Acme7 Tools")
+    await seed_branded(graph, mongo, plain, suffix="")
+
+    kept, path = await extract_anchors(graph, mongo, branded, cache_dir=tmp_path)
+    refused, _ = await extract_anchors(graph, mongo, plain, cache_dir=tmp_path)
+
+    # "acme7" is the brand's, so dropping it loses no identifier.
+    [row] = pq.read_table(path).to_pylist()
+    assert (row["rung"], row["phrase"]) == ("STEMMED", "hydraulic presses")
+    assert kept.identifier_mismatches == 0
+    # Without the brand, "acme7" reads as a model number the phrase lacks.
+    assert (refused.matches, refused.identifier_mismatches) == (0, 1)
 
 
 def test_the_parquet_schema_is_every_anchor_match_field_in_order() -> None:

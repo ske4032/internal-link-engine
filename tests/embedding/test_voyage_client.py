@@ -252,9 +252,11 @@ async def test_iter_embed_api_tokens_are_the_sdk_total_not_the_local_count() -> 
     assert [batch.api_tokens for batch in batches] == [n + API_TOKEN_DRIFT for n in local]
 
 
-async def test_iter_embed_requests_lazily_one_batch_at_a_time() -> None:
+async def test_one_request_at_a_time_waits_for_the_caller_before_the_next() -> None:
     fake = FakeVoyage()
-    batches = client(fake).iter_embed([page(i, 30) for i in range(10)])
+    batches = client(fake, settings(max_concurrent_requests=1)).iter_embed(
+        [page(i, 30) for i in range(10)]
+    )
     first = await anext(batches)
     assert len(first.embeddings) == 4
     assert len(fake.calls) == 1, "the second request must wait until the caller asks for it"
@@ -262,6 +264,18 @@ async def test_iter_embed_requests_lazily_one_batch_at_a_time() -> None:
     assert len(fake.calls) == 2
     await batches.aclose()
     assert len(fake.calls) == 2
+
+
+async def test_the_first_batch_starts_every_request_up_to_the_concurrency_cap() -> None:
+    fake = FakeVoyage()
+    # Ten 30-token pages are three requests (4, 4 and 2 pages), all under the default cap.
+    batches = client(fake).iter_embed([page(i, 30) for i in range(10)])
+
+    first = await anext(batches)
+
+    assert len(first.embeddings) == 4
+    assert len(fake.calls) == 3
+    await batches.aclose()
 
 
 async def test_batches_already_yielded_survive_a_later_request_failure() -> None:
@@ -272,7 +286,8 @@ async def test_batches_already_yielded_survive_a_later_request_failure() -> None
     assert [e.url for e in first.embeddings] == [page(i, 30).url for i in range(4)]
     with pytest.raises(EmbeddingRequestError, match="HTTP 400 InvalidRequestError"):
         await anext(batches)
-    assert fake.call_count == 2
+    # All three requests were under way together; the failure still reaches the caller.
+    assert fake.call_count == 3
 
 
 async def test_embed_equals_the_flattened_iter_embed() -> None:

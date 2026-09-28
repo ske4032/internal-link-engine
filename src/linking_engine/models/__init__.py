@@ -10,7 +10,16 @@ neo4j, motor, voyageai, prefect, mlflow and igraph: models describe data, they d
 not fetch it, compute it, or log it.
 """
 
-from linking_engine.models.anchors import AnchorMatch, AnchorReport, ExtractionSettings
+from linking_engine.models.anchors import (
+    AnchorChoice,
+    AnchorMatch,
+    AnchorReport,
+    AnchorScore,
+    AnchorSelectionReport,
+    ExtractionSettings,
+    SemanticThreshold,
+    UnanchoredPair,
+)
 from linking_engine.models.audit import LinkAuditResult
 from linking_engine.models.bridges import BridgeLink, BridgeReport, HubPair
 from linking_engine.models.candidates import (
@@ -64,6 +73,7 @@ from linking_engine.models.enums import (
     OrphanLabel,
     PageType,
     RecommendationStatus,
+    UnanchoredReason,
 )
 from linking_engine.models.features import FeatureReport, PageStructure, PairFeatures
 from linking_engine.models.keywords import KeywordReport, KeywordTarget, ResolvedKeyword
@@ -121,12 +131,15 @@ from linking_engine.models.tenant import AnchorRules, AnchorTypeProfile, Languag
 __all__ = [
     "ActionType",
     "AnchorCandidate",
+    "AnchorChoice",
     "AnchorKeyUpdate",
     "AnchorMatch",
     "AnchorMatchCheck",
     "AnchorReport",
     "AnchorRules",
     "AnchorRung",
+    "AnchorScore",
+    "AnchorSelectionReport",
     "AnchorType",
     "AnchorTypeProfile",
     "BridgeLink",
@@ -220,6 +233,7 @@ __all__ = [
     "ScoreReport",
     "ScorerCheck",
     "ScorerWeights",
+    "SemanticThreshold",
     "SentenceTarget",
     "SignalReport",
     "StrategicKeyword",
@@ -229,5 +243,7 @@ __all__ = [
     "TemplateLink",
     "TenantConfig",
     "TenantGraphCounts",
+    "UnanchoredPair",
+    "UnanchoredReason",
     "VectorIndex",
 ]

@@ -26,6 +26,25 @@ from linking_engine.anchor.keywords import (
     MIN_QUERY_IMPRESSIONS,
     REPEATED_FALLBACK_PAGES,
 )
+from linking_engine.anchor.scoring import (
+    AWKWARD_FLOOR,
+    COSINE_SHARE,
+    DIVERSITY_WEIGHT,
+    KEYWORD_WEIGHT,
+    LENGTH_WEIGHT,
+    PROFILE_BONUS,
+    SECONDARY_WEIGHT,
+    SEMANTIC_WEIGHT,
+    STEM_SHARE,
+)
+from linking_engine.anchor.semantic import (
+    DEFAULT_SEMANTIC_THRESHOLD,
+    MAX_PHRASES_PER_SENTENCE,
+    MIN_NEGATIVES,
+    NEGATIVE_SAMPLE,
+    THRESHOLD_BOUNDS,
+    TOP_SENTENCES,
+)
 from linking_engine.audit.relevance import MIN_MODE_GAP, MIN_SPLIT_SCORES, SPLIT_SEED
 from linking_engine.discovery.bridges import (
     ALTERNATIVES,
@@ -66,7 +85,8 @@ from linking_engine.ml.quality import (
     quality_metrics,
 )
 from linking_engine.models import QualityBaseline
-from linking_engine.models.anchors import SENTENCE_INDEX_BINS
+from linking_engine.models.anchors import SCORE_HISTOGRAM_BINS as ANCHOR_SCORE_BINS
+from linking_engine.models.anchors import SENTENCE_INDEX_BINS, UNANCHORED_ADVICE
 from linking_engine.models.relevance import HISTOGRAM_BINS
 from linking_engine.models.scoring import SCORE_HISTOGRAM_BINS
 
@@ -75,6 +95,7 @@ if TYPE_CHECKING:
 
     from linking_engine.models import (
         AnchorReport,
+        AnchorSelectionReport,
         BridgeReport,
         CandidateReport,
         CandidateSet,
@@ -751,6 +772,167 @@ def log_anchors(report: AnchorReport, summary: str) -> str:
         )
         mlflow.log_table(anchor_rank_table(report), "rung_by_rank.json")
         mlflow.log_table(anchor_language_table(report), "languages.json")
+        mlflow.log_dict(report.model_dump(mode="json"), "report.json")
+        mlflow.log_text(summary, "summary.md")
+        return str(run.info.run_id)
+
+
+def selection_metrics(report: AnchorSelectionReport) -> dict[str, float]:
+    """Every count of the run, flat, with the threshold's values when the rung used one; per
+    unanchored reason
+    (``unanchored_<reason>``), chosen type (``type_<type>``) and chosen keyword rank
+    (``keyword_rank_<n>``)."""
+    threshold = report.threshold
+    metrics: dict[str, float] = {
+        name: float(value)
+        for name, value in report.model_dump(
+            exclude={
+                "tenant_id",
+                "threshold",
+                "semantic_skipped_reason",
+                "embedding_skipped_reason",
+                "unanchored",
+                "chosen_types",
+                "chosen_ranks",
+                "profile",
+                "score_histogram",
+                "semantic_histogram",
+                "finished_at",
+            }
+        ).items()
+    }
+    metrics.update(
+        {
+            "semantic_skipped": float(report.semantic_skipped_reason is not None),
+            "embedding_skipped": float(report.embedding_skipped_reason is not None),
+        }
+    )
+    # A threshold is only reported as used when the rung ran, and a derivation only when the
+    # threshold was derived rather than configured.
+    if report.semantic_skipped_reason is None:
+        metrics.update(
+            {
+                "threshold_value": threshold.value,
+                "threshold_overridden": float(threshold.overridden),
+                "threshold_positives": float(threshold.positives),
+            }
+        )
+        if threshold.positive_recall is not None:
+            metrics["threshold_positive_recall"] = threshold.positive_recall
+        if not threshold.overridden:
+            metrics.update(
+                {
+                    "threshold_negatives": float(threshold.negatives),
+                    "threshold_bounded": float(threshold.bounded),
+                    "threshold_fallback": float(threshold.fallback),
+                }
+            )
+    if report.targets:
+        metrics["targets_with_anchor_share"] = report.targets_with_anchor / report.targets
+    metrics.update(
+        {f"unanchored_{reason.value.lower()}": float(n) for reason, n in report.unanchored.items()}
+    )
+    metrics.update(
+        {f"type_{kind.value.lower()}": float(n) for kind, n in report.chosen_types.items()}
+    )
+    metrics.update({f"keyword_rank_{rank}": float(n) for rank, n in report.chosen_ranks.items()})
+    return metrics
+
+
+def selection_tables(report: AnchorSelectionReport) -> dict[str, dict[str, list[object]]]:
+    """The chosen types against the profile, the chosen keyword ranks and the unanchored pairs
+    by reason with their advice, as MLflow tables keyed by artifact file."""
+    wanted = report.profile.model_dump()
+    types = list(report.chosen_types)
+    return {
+        "types.json": {
+            "type": [kind.value for kind in types],
+            "chosen": [report.chosen_types[kind] for kind in types],
+            "share": [
+                report.chosen_types[kind] / report.chosen if report.chosen else 0.0
+                for kind in types
+            ],
+            "profile": [wanted[kind.value.lower()] for kind in types],
+        },
+        "keyword_ranks.json": {
+            "keyword_rank": list(report.chosen_ranks),
+            "chosen": list(report.chosen_ranks.values()),
+        },
+        "unanchored.json": {
+            "reason": [reason.value for reason in report.unanchored],
+            "pairs": list(report.unanchored.values()),
+            "advice": [UNANCHORED_ADVICE[reason] for reason in report.unanchored],
+        },
+    }
+
+
+def selection_params(report: AnchorSelectionReport) -> dict[str, object]:
+    """The scoring constants; the semantic rung's when it ran, and the threshold derivation's
+    only when the threshold was derived rather than configured."""
+    params: dict[str, object] = {
+        "semantic_weight": SEMANTIC_WEIGHT,
+        "keyword_weight": KEYWORD_WEIGHT,
+        "diversity_weight": DIVERSITY_WEIGHT,
+        "length_weight": LENGTH_WEIGHT,
+        "stem_share": STEM_SHARE,
+        "cosine_share": COSINE_SHARE,
+        "secondary_weight": SECONDARY_WEIGHT,
+        "profile_bonus": PROFILE_BONUS,
+        "awkward_floor": AWKWARD_FLOOR,
+        "score_bins": ANCHOR_SCORE_BINS,
+    }
+    if report.semantic_skipped_reason is None:
+        params.update(
+            {
+                "top_sentences": TOP_SENTENCES,
+                "max_phrases_per_sentence": MAX_PHRASES_PER_SENTENCE,
+                "threshold_overridden": report.threshold.overridden,
+            }
+        )
+        if not report.threshold.overridden:
+            params.update(
+                {
+                    "threshold_quantile": report.threshold.quantile,
+                    "threshold_bounds": ",".join(map(str, THRESHOLD_BOUNDS)),
+                    "min_negatives": MIN_NEGATIVES,
+                    "negative_sample": NEGATIVE_SAMPLE,
+                    "default_semantic_threshold": DEFAULT_SEMANTIC_THRESHOLD,
+                }
+            )
+    return params
+
+
+def log_anchor_selection(report: AnchorSelectionReport, summary: str) -> str:
+    """Log one anchor selection run from its report: counts, the semantic threshold, the chosen
+    anchors' totals and the semantic matches' similarities as step-indexed histograms (step =
+    bin), and tables; never urls, phrases, sentences or keywords. Returns the MLflow run id."""
+    use_analytics_experiment(report.tenant_id)
+    with mlflow.start_run(
+        run_name="anchor selection",
+        tags={
+            "tenant_id": report.tenant_id,
+            "kind": "pipeline",
+            "stage": "anchor-selection",
+            "embedding_skipped": report.embedding_skipped_reason or "none",
+            "mlflow.note.content": summary,
+        },
+    ) as run:
+        mlflow.log_params(selection_params(report))
+        mlflow.log_metrics(selection_metrics(report))
+        now = int(time.time() * 1000)
+        mlflow.MlflowClient().log_batch(
+            run.info.run_id,
+            metrics=[
+                Metric(name, float(count), now, step)
+                for name, histogram in (
+                    ("anchor_score_hist", report.score_histogram),
+                    ("semantic_similarity_hist", report.semantic_histogram),
+                )
+                for step, count in enumerate(histogram)
+            ],
+        )
+        for artifact, table in selection_tables(report).items():
+            mlflow.log_table(table, artifact)
         mlflow.log_dict(report.model_dump(mode="json"), "report.json")
         mlflow.log_text(summary, "summary.md")
         return str(run.info.run_id)

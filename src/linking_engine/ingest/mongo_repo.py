@@ -30,6 +30,7 @@ from linking_engine.errors import (
 )
 from linking_engine.models import (
     AnchorRules,
+    AnchorTypeProfile,
     CrawlPage,
     ExtractionSettings,
     GscMetrics,
@@ -425,6 +426,48 @@ class MongoRepo:
             what="write extraction settings",
         )
 
+    async def get_anchor_type_profile(self, tenant_id: str) -> AnchorTypeProfile | None:
+        """The tenant's anchor type profile; None means the default."""
+        _require_tenant(tenant_id)
+        document = await _retrying(
+            partial(
+                self._db["tenant_config"].find_one,
+                {"tenantId": tenant_id},
+                {"_id": 0, "anchorTypeProfile": 1},
+            ),
+            write=False,
+            what="read anchor type profile",
+        )
+        stored = document.get("anchorTypeProfile") if document else None
+        return _stored_config(AnchorTypeProfile, stored, f"anchor type profile of {tenant_id!r}")
+
+    async def set_anchor_type_profile(
+        self, tenant_id: str, profile: AnchorTypeProfile | None
+    ) -> None:
+        """Store the tenant's anchor type profile; None removes it, back to the default."""
+        _require_tenant(tenant_id)
+        now = datetime.now(UTC)
+        update = (
+            {
+                "$set": {
+                    "anchorTypeProfile": _to_document(profile),
+                    "anchorTypeProfileUpdatedAt": now,
+                }
+            }
+            if profile is not None
+            else {
+                "$unset": {"anchorTypeProfile": ""},
+                "$set": {"anchorTypeProfileUpdatedAt": now},
+            }
+        )
+        await _retrying(
+            partial(
+                self._db["tenant_config"].update_one, {"tenantId": tenant_id}, update, upsert=True
+            ),
+            write=True,
+            what="write anchor type profile",
+        )
+
     async def delete_tenant(self, tenant_id: str) -> int:
         _require_tenant(tenant_id)
         deleted = 0
@@ -469,6 +512,29 @@ class MongoRepo:
         for query in queries:
             async for documents in _find_batches(self._db["pages"], query, PageRecord, batch_size):
                 yield [_from_document(PageRecord, document) for document in documents]
+
+    async def page_titles(
+        self, tenant_id: str, *, batch_size: int = READ_BATCH
+    ) -> list[str | None]:
+        """The meta title of every stored page of the tenant, and nothing else: what brand affix
+        detection reads."""
+        _require_tenant(tenant_id)
+        titles: list[str | None] = []
+        async for documents in _find_batches(
+            self._db["pages"],
+            {"tenantId": tenant_id},
+            PageRecord,
+            batch_size,
+            keys={"metaTitle": "meta_title"},
+        ):
+            for document in documents:
+                title = document.get("metaTitle")
+                if title is not None and not isinstance(title, str):
+                    raise DatabaseReadError(
+                        "mongodb", f"a page of {tenant_id!r} has a non-text title {title!r}"
+                    )
+                titles.append(title)
+        return titles
 
     async def gsc_query_stats(
         self, tenant_id: str, *, batch_size: int = READ_BATCH
