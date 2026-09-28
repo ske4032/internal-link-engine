@@ -31,6 +31,7 @@ from linking_engine.errors import (
 from linking_engine.models import (
     AnchorRules,
     CrawlPage,
+    ExtractionSettings,
     GscMetrics,
     GscQuery,
     GscQueryStats,
@@ -44,7 +45,7 @@ from linking_engine.models import (
 from linking_engine.urls import UrlRules, normalise_url
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
     from types import TracebackType
 
     from pymongo.asynchronous.collection import AsyncCollection
@@ -363,30 +364,7 @@ class MongoRepo:
             what="read scorer weights",
         )
         stored = document.get("scorerWeights") if document else None
-        if stored is None:
-            return None
-        if not isinstance(stored, dict):
-            raise DatabaseReadError(
-                "mongodb", f"scorer weights of {tenant_id!r} are not a document"
-            )
-        # One stored form, camelCase: a snake_case key copied from the packaged JSON would
-        # otherwise be dropped silently.
-        keys = _keys(ScorerWeights)
-        unknown = sorted(str(key) for key in stored if key not in keys)
-        if unknown:
-            raise DatabaseReadError(
-                "mongodb",
-                f"scorer weights of {tenant_id!r} have unknown keys {', '.join(unknown)}; "
-                f"expected {', '.join(keys)}",
-            )
-        try:
-            return ScorerWeights.model_validate(
-                {field: stored[key] for key, field in keys.items() if key in stored}
-            )
-        except ValidationError as error:
-            raise DatabaseReadError(
-                "mongodb", f"scorer weights of {tenant_id!r} do not fit ScorerWeights: {error}"
-            ) from error
+        return _stored_config(ScorerWeights, stored, f"scorer weights of {tenant_id!r}")
 
     async def set_scorer_weights(self, tenant_id: str, weights: ScorerWeights | None) -> None:
         """Store the tenant's scorer weights; None removes them, back to the default."""
@@ -403,6 +381,48 @@ class MongoRepo:
             ),
             write=True,
             what="write scorer weights",
+        )
+
+    async def get_extraction_settings(self, tenant_id: str) -> ExtractionSettings | None:
+        """The tenant's anchor extraction settings; None means the defaults."""
+        _require_tenant(tenant_id)
+        document = await _retrying(
+            partial(
+                self._db["tenant_config"].find_one,
+                {"tenantId": tenant_id},
+                {"_id": 0, "extractionSettings": 1},
+            ),
+            write=False,
+            what="read extraction settings",
+        )
+        stored = document.get("extractionSettings") if document else None
+        return _stored_config(ExtractionSettings, stored, f"extraction settings of {tenant_id!r}")
+
+    async def set_extraction_settings(
+        self, tenant_id: str, settings: ExtractionSettings | None
+    ) -> None:
+        """Store the tenant's extraction settings; None removes them, back to the defaults."""
+        _require_tenant(tenant_id)
+        now = datetime.now(UTC)
+        update = (
+            {
+                "$set": {
+                    "extractionSettings": _to_document(settings),
+                    "extractionSettingsUpdatedAt": now,
+                }
+            }
+            if settings is not None
+            else {
+                "$unset": {"extractionSettings": ""},
+                "$set": {"extractionSettingsUpdatedAt": now},
+            }
+        )
+        await _retrying(
+            partial(
+                self._db["tenant_config"].update_one, {"tenantId": tenant_id}, update, upsert=True
+            ),
+            write=True,
+            what="write extraction settings",
         )
 
     async def delete_tenant(self, tenant_id: str) -> int:
@@ -427,14 +447,28 @@ class MongoRepo:
             yield [_from_document(PageSummary, document) for document in documents]
 
     async def iter_page_records(
-        self, tenant_id: str, *, batch_size: int = READ_BATCH
+        self,
+        tenant_id: str,
+        *,
+        batch_size: int = READ_BATCH,
+        urls: Iterable[str] | None = None,
     ) -> AsyncIterator[list[PageRecord]]:
-        """Every stored page of the tenant with its text, in storage order."""
+        """Every stored page of the tenant with its text, in storage order; with ``urls``, only
+        those pages, looked up ``batch_size`` urls at a time."""
         _require_tenant(tenant_id)
-        async for documents in _find_batches(
-            self._db["pages"], {"tenantId": tenant_id}, PageRecord, batch_size
-        ):
-            yield [_from_document(PageRecord, document) for document in documents]
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        queries: Iterable[Document] = (
+            [{"tenantId": tenant_id}]
+            if urls is None
+            else (
+                {"tenantId": tenant_id, "url": {"$in": list(chunk)}}
+                for chunk in batched(sorted(set(urls)), batch_size)
+            )
+        )
+        for query in queries:
+            async for documents in _find_batches(self._db["pages"], query, PageRecord, batch_size):
+                yield [_from_document(PageRecord, document) for document in documents]
 
     async def gsc_query_stats(
         self, tenant_id: str, *, batch_size: int = READ_BATCH
@@ -575,6 +609,31 @@ class CrawlSource:
 def _keys(model: type[BaseModel]) -> dict[str, str]:
     """Stored camelCase key -> model field."""
     return {to_camel(field): field for field in model.model_fields}
+
+
+def _stored_config[M: BaseModel](model: type[M], stored: object, what: str) -> M | None:
+    """A tenant config sub-document as ``model``; None when nothing is stored. One stored form,
+    camelCase: a snake_case key copied from a packaged JSON would otherwise be dropped
+    silently, so any unknown key fails."""
+    if stored is None:
+        return None
+    if not isinstance(stored, dict):
+        raise DatabaseReadError("mongodb", f"{what} are not a document")
+    keys = _keys(model)
+    unknown = sorted(str(key) for key in stored if key not in keys)
+    if unknown:
+        raise DatabaseReadError(
+            "mongodb",
+            f"{what} have unknown keys {', '.join(unknown)}; expected {', '.join(keys)}",
+        )
+    try:
+        return model.model_validate(
+            {field: stored[key] for key, field in keys.items() if key in stored}
+        )
+    except ValidationError as error:
+        raise DatabaseReadError(
+            "mongodb", f"{what} do not fit {model.__name__}: {error}"
+        ) from error
 
 
 def _to_document(model: BaseModel) -> Document:

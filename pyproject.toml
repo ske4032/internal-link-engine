@@ -40,7 +40,7 @@ dependencies = [
   "pyarrow>=18.0",          # cache feature matrices between experiment runs
 
   # ── text processing ─────────────────────────────────────────────────────
-  "nltk>=3.9",              # SnowballStemmer — key off page.language, ~15 langs
+  "snowballstemmer>=3.1",   # Snowball stemmers keyed off page.language, ~35 languages
 
   # ── orchestration ───────────────────────────────────────────────────────
   # Engine is Apache 2.0. The /server directory is Prefect Community License:
@@ -161,7 +161,7 @@ plugins = ["pydantic.mypy"]
 # No stubs published for these.
 module = [
   "igraph.*", "leidenalg.*", "hdbscan.*", "umap.*", "lightgbm.*", "voyageai.*", "sklearn.*",
-  "pandas.*", "pyarrow.*",
+  "pandas.*", "pyarrow.*", "snowballstemmer.*",
 ]
 ignore_missing_imports = true
 
@@ -218,8 +218,6 @@ DEP002 = [
   # embedding/
   # ml/
   "lightgbm",
-  # anchor/
-  "nltk",
   # serving and cross-cutting
   "redis",
   "orjson",

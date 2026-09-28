@@ -9,8 +9,10 @@ from typing import TYPE_CHECKING, Any
 from prefect import flow, get_run_logger, task
 from prefect.cache_policies import NONE
 from prefect.runtime import flow_run
+from pydantic import ValidationError
 from structlog.contextvars import bound_contextvars
 
+from linking_engine.anchor.extraction import summarise_anchors
 from linking_engine.discovery.bridges import summarise_bridges
 from linking_engine.discovery.candidates import retrieve_candidates, summarise_candidates
 from linking_engine.discovery.features import CHUNK_PAIRS, summarise_features
@@ -28,15 +30,19 @@ from linking_engine.ingest.mongo_repo import CrawlSource, MongoRepo
 from linking_engine.ingest.prepare import BOILERPLATE_SHARE, NAV_SHARE, prepare_tenant
 from linking_engine.ml.tracking import (
     log_analytics,
+    log_anchors,
     log_bridges,
     log_candidates,
     log_duplicates,
     log_features,
     log_keywords,
     log_link_relevance,
+    log_quality,
     log_scores,
+    previous_quality_run,
 )
 from linking_engine.models import (
+    AnchorReport,
     BridgeReport,
     CandidateSet,
     CentralityReport,
@@ -50,6 +56,8 @@ from linking_engine.models import (
     LinkEmbedReport,
     LinkRelevanceReport,
     PrepareReport,
+    QualityBaseline,
+    QualityReport,
     ScoreReport,
     TenantConfig,
     TenantGraphCounts,
@@ -61,6 +69,7 @@ from linking_engine.pipeline.analytics import (
     compute_hubs,
     summarise,
 )
+from linking_engine.pipeline.anchors import extract_anchors
 from linking_engine.pipeline.bridges import HUB_PAIRS_FILE, find_bridges, read_hub_pairs
 from linking_engine.pipeline.duplicates import find_duplicates, summarise_duplicates
 from linking_engine.pipeline.embed import FLUSH_SIZE, embed_tenant
@@ -68,6 +77,7 @@ from linking_engine.pipeline.embed_links import embed_links
 from linking_engine.pipeline.features import CACHE_DIR, assemble_features
 from linking_engine.pipeline.keywords import resolve_tenant_keywords, summarise_keywords
 from linking_engine.pipeline.link_relevance import score_links, summarise_link_relevance
+from linking_engine.pipeline.quality import evaluate_quality, summarise_quality
 from linking_engine.pipeline.scoring import score_pairs
 
 if TYPE_CHECKING:
@@ -89,6 +99,18 @@ def voyage_client(tenant_id: str) -> VoyageClient:
     return VoyageClient(
         VoyageSettings(), model=tenant.embedding_model, dimension=tenant.embedding_dimensions
     )
+
+
+def keyword_voyage(tenant_id: str) -> VoyageClient | None:
+    """The tenant's Voyage client for keyword embeddings; None without an API key, so the
+    checks that need it are reported as not applicable."""
+    try:
+        VoyageSettings()
+    except ValidationError as error:
+        if all(e["type"] == "missing" and e["loc"] == ("api_key",) for e in error.errors()):
+            return None
+        raise
+    return voyage_client(tenant_id)
 
 
 def is_transient(_task: object, _task_run: object, state: State[Any]) -> bool:
@@ -690,3 +712,108 @@ async def hub_bridges_flow(
         mlflow_run,
     )
     return report, path, mlflow_run
+
+
+# Read-only against both stores; the anchors file is renamed into place only when complete, so
+# a retry writes it again whole.
+@task(
+    name="anchor-extraction",
+    retries=1,
+    retry_delay_seconds=30,
+    retry_condition_fn=is_transient,
+    cache_policy=NONE,
+)
+async def anchors_task(tenant_id: str, cache_dir: Path) -> tuple[AnchorReport, Path]:
+    async with await neo4j() as graph, await mongo() as repo:
+        await graph.check_server()
+        return await extract_anchors(graph, repo, tenant_id, cache_dir=cache_dir)
+
+
+@task(name="mlflow-log-anchors", cache_policy=NONE)
+def log_anchors_task(report: AnchorReport) -> str:
+    return log_anchors(report, summarise_anchors(report))
+
+
+@flow(name="anchor-extraction")
+async def anchor_extraction_flow(
+    tenant_id: str, cache_dir: Path = CACHE_DIR
+) -> tuple[AnchorReport, Path, str]:
+    """Anchor phrases for every candidate pair and hub bridge, extracted from the source pages'
+    own copy and written under ``cache_dir``; nothing is written to the stores, the run is
+    logged to MLflow without urls, phrases or sentences."""
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
+        logger.info("anchor extraction of tenant %s", tenant_id)
+        report, path = await anchors_task(tenant_id, cache_dir)
+        mlflow_run = log_anchors_task(report)
+    logger.info(
+        "%d pairs (%d bridges), %d with keywords, %d matched (%d on the primary keyword); "
+        "%d matches %s; %d existing anchors skipped; %s; %.1fs; mlflow run %s",
+        report.pairs,
+        report.bridge_pairs,
+        report.pairs_with_keywords,
+        report.pairs_matched,
+        report.primary_matched,
+        report.matches,
+        {rung.value: count for rung, count in report.by_rung.items()},
+        report.overlapping_existing_anchors,
+        path,
+        report.seconds,
+        mlflow_run,
+    )
+    return report, path, mlflow_run
+
+
+@task(name="quality-baseline", cache_policy=NONE)
+def quality_baseline_task(tenant_id: str) -> QualityBaseline | None:
+    return previous_quality_run(tenant_id)
+
+
+# Read-only against both stores; the keyword vector cache is renamed into place only when
+# complete, so a retry reuses what the first attempt embedded.
+@task(
+    name="quality-eval",
+    retries=1,
+    retry_delay_seconds=30,
+    retry_condition_fn=is_transient,
+    cache_policy=NONE,
+)
+async def quality_eval_task(
+    tenant_id: str, cache_dir: Path, baseline: QualityBaseline | None
+) -> QualityReport:
+    voyage = keyword_voyage(tenant_id)
+    async with await neo4j() as graph, await mongo() as repo:
+        await graph.check_server()
+        return await evaluate_quality(
+            graph, repo, tenant_id, cache_dir=cache_dir, voyage=voyage, baseline=baseline
+        )
+
+
+@task(name="mlflow-log-quality", cache_policy=NONE)
+def log_quality_task(report: QualityReport) -> str:
+    return log_quality(report, summarise_quality(report))
+
+
+@flow(name="quality-eval")
+async def quality_eval_flow(
+    tenant_id: str, cache_dir: Path = CACHE_DIR
+) -> tuple[QualityReport, str]:
+    """Every quality check of the tenant after feature-assembly, score-links and score-pairs,
+    logged to MLflow with alerts against its previous quality run; read-only against the
+    stores, and an alert never fails the flow."""
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
+        logger.info("quality evaluation of tenant %s", tenant_id)
+        baseline = quality_baseline_task(tenant_id)
+        report = await quality_eval_task(tenant_id, cache_dir, baseline)
+        mlflow_run = log_quality_task(report)
+    logger.info(
+        "checked %s; not applicable %s; baseline %s; alerts %s; %.1fs; mlflow run %s",
+        report.tenant_id,
+        list(report.not_applicable) or "none",
+        report.baseline_run_id or "none",
+        [alert.metric for alert in report.alerts] or "none",
+        report.seconds,
+        mlflow_run,
+    )
+    return report, mlflow_run

@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import time
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
 import structlog
@@ -40,6 +42,7 @@ if TYPE_CHECKING:
     from linking_engine.graph.repo import GraphRepo
     from linking_engine.ingest.mongo_repo import MongoRepo
     from linking_engine.models import (
+        CtrCurve,
         GscQueryStats,
         PageRecord,
         ResolvedKeyword,
@@ -128,14 +131,29 @@ def ranked_targets(
     return targets
 
 
-async def resolve_tenant_keywords(
-    graph: GraphRepo, mongo: MongoRepo, tenant_id: str
-) -> KeywordReport:
-    """Resolve every crawled 2xx page's keyword and replace the tenant's keyword edges, one
-    source at a time."""
+@dataclass(frozen=True, slots=True)
+class KeywordPlan:
+    """Every keyword decision of a run, before anything is written."""
+
+    pages: int
+    resolved: Mapping[str, ResolvedKeyword]
+    by_source: Mapping[KeywordSource, tuple[KeywordTarget, ...]]
+    by_language: Mapping[str, int]
+    fallbacks_rejected: Mapping[str, int]
+    gsc_rejected: int
+    gsc_rows: int
+    curve: CtrCurve | None
+    brand_prefix: str | None
+    brand_suffix: str | None
+    invalid_strategic_rows: int
+    generic_add: frozenset[str]
+    generic_remove: frozenset[str]
+
+
+async def plan_keywords(mongo: MongoRepo, tenant_id: str) -> KeywordPlan:
+    """Resolve every crawled 2xx page's keyword and rank each page's keyword set; read-only."""
     if not tenant_id.strip():
         raise ValueError("tenant_id must be a non-empty string")
-    started = time.perf_counter()
     rules = await mongo.get_language_rules(tenant_id)
     anchor_rules = await mongo.get_anchor_rules(tenant_id)
     generic_add, generic_remove = generic_overrides(
@@ -206,7 +224,38 @@ async def resolve_tenant_keywords(
             if found:
                 secondaries[page.url] = (language, found)
 
-    by_source = ranked_targets(strategic, resolved, secondaries)
+    return KeywordPlan(
+        pages=pages,
+        resolved=MappingProxyType(resolved),
+        by_source=MappingProxyType(
+            {
+                source: tuple(targets)
+                for source, targets in ranked_targets(strategic, resolved, secondaries).items()
+            }
+        ),
+        by_language=MappingProxyType(dict(by_language)),
+        fallbacks_rejected=MappingProxyType(dict(sorted(reasons.items()))),
+        gsc_rejected=rejected,
+        gsc_rows=len(gsc_rows),
+        curve=curve,
+        brand_prefix=prefix,
+        brand_suffix=suffix,
+        invalid_strategic_rows=invalid,
+        generic_add=generic_add,
+        generic_remove=generic_remove,
+    )
+
+
+async def resolve_tenant_keywords(
+    graph: GraphRepo, mongo: MongoRepo, tenant_id: str
+) -> KeywordReport:
+    """Resolve every crawled 2xx page's keyword and replace the tenant's keyword edges, one
+    source at a time."""
+    if not tenant_id.strip():
+        raise ValueError("tenant_id must be a non-empty string")
+    started = time.perf_counter()
+    plan = await plan_keywords(mongo, tenant_id)
+    by_source = plan.by_source
     ranked_after = [
         target
         for targets in by_source.values()
@@ -222,19 +271,19 @@ async def resolve_tenant_keywords(
             tenant_id, source, targets
         )
 
-    rungs = Counter(keyword.rung for keyword in resolved.values())
+    rungs = Counter(keyword.rung for keyword in plan.resolved.values())
     report = KeywordReport(
         tenant_id=tenant_id,
-        pages=pages,
-        resolved=len(resolved),
+        pages=plan.pages,
+        resolved=len(plan.resolved),
         by_rung={rung: rungs[rung] for rung in KeywordRung},
-        gsc_enabled=curve is not None,
-        gsc_rows=len(gsc_rows),
-        gsc_rejected=rejected,
-        brand_suffix=suffix,
-        brand_prefix=prefix,
-        fallbacks_rejected=dict(sorted(reasons.items())),
-        long_fallbacks=sum(1 for keyword in resolved.values() if is_long(keyword)),
+        gsc_enabled=plan.curve is not None,
+        gsc_rows=plan.gsc_rows,
+        gsc_rejected=plan.gsc_rejected,
+        brand_suffix=plan.brand_suffix,
+        brand_prefix=plan.brand_prefix,
+        fallbacks_rejected=dict(sorted(plan.fallbacks_rejected.items())),
+        long_fallbacks=sum(1 for keyword in plan.resolved.values() if is_long(keyword)),
         secondary_keywords=len(ranked_after),
         pages_with_secondaries=len({target.url for target in ranked_after}),
         edges_written=written,
@@ -242,14 +291,14 @@ async def resolve_tenant_keywords(
         # The repo writes no edge on a url that is not a crawled page.
         skipped_rows=len(by_source[KeywordSource.CLIENT_STRATEGIC])
         - written[KeywordSource.CLIENT_STRATEGIC],
-        by_language=dict(by_language),
+        by_language=dict(plan.by_language),
         seconds=round(time.perf_counter() - started, 3),
         finished_at=datetime.now(UTC),
     )
     log.info(
         "keywords.resolved",
         stage=STAGE,
-        invalid_strategic_rows=invalid,
+        invalid_strategic_rows=plan.invalid_strategic_rows,
         **report.model_dump(mode="json"),
     )
     return report

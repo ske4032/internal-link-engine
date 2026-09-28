@@ -464,6 +464,13 @@ WHERE NOT coalesce(p.isPlaceholder, false) AND r.rung IS NOT NULL AND r.rank = 1
 RETURN p.url AS url, k.text AS text, r.rung AS rung
 ORDER BY url, text
 """
+# A page's ranked keyword set: every keyword edge with a rank, the resolved keyword first.
+_RANKED_KEYWORDS: Final = """
+MATCH (p:Page {tenantId: $tenant})-[r:TARGETS_KEYWORD]->(k:Keyword {tenantId: $tenant})
+WHERE NOT coalesce(p.isPlaceholder, false) AND r.rank IS NOT NULL
+RETURN p.url AS url, r.rank AS rank, k.text AS text, r.source AS source
+ORDER BY url, rank, text
+"""
 _NON_CANONICAL_COPIES: Final = """
 MATCH (p:Page {tenantId: $tenant})
 WHERE p.isCanonical = false AND NOT coalesce(p.isPlaceholder, false)
@@ -1418,6 +1425,33 @@ class GraphRepo:
             except ValueError:
                 raise DatabaseReadError(
                     "neo4j", f"page {url!r} has an unknown keyword rung {rung!r}"
+                ) from None
+        return found
+
+    async def ranked_keywords(
+        self, tenant_id: str
+    ) -> dict[str, list[tuple[int, str, KeywordSource]]]:
+        """Page url to its ranked keyword set as (rank, text, source), rank ascending, for the
+        tenant's crawled pages with one. Two keywords of one rank on a page fail the read."""
+        _require_tenant(tenant_id)
+        found: dict[str, list[tuple[int, str, KeywordSource]]] = {}
+        for row in await self._read(_RANKED_KEYWORDS, tenant=tenant_id):
+            url, text, source = str(row["url"]), row["text"], row["source"]
+            rank = _int_row(row, "rank")
+            ranked = found.setdefault(url, [])
+            if ranked and ranked[-1][0] == rank:
+                raise DatabaseReadError(
+                    "neo4j", f"page {url!r} of {tenant_id!r} has two keywords of rank {rank}"
+                )
+            if rank < 1 or not isinstance(text, str) or not text:
+                raise DatabaseReadError(
+                    "neo4j", f"page {url!r} has a ranked keyword without text or a valid rank"
+                )
+            try:
+                ranked.append((rank, text, KeywordSource(str(source))))
+            except ValueError:
+                raise DatabaseReadError(
+                    "neo4j", f"page {url!r} has an unknown keyword source {source!r}"
                 ) from None
         return found
 

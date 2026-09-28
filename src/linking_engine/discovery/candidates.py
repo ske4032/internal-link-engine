@@ -243,9 +243,14 @@ async def retrieve_candidates(
     index: VectorIndex = "page_content",
     per_target: int = PER_TARGET,
     chunk_size: int = TARGET_CHUNK,
+    links: Sequence[tuple[str, str]] | None = None,
+    vectors: Mapping[str, npt.NDArray[np.float32]] | None = None,
+    stage: str = STAGE,
 ) -> CandidateSet:
     """Every target's nearest eligible sources among the tenant's own crawled pages of the
-    target's language."""
+    target's language. ``links`` replaces the stored body links as the pairs already linked,
+    for a view of the graph with some links held out; ``vectors`` are the pages' vectors in
+    ``index`` when the caller has already read them; ``stage`` names the stage in the log."""
     if not tenant_id.strip():
         raise ValueError("tenant_id must be a non-empty string")
     if per_target < 1:
@@ -255,10 +260,12 @@ async def retrieve_candidates(
 
     started = time.perf_counter()
     selection = await graph.candidate_targets(tenant_id, index=index)
-    vectors = await graph.page_vectors(tenant_id, index=index)
+    if vectors is None:
+        vectors = await graph.page_vectors(tenant_id, index=index)
     copies = await graph.non_canonical_copies(tenant_id)
     languages = await graph.page_languages(tenant_id)
-    snapshot = await graph.link_graph(tenant_id)
+    if links is None:
+        links = (await graph.link_graph(tenant_id)).links
     loaded = time.perf_counter()
 
     # Separate reads, so a page can lose its vector between them.
@@ -278,7 +285,7 @@ async def retrieve_candidates(
         urls,
         pool,
         sorted(t.url for t in selection.targets if t.url not in dropped),
-        snapshot.links,
+        links,
         per_target=per_target,
         chunk_size=chunk_size,
         languages=languages,
@@ -297,7 +304,7 @@ async def retrieve_candidates(
         search_seconds=round(searched - loaded, 3),
         seconds=round(time.perf_counter() - started, 3),
     )
-    log.info("candidates.retrieved", stage=STAGE, **report.model_dump(mode="json"))
+    log.info("candidates.retrieved", stage=stage, **report.model_dump(mode="json"))
     return CandidateSet(report=report, targets=targets)
 
 
