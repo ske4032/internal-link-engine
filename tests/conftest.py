@@ -45,8 +45,6 @@ _TENANT_FIELD_NAMES = (
     "embedding_strategy",
     "site_languages",
     "client_tier",
-    "lifecycle_boost_enabled",
-    "reserved_new_page_slot_pct",
     "diversity_cap_pct",
     "max_recommendations_per_source",
 )

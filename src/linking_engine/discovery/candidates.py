@@ -40,12 +40,16 @@ def nearest_eligible(
     *,
     per_target: int = PER_TARGET,
     chunk_size: int = TARGET_CHUNK,
+    languages: Mapping[str, str | None] | None = None,
 ) -> tuple[TargetCandidates, ...]:
     """The ``per_target`` nearest eligible sources of each target, in ``targets`` order.
 
     ``urls`` is the pool, ascending, one row of ``vectors`` each; every target is in it.
-    ``links`` are (source, target) pairs. Targets are scored ``chunk_size`` at a time against
-    the whole pool, so memory grows with the chunk, not with the square of the pool.
+    ``links`` are (source, target) pairs. A source must share the target's language in
+    ``languages`` (a url without an entry has none, and none matches none); pages of another
+    language are neither eligible nor counted as linked. Targets are scored ``chunk_size`` at
+    a time against the whole pool, so memory grows with the chunk, not with the square of
+    the pool.
     """
     if per_target < 1:
         raise ValueError("per_target must be at least 1")
@@ -63,10 +67,18 @@ def nearest_eligible(
     if not targets:
         return ()
 
+    codes = _language_codes(urls, languages or {})
+    # Pool pages sharing each language, the page itself included.
+    peers = np.bincount(codes) if codes is not None else np.array([len(urls)])
     wanted = set(targets)
     linking: dict[str, set[int]] = {}
     for source, target in links:
-        if target in wanted and source != target and source in position:
+        if (
+            target in wanted
+            and source != target
+            and source in position
+            and (codes is None or codes[position[source]] == codes[position[target]])
+        ):
             linking.setdefault(target, set()).add(position[source])
     linked = {url: np.array(sorted(found), dtype=np.intp) for url, found in linking.items()}
     no_links = np.empty(0, dtype=np.intp)
@@ -92,6 +104,8 @@ def nearest_eligible(
         for i, cols in enumerate(excluded):
             scores[i, cols] = -np.inf
         scores[np.arange(len(chunk)), rows] = -np.inf
+        if codes is not None:
+            scores[codes[rows, None] != codes] = -np.inf
         for i, (url, (kept, similarities)) in enumerate(
             zip(chunk, _best(scores, per_target), strict=True)
         ):
@@ -107,12 +121,26 @@ def nearest_eligible(
                     target_url=url,
                     sources=tuple(urls[j] for j in kept.tolist()),
                     similarities=tuple(similarities.tolist()),
-                    eligible=len(urls) - 1 - len(cols),
+                    eligible=int(peers[codes[position[url]] if codes is not None else 0])
+                    - 1
+                    - len(cols),
                     linked=len(cols),
                     linked_nearer=nearer,
                 )
             )
     return tuple(results)
+
+
+def _language_codes(
+    urls: Sequence[str], languages: Mapping[str, str | None]
+) -> npt.NDArray[np.intp] | None:
+    """One small integer per pool page for its language; None when every page shares one, so
+    single-language tenants skip the constraint."""
+    code_of: dict[str | None, int] = {}
+    codes = np.array(
+        [code_of.setdefault(languages.get(url), len(code_of)) for url in urls], dtype=np.intp
+    )
+    return codes if len(code_of) > 1 else None
 
 
 def _best(
@@ -210,7 +238,8 @@ async def retrieve_candidates(
     per_target: int = PER_TARGET,
     chunk_size: int = TARGET_CHUNK,
 ) -> CandidateSet:
-    """Every target's nearest eligible sources among the tenant's own crawled pages."""
+    """Every target's nearest eligible sources among the tenant's own crawled pages of the
+    target's language."""
     if not tenant_id.strip():
         raise ValueError("tenant_id must be a non-empty string")
     if per_target < 1:
@@ -221,6 +250,7 @@ async def retrieve_candidates(
     started = time.perf_counter()
     selection = await graph.candidate_targets(tenant_id, index=index)
     urls, pool = _pool(await graph.page_vectors(tenant_id, index=index), tenant_id, index)
+    languages = await graph.page_languages(tenant_id)
     snapshot = await graph.link_graph(tenant_id)
     loaded = time.perf_counter()
 
@@ -241,6 +271,7 @@ async def retrieve_candidates(
         snapshot.links,
         per_target=per_target,
         chunk_size=chunk_size,
+        languages=languages,
     )
     searched = time.perf_counter()
     report = candidate_report(

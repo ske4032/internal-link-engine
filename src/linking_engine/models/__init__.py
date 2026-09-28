@@ -53,13 +53,15 @@ from linking_engine.models.enums import (
     ClusterAgreement,
     ContentGapFinding,
     IssueFlag,
+    KeywordRung,
     KeywordSource,
     LifecycleStage,
     OrphanLabel,
     PageType,
     RecommendationStatus,
 )
-from linking_engine.models.features import PairFeatures
+from linking_engine.models.features import FeatureReport, PageStructure, PairFeatures
+from linking_engine.models.keywords import KeywordReport, KeywordTarget, ResolvedKeyword
 from linking_engine.models.page import (
     CentralityReport,
     CommunityContext,
@@ -78,13 +80,16 @@ from linking_engine.models.page import (
 )
 from linking_engine.models.recommendation import AnchorCandidate, Recommendation
 from linking_engine.models.signals import (
+    CtrCurve,
+    GscMetrics,
     GscQuery,
+    GscQueryStats,
     PageSignals,
     PairSignals,
     SignalReport,
     StrategicKeyword,
 )
-from linking_engine.models.tenant import AnchorRules, AnchorTypeProfile, TenantConfig
+from linking_engine.models.tenant import AnchorRules, AnchorTypeProfile, LanguageRules, TenantConfig
 
 __all__ = [
     "ActionType",
@@ -103,6 +108,7 @@ __all__ = [
     "CommunityReport",
     "ContentGapFinding",
     "CrawlPage",
+    "CtrCurve",
     "EdgeRef",
     "EmbedRunReport",
     "EmbeddingBatch",
@@ -110,14 +116,21 @@ __all__ = [
     "EmbeddingSelection",
     "EmbeddingTarget",
     "ExtractedLink",
+    "FeatureReport",
     "GraphLoadReport",
+    "GscMetrics",
     "GscQuery",
+    "GscQueryStats",
     "Heading",
     "HubCentroid",
     "HubReport",
     "IssueFlag",
     "Keyword",
+    "KeywordReport",
+    "KeywordRung",
     "KeywordSource",
+    "KeywordTarget",
+    "LanguageRules",
     "LifecycleStage",
     "Link",
     "LinkAuditResult",
@@ -133,6 +146,7 @@ __all__ = [
     "PageHub",
     "PageRecord",
     "PageSignals",
+    "PageStructure",
     "PageSummary",
     "PageText",
     "PageType",
@@ -143,6 +157,7 @@ __all__ = [
     "QueryParamEvidence",
     "Recommendation",
     "RecommendationStatus",
+    "ResolvedKeyword",
     "SentenceTarget",
     "SignalReport",
     "StrategicKeyword",

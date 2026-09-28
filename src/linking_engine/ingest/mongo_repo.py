@@ -31,7 +31,10 @@ from linking_engine.errors import (
 from linking_engine.models import (
     AnchorRules,
     CrawlPage,
+    GscMetrics,
     GscQuery,
+    GscQueryStats,
+    LanguageRules,
     LinkRecord,
     PageRecord,
     PageSummary,
@@ -52,6 +55,8 @@ READ_BATCH: Final = 1000
 _ATTEMPTS: Final = 3
 _AUTH_CODES: Final = frozenset({13, 18})  # Unauthorized, AuthenticationFailed
 _THIRTY_DAYS: Final = 30 * 24 * 3600
+# The GSC rollup stores its fields under their snake_case names, not camelCase.
+_GSC_METRICS_KEYS: Final = {field: field for field in GscMetrics.model_fields}
 
 # All project indexes. Changing options of an existing index needs a manual drop.
 INDEXES: Final[dict[str, tuple[IndexModel, ...]]] = {
@@ -294,6 +299,56 @@ class MongoRepo:
             what="write anchor rules",
         )
 
+    async def get_language_rules(self, tenant_id: str) -> LanguageRules:
+        """The tenant's default language and url prefix languages; none stored means English."""
+        _require_tenant(tenant_id)
+        document = await _retrying(
+            partial(
+                self._db["tenant_config"].find_one,
+                {"tenantId": tenant_id},
+                {"_id": 0, "defaultLanguage": 1, "languagePrefixes": 1},
+            ),
+            write=False,
+            what="read language rules",
+        )
+        if not document:
+            return LanguageRules()
+        data: Document = {}
+        if document.get("defaultLanguage") is not None:
+            data["default_language"] = document["defaultLanguage"]
+        prefixes = document.get("languagePrefixes") or []
+        if isinstance(prefixes, list) and all(isinstance(p, dict) for p in prefixes):
+            prefixes = [(p.get("path"), p.get("language")) for p in prefixes]
+        data["prefixes"] = prefixes
+        try:
+            return LanguageRules.model_validate(data)
+        except ValidationError as error:
+            raise DatabaseReadError(
+                "mongodb", f"language rules of {tenant_id!r} do not fit LanguageRules: {error}"
+            ) from error
+
+    async def set_language_rules(self, tenant_id: str, rules: LanguageRules) -> None:
+        _require_tenant(tenant_id)
+        await _retrying(
+            partial(
+                self._db["tenant_config"].update_one,
+                {"tenantId": tenant_id},
+                {
+                    "$set": {
+                        "defaultLanguage": rules.default_language,
+                        "languagePrefixes": [
+                            {"path": path, "language": language}
+                            for path, language in sorted(rules.prefixes)
+                        ],
+                        "languageRulesUpdatedAt": datetime.now(UTC),
+                    }
+                },
+                upsert=True,
+            ),
+            write=True,
+            what="write language rules",
+        )
+
     async def delete_tenant(self, tenant_id: str) -> int:
         _require_tenant(tenant_id)
         deleted = 0
@@ -314,6 +369,47 @@ class MongoRepo:
             self._db["pages"], {"tenantId": tenant_id}, PageSummary, batch_size
         ):
             yield [_from_document(PageSummary, document) for document in documents]
+
+    async def iter_page_records(
+        self, tenant_id: str, *, batch_size: int = READ_BATCH
+    ) -> AsyncIterator[list[PageRecord]]:
+        """Every stored page of the tenant with its text, in storage order."""
+        _require_tenant(tenant_id)
+        async for documents in _find_batches(
+            self._db["pages"], {"tenantId": tenant_id}, PageRecord, batch_size
+        ):
+            yield [_from_document(PageRecord, document) for document in documents]
+
+    async def gsc_query_stats(
+        self, tenant_id: str, *, batch_size: int = READ_BATCH
+    ) -> list[GscQueryStats]:
+        """Every stored GSC query row of the tenant with its metrics, ordered by url then query."""
+        _require_tenant(tenant_id)
+        rows: list[GscQueryStats] = []
+        async for documents in _find_batches(
+            self._db["gsc_queries"], {"tenantId": tenant_id}, GscQueryStats, batch_size
+        ):
+            rows.extend(_from_document(GscQueryStats, document) for document in documents)
+        return sorted(rows, key=lambda row: (row.url, row.query))
+
+    async def gsc_metrics(
+        self, tenant_id: str, *, batch_size: int = READ_BATCH
+    ) -> list[GscMetrics]:
+        """The tenant's 28-day GSC totals per page, ordered by url."""
+        _require_tenant(tenant_id)
+        rows: list[GscMetrics] = []
+        async for documents in _find_batches(
+            self._db["gsc_metrics"],
+            {"tenantId": tenant_id},
+            GscMetrics,
+            batch_size,
+            keys=_GSC_METRICS_KEYS,
+        ):
+            rows.extend(
+                _from_document(GscMetrics, document, keys=_GSC_METRICS_KEYS)
+                for document in documents
+            )
+        return sorted(rows, key=lambda row: row.url)
 
     async def gsc_queries(
         self, tenant_id: str, *, batch_size: int = READ_BATCH
@@ -439,8 +535,12 @@ def _bson(value: object) -> object:
     return value
 
 
-def _from_document[M: BaseModel](model: type[M], document: Mapping[str, object]) -> M:
-    data = {field: document[key] for key, field in _keys(model).items() if key in document}
+def _from_document[M: BaseModel](
+    model: type[M], document: Mapping[str, object], *, keys: Mapping[str, str] | None = None
+) -> M:
+    """``keys`` maps stored keys to fields when they are not the camelCase field names."""
+    stored = _keys(model) if keys is None else keys
+    data = {field: document[key] for key, field in stored.items() if key in document}
     try:
         return model.model_validate(data)
     except ValidationError as error:
@@ -463,9 +563,11 @@ async def _find_batches(
     query: Document,
     model: type[BaseModel],
     batch_size: int,
+    *,
+    keys: Mapping[str, str] | None = None,
 ) -> AsyncIterator[list[Document]]:
     """Keyset pagination on _id, so a retried batch never repeats or skips documents."""
-    projection = dict.fromkeys(_keys(model), 1)
+    projection = dict.fromkeys(_keys(model) if keys is None else keys, 1)
     last_id: object = None
     while True:
         page_query: Document = (

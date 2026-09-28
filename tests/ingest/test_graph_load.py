@@ -184,3 +184,24 @@ async def test_load_writes_template_inlinks_and_a_reload_converges(
         f"{BASE}/uncrawled": (None, None),
     }
     assert await graph.counts(tenant) == TenantGraphCounts(pages=2, placeholders=1, links=1)
+
+
+@pytest.mark.integration
+async def test_load_carries_language_and_crawl_depth_and_drops_a_lost_depth(
+    mongo: MongoRepo, graph: GraphRepo, tenant: str
+) -> None:
+    home = page("/", 0).model_copy(update={"language": "de", "crawl_depth": 0})
+    deep = page("/b", 0).model_copy(update={"language": "en", "crawl_depth": 2})
+    await mongo.write_pages(tenant, [home, deep], [])
+    await load_tenant_graph(mongo, graph, tenant)
+
+    async def stored() -> dict[str, tuple[str | None, int | None]]:
+        pages = await graph.get_pages(tenant, [BASE, f"{BASE}/b"])
+        return {str(p.url): (p.language, p.crawl_depth) for p in pages}
+
+    assert await stored() == {BASE: ("de", 0), f"{BASE}/b": ("en", 2)}
+
+    await mongo.write_pages(tenant, [deep.model_copy(update={"crawl_depth": None})], [])
+    await load_tenant_graph(mongo, graph, tenant)
+
+    assert await stored() == {BASE: ("de", 0), f"{BASE}/b": ("en", None)}

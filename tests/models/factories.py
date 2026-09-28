@@ -20,6 +20,7 @@ from linking_engine.models.audit import LinkAuditResult
 from linking_engine.models.enums import (
     ActionType,
     AnchorType,
+    ClusterAgreement,
     IssueFlag,
     LifecycleStage,
     OrphanLabel,
@@ -160,37 +161,47 @@ PAIR_KWARGS: dict[str, object] = {
     # gsc
     "source_impressions_log": 9.21,
     "target_impressions_log": 8.15,
-    "target_position_band": "1",
+    "target_position_band": 1,
     "target_ctr_gap": 0.04,
     "target_query_count": 42,
     "has_gsc_data": True,
-    # lifecycle
-    "source_lifecycle_stage": LifecycleStage.MATURE,
-    "target_lifecycle_stage": LifecycleStage.NEW,
-    "source_page_age_days": 820,
-    "target_page_age_days": 12,
-    # strategic
+    # overlap
+    "pair_query_overlap": 0.2,
+    "pair_kw_overlap": 0.25,
     "target_kw_count": 5,
     "target_max_priority": 4,
     "target_keyword_gap": 2,
-    "pair_kw_overlap": 0.25,
-    # target structural
+    # target structure
     "target_inbound_count": 3,
     "target_is_orphan": False,
     "target_crawl_depth": 2,
+    "target_page_rank_percentile": 0.35,
     "target_saturation_ratio": 0.45,
-    # source structural
+    # source structure
     "source_outbound_count": 12,
-    "source_outbound_density": 0.008,
-    "source_link_equity_share": 0.083,
-    # cluster
+    "source_outbound_density": 8.0,
+    "source_link_equity_share": 1 / 13,
+    # hub structure
+    "same_hub": False,
+    "source_is_hub_pillar": True,
+    "target_is_hub_pillar": False,
+    "source_hub_size": 14,
+    "target_hub_size": 9,
+    "target_hub_coverage": 0.25,
+    # clusters
     "source_link_community_id": 3,
     "target_link_community_id": 7,
     "source_keyword_community_id": 1,
     "target_keyword_community_id": 4,
+    "source_content_community_id": 6,
+    "target_content_community_id": 6,
     "source_hub_id": 2,
     "target_hub_id": 5,
-    "cluster_agreement": 1,
+    "same_link_community": False,
+    "same_keyword_community": False,
+    "same_content_community": True,
+    "cluster_agreement": ClusterAgreement.OTHER_TOPIC_OTHER_LINKS,
+    "content_agreement": ClusterAgreement.SAME_TOPIC_OTHER_LINKS,
     # semantic
     "content_cosine": 0.62,
     "context_relevance": 0.71,

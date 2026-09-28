@@ -8,6 +8,10 @@ from prefect.states import Failed
 from pymongo import AsyncMongoClient
 from test_embed import DIM, record, seed, seed_plain, url
 from test_embed_links import text_vector
+from test_feature_stage import seed as seed_features
+from test_keyword_stage import EXPECTED as EXPECTED_KEYWORD_EDGES
+from test_keyword_stage import edges as keyword_edges
+from test_keyword_stage import seed as seed_keywords
 from voyage_fakes import FakeVoyage, client, page_index
 from voyageai.error import InvalidRequestError, ServiceUnavailableError
 
@@ -439,3 +443,48 @@ async def test_unreadable_graph_data_fails_candidate_retrieval_without_a_retry(
 
     assert state.is_failed()
     assert calls == [tenant]
+
+
+@pytest.mark.integration
+async def test_resolve_keywords_flow_writes_edges_and_logs_one_mlflow_run(
+    graph: GraphRepo,
+    mongo: MongoRepo,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    await seed_keywords(graph, mongo, tenant, "Trail Running Shoes")
+
+    report, run_id = await flows.resolve_keywords_flow(tenant)
+
+    assert (report.tenant_id, report.resolved) == (tenant, 5)
+    assert await keyword_edges(graph, tenant) == EXPECTED_KEYWORD_EDGES
+    run = MlflowClient(uri).get_run(run_id)
+    assert (run.data.tags["tenant_id"], run.data.tags["stage"]) == (tenant, "resolve-keywords")
+    assert run.data.metrics["rung_gsc"] == 1
+
+
+@pytest.mark.integration
+async def test_feature_assembly_flow_writes_the_matrix_and_logs_one_mlflow_run(
+    graph: GraphRepo,
+    mongo: MongoRepo,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    await seed_features(graph, mongo, tenant)
+
+    report, path, run_id = await flows.feature_assembly_flow(tenant, tmp_path / "features", 5)
+
+    assert path == tmp_path / "features" / tenant / f"{report.cache_key}.parquet"
+    assert path.is_file()
+    assert report.pairs > 0
+    run = MlflowClient(uri).get_run(run_id)
+    assert (run.data.tags["tenant_id"], run.data.tags["stage"]) == (tenant, "feature-assembly")
+    assert run.data.metrics["pairs"] == report.pairs

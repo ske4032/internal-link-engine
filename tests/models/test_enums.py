@@ -16,8 +16,10 @@ import pytest
 from linking_engine.models.enums import (
     ActionType,
     AnchorType,
+    ClusterAgreement,
     ContentGapFinding,
     IssueFlag,
+    KeywordRung,
     KeywordSource,
     LifecycleStage,
     PageType,
@@ -44,6 +46,17 @@ ENUM_CASES = [
     (LifecycleStage, ("NEW", "EMERGING", "ESTABLISHED", "MATURE")),
     (PageType, ("PILLAR", "CATEGORY", "PRODUCT", "ARTICLE")),
     (KeywordSource, ("CLIENT_STRATEGIC", "GSC_OBSERVED", "INFERRED")),
+    (KeywordRung, ("STRATEGIC", "GSC", "H1", "TITLE")),
+    (
+        ClusterAgreement,
+        (
+            "SAME_TOPIC_SAME_LINKS",
+            "SAME_TOPIC_OTHER_LINKS",
+            "OTHER_TOPIC_SAME_LINKS",
+            "OTHER_TOPIC_OTHER_LINKS",
+            "UNKNOWN_TOPIC",
+        ),
+    ),
     (ContentGapFinding, ("NO_TOPICAL_MENTION", "AWKWARD_PHRASING")),
     (RecommendationStatus, ("PENDING", "ACCEPTED", "MODIFIED", "DISMISSED")),
 ]

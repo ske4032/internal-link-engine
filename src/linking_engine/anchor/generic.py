@@ -118,7 +118,8 @@ def is_generic(
     text: str, *, add: frozenset[str] = frozenset(), remove: frozenset[str] = frozenset()
 ) -> bool:
     """True when the anchor says nothing about its target: a generic phrase, pagination,
-    or no letters at all ("2", "»"). ``add``/``remove`` are normalised tenant overrides."""
+    or no letters at all ("2", "→"). Text that normalises to nothing ("»", "...") has no
+    key and is not called generic. ``add``/``remove`` are normalised tenant overrides."""
     key = normalise_anchor(text)
     if not key or key in remove:
         return False

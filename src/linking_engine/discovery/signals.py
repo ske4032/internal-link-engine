@@ -7,12 +7,12 @@ signal is a ranker input: a pair with no overlap still goes on with a weak signa
 from __future__ import annotations
 
 import time
-import unicodedata
 from collections import Counter, defaultdict
 from typing import TYPE_CHECKING, Final
 
 import structlog
 
+from linking_engine.gsc import normalise_term
 from linking_engine.models import (
     ClusterAgreement,
     PageSignals,
@@ -29,10 +29,6 @@ log = structlog.get_logger(__name__)
 
 HUB_NOISE: Final = -1
 STAGE: Final = "pair-signals"
-
-
-def normalise_term(text: str) -> str:
-    return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
 
 
 def jaccard(a: frozenset[str], b: frozenset[str]) -> float:

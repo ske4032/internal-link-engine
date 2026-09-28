@@ -229,6 +229,31 @@ async def test_batched_reads_do_not_skip_or_repeat(mongo: MongoRepo, tenant: str
 
 
 @pytest.mark.integration
+async def test_page_records_read_back_whole_with_language_and_depth(
+    mongo: MongoRepo, tenant: str
+) -> None:
+    other = f"{tenant}-other"
+    pages = [
+        record("/a", language="de", crawl_depth=0),
+        record("/b", language="en", crawl_depth=3),
+        record("/unreached"),
+    ]
+    await mongo.write_pages(tenant, pages, [])
+    await mongo.write_pages(other, [record("/other-only")], [])
+
+    batches = [batch async for batch in mongo.iter_page_records(tenant, batch_size=2)]
+
+    assert [len(batch) for batch in batches] == [2, 1]
+    assert sorted((r for batch in batches for r in batch), key=lambda r: str(r.url)) == pages
+    summaries = [s async for batch in mongo.iter_page_summaries(tenant) for s in batch]
+    assert {s.url: (s.language, s.crawl_depth) for s in summaries} == {
+        url("/a"): ("de", 0),
+        url("/b"): ("en", 3),
+        url("/unreached"): (None, None),
+    }
+
+
+@pytest.mark.integration
 async def test_tenants_are_isolated(mongo: MongoRepo, tenant: str) -> None:
     other = f"{tenant}-other"
     for t in (tenant, other):

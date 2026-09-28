@@ -29,8 +29,6 @@ EXPECTED_DEFAULTS = {
     "discovery_enabled": False,
     "embedding_strategy": "MULTILINGUAL_EMBED",
     "client_tier": "STARTER",
-    "lifecycle_boost_enabled": True,
-    "reserved_new_page_slot_pct": 0.15,
     "diversity_cap_pct": 0.15,
     "max_recommendations_per_source": 10,
 }
