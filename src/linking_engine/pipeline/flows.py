@@ -11,6 +11,7 @@ from prefect.cache_policies import NONE
 from prefect.runtime import flow_run
 from structlog.contextvars import bound_contextvars
 
+from linking_engine.discovery.bridges import summarise_bridges
 from linking_engine.discovery.candidates import retrieve_candidates, summarise_candidates
 from linking_engine.discovery.features import CHUNK_PAIRS, summarise_features
 from linking_engine.discovery.scoring import summarise_scores
@@ -27,6 +28,7 @@ from linking_engine.ingest.mongo_repo import CrawlSource, MongoRepo
 from linking_engine.ingest.prepare import BOILERPLATE_SHARE, NAV_SHARE, prepare_tenant
 from linking_engine.ml.tracking import (
     log_analytics,
+    log_bridges,
     log_candidates,
     log_duplicates,
     log_features,
@@ -35,6 +37,7 @@ from linking_engine.ml.tracking import (
     log_scores,
 )
 from linking_engine.models import (
+    BridgeReport,
     CandidateSet,
     CentralityReport,
     CommunityReport,
@@ -58,6 +61,7 @@ from linking_engine.pipeline.analytics import (
     compute_hubs,
     summarise,
 )
+from linking_engine.pipeline.bridges import HUB_PAIRS_FILE, find_bridges, read_hub_pairs
 from linking_engine.pipeline.duplicates import find_duplicates, summarise_duplicates
 from linking_engine.pipeline.embed import FLUSH_SIZE, embed_tenant
 from linking_engine.pipeline.embed_links import embed_links
@@ -635,3 +639,54 @@ async def score_links_flow(tenant_id: str) -> tuple[LinkRelevanceReport, str]:
         mlflow_run,
     )
     return report, mlflow_run
+
+
+# Read-only against both stores; both files are renamed into place only when complete, so a
+# retry writes them again whole.
+@task(
+    name="hub-bridges",
+    retries=1,
+    retry_delay_seconds=30,
+    retry_condition_fn=is_transient,
+    cache_policy=NONE,
+)
+async def bridges_task(tenant_id: str, cache_dir: Path) -> tuple[BridgeReport, Path]:
+    async with await neo4j() as graph, await mongo() as repo:
+        await graph.check_server()
+        return await find_bridges(graph, repo, tenant_id, cache_dir=cache_dir)
+
+
+@task(name="mlflow-log-bridges", cache_policy=NONE)
+def log_bridges_task(report: BridgeReport, path: Path) -> str:
+    pairs = read_hub_pairs(path.with_name(HUB_PAIRS_FILE))
+    return log_bridges(report, pairs, summarise_bridges(report))
+
+
+@flow(name="hub-bridges")
+async def hub_bridges_flow(
+    tenant_id: str, cache_dir: Path = CACHE_DIR
+) -> tuple[BridgeReport, Path, str]:
+    """Bridge links that keep every hub connected to the others, written with the scored hub
+    pairs under ``cache_dir``; nothing is written to the stores, the run is logged to MLflow
+    without page urls."""
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
+        logger.info("hub bridges of tenant %s", tenant_id)
+        report, path = await bridges_task(tenant_id, cache_dir)
+        mlflow_run = log_bridges_task(report, path)
+    logger.info(
+        "%d hubs, %d pairs; %d directions below the floor need %d links, %d proposed, %d short; "
+        "components %d -> %d; %s; %.1fs; mlflow run %s",
+        report.hubs,
+        report.hub_pairs,
+        report.directions_below_floor,
+        report.links_needed,
+        report.bridge_links,
+        report.directions_short,
+        report.components_before,
+        report.components_after,
+        path,
+        report.seconds,
+        mlflow_run,
+    )
+    return report, path, mlflow_run

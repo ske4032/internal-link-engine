@@ -19,6 +19,17 @@ from linking_engine.anchor.keywords import (
     REPEATED_FALLBACK_PAGES,
 )
 from linking_engine.audit.relevance import MIN_MODE_GAP, MIN_SPLIT_SCORES, SPLIT_SEED
+from linking_engine.discovery.bridges import (
+    ALTERNATIVES,
+    COSINE_WEIGHT,
+    DENSITY_WEIGHT,
+    FLOOR_SHARE,
+    JACCARD_WEIGHT,
+    NEAREST_HUBS,
+    RELEVANCE_DECIMALS,
+    SHARED_QUERIES,
+    TOP_GAP_PAIRS,
+)
 from linking_engine.discovery.features import POSITION_BANDS
 from linking_engine.graph.algorithms import (
     DAMPING,
@@ -37,13 +48,17 @@ from linking_engine.models.relevance import HISTOGRAM_BINS
 from linking_engine.models.scoring import SCORE_HISTOGRAM_BINS
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from linking_engine.models import (
+        BridgeReport,
         CandidateReport,
         CandidateSet,
         CentralityReport,
         CommunityReport,
         DuplicateReport,
         FeatureReport,
+        HubPair,
         HubReport,
         KeywordReport,
         LinkRelevanceReport,
@@ -533,3 +548,77 @@ def log_link_relevance(report: LinkRelevanceReport, summary: str) -> str:
         mlflow.log_dict(report.model_dump(mode="json"), "report.json")
         mlflow.log_text(summary, "summary.md")
         return run_id
+
+
+def bridge_metrics(report: BridgeReport) -> dict[str, float]:
+    """Every count of the run, flat, with the covered pairs per reason as ``pairs_<reason>``."""
+    metrics: dict[str, float] = {
+        name: float(value)
+        for name, value in report.model_dump(
+            exclude={"tenant_id", "floor_share", "by_reason", "finished_at"}
+        ).items()
+    }
+    metrics.update(
+        {
+            f"pairs_{reason.value.lower()}": float(count)
+            for reason, count in report.by_reason.items()
+        }
+    )
+    return metrics
+
+
+def hub_pair_table(pairs: Sequence[HubPair]) -> dict[str, list[object]]:
+    """Every scored hub pair with its three bridge-gap terms, how many queries the hubs share
+    and its reasons; hub ids and counts, never urls or queries."""
+    columns = (
+        "language",
+        "hub_a",
+        "hub_b",
+        "size_a",
+        "size_b",
+        "pages_ab",
+        "pages_ba",
+        "link_density",
+        "centroid_cosine",
+        "query_jaccard",
+        "bridge_gap",
+    )
+    table: dict[str, list[object]] = {
+        name: [getattr(pair, name) for pair in pairs] for name in columns
+    }
+    table["shared_query_count"] = [len(pair.shared_queries) for pair in pairs]
+    table["reasons"] = [",".join(reason.value for reason in pair.reasons) for pair in pairs]
+    return table
+
+
+def log_bridges(report: BridgeReport, pairs: Sequence[HubPair], summary: str) -> str:
+    """Log one hub-bridge run: its counts, the hub pair table and its description; no page urls
+    reach the run. Returns the MLflow run id."""
+    use_analytics_experiment(report.tenant_id)
+    with mlflow.start_run(
+        run_name="hub bridges",
+        tags={
+            "tenant_id": report.tenant_id,
+            "kind": "pipeline",
+            "stage": "hub-bridges",
+            "mlflow.note.content": summary,
+        },
+    ) as run:
+        mlflow.log_params(
+            {
+                "floor_share": FLOOR_SHARE,
+                "nearest_hubs": NEAREST_HUBS,
+                "top_gap_pairs": TOP_GAP_PAIRS,
+                "alternatives": ALTERNATIVES,
+                "density_weight": DENSITY_WEIGHT,
+                "cosine_weight": COSINE_WEIGHT,
+                "jaccard_weight": JACCARD_WEIGHT,
+                "shared_queries": SHARED_QUERIES,
+                "relevance_decimals": RELEVANCE_DECIMALS,
+            }
+        )
+        mlflow.log_metrics(bridge_metrics(report))
+        mlflow.log_table(hub_pair_table(pairs), "hub_pairs.json")
+        mlflow.log_dict(report.model_dump(mode="json"), "report.json")
+        mlflow.log_text(summary, "summary.md")
+        return str(run.info.run_id)

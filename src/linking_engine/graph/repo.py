@@ -36,6 +36,7 @@ from linking_engine.models import (
     EmbeddingSelection,
     EmbeddingTarget,
     IssueFlag,
+    KeywordRung,
     KeywordSource,
     Link,
     LinkGraphSnapshot,
@@ -455,6 +456,13 @@ MATCH (p:Page {tenantId: $tenant})
 WHERE (p.duplicateGroup IS NOT NULL OR p.isCanonical IS NOT NULL) AND NOT p.url IN $urls
 REMOVE p.duplicateGroup, p.isCanonical
 RETURN count(p) AS n
+"""
+# The resolved keyword is the rank-1 edge carrying a rung, one per page across the sources.
+_RESOLVED_KEYWORDS: Final = """
+MATCH (p:Page {tenantId: $tenant})-[r:TARGETS_KEYWORD]->(k:Keyword {tenantId: $tenant})
+WHERE NOT coalesce(p.isPlaceholder, false) AND r.rung IS NOT NULL AND r.rank = 1
+RETURN p.url AS url, k.text AS text, r.rung AS rung
+ORDER BY url, text
 """
 _NON_CANONICAL_COPIES: Final = """
 MATCH (p:Page {tenantId: $tenant})
@@ -1391,6 +1399,27 @@ class GraphRepo:
             raise DatabaseReadError(
                 "neo4j", f"duplicate inputs of {tenant_id!r}: {error}"
             ) from error
+
+    async def resolved_keywords(self, tenant_id: str) -> dict[str, tuple[str, KeywordRung]]:
+        """Page url to the text and rung of its resolved keyword, for the tenant's crawled pages
+        that resolved one."""
+        _require_tenant(tenant_id)
+        found: dict[str, tuple[str, KeywordRung]] = {}
+        for row in await self._read(_RESOLVED_KEYWORDS, tenant=tenant_id):
+            url, text, rung = str(row["url"]), row["text"], row["rung"]
+            if url in found:
+                raise DatabaseReadError(
+                    "neo4j", f"page {url!r} of {tenant_id!r} has more than one resolved keyword"
+                )
+            if not isinstance(text, str) or not text:
+                raise DatabaseReadError("neo4j", f"page {url!r} has a keyword without text")
+            try:
+                found[url] = (text, KeywordRung(str(rung)))
+            except ValueError:
+                raise DatabaseReadError(
+                    "neo4j", f"page {url!r} has an unknown keyword rung {rung!r}"
+                ) from None
+        return found
 
     async def non_canonical_copies(self, tenant_id: str) -> frozenset[str]:
         """Urls of the tenant's crawled pages stored as non-canonical duplicate copies."""
