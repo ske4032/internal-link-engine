@@ -38,6 +38,7 @@ from linking_engine.models import (
     LinkRecord,
     PageRecord,
     PageSummary,
+    ScorerWeights,
     StrategicKeyword,
 )
 from linking_engine.urls import UrlRules, normalise_url
@@ -347,6 +348,61 @@ class MongoRepo:
             ),
             write=True,
             what="write language rules",
+        )
+
+    async def get_scorer_weights(self, tenant_id: str) -> ScorerWeights | None:
+        """The tenant's scorer weights; None means the packaged default."""
+        _require_tenant(tenant_id)
+        document = await _retrying(
+            partial(
+                self._db["tenant_config"].find_one,
+                {"tenantId": tenant_id},
+                {"_id": 0, "scorerWeights": 1},
+            ),
+            write=False,
+            what="read scorer weights",
+        )
+        stored = document.get("scorerWeights") if document else None
+        if stored is None:
+            return None
+        if not isinstance(stored, dict):
+            raise DatabaseReadError(
+                "mongodb", f"scorer weights of {tenant_id!r} are not a document"
+            )
+        # One stored form, camelCase: a snake_case key copied from the packaged JSON would
+        # otherwise be dropped silently.
+        keys = _keys(ScorerWeights)
+        unknown = sorted(str(key) for key in stored if key not in keys)
+        if unknown:
+            raise DatabaseReadError(
+                "mongodb",
+                f"scorer weights of {tenant_id!r} have unknown keys {', '.join(unknown)}; "
+                f"expected {', '.join(keys)}",
+            )
+        try:
+            return ScorerWeights.model_validate(
+                {field: stored[key] for key, field in keys.items() if key in stored}
+            )
+        except ValidationError as error:
+            raise DatabaseReadError(
+                "mongodb", f"scorer weights of {tenant_id!r} do not fit ScorerWeights: {error}"
+            ) from error
+
+    async def set_scorer_weights(self, tenant_id: str, weights: ScorerWeights | None) -> None:
+        """Store the tenant's scorer weights; None removes them, back to the default."""
+        _require_tenant(tenant_id)
+        now = datetime.now(UTC)
+        update = (
+            {"$set": {"scorerWeights": _to_document(weights), "scorerWeightsUpdatedAt": now}}
+            if weights is not None
+            else {"$unset": {"scorerWeights": ""}, "$set": {"scorerWeightsUpdatedAt": now}}
+        )
+        await _retrying(
+            partial(
+                self._db["tenant_config"].update_one, {"tenantId": tenant_id}, update, upsert=True
+            ),
+            write=True,
+            what="write scorer weights",
         )
 
     async def delete_tenant(self, tenant_id: str) -> int:

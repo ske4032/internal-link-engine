@@ -181,6 +181,7 @@ PAIR_KWARGS: dict[str, object] = {
     "source_outbound_count": 12,
     "source_outbound_density": 8.0,
     "source_link_equity_share": 1 / 13,
+    "source_page_rank_percentile": 0.6,
     # hub structure
     "same_hub": False,
     "source_is_hub_pillar": True,

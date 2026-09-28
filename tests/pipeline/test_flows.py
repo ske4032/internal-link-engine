@@ -536,3 +536,199 @@ async def test_feature_assembly_flow_writes_the_matrix_and_logs_one_mlflow_run(
     run = MlflowClient(uri).get_run(run_id)
     assert (run.data.tags["tenant_id"], run.data.tags["stage"]) == (tenant, "feature-assembly")
     assert run.data.metrics["pairs"] == report.pairs
+
+
+@pytest.mark.integration
+async def test_score_pairs_flow_writes_the_scores_and_logs_one_mlflow_run(
+    graph: GraphRepo,
+    mongo: MongoRepo,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    await seed_features(graph, mongo, tenant)
+
+    report, path, run_id = await flows.score_pairs_flow(tenant, tmp_path / "features")
+
+    assert path.parent == tmp_path / "features" / tenant
+    assert path.name.endswith(f".{report.weights_hash[:12]}.scores.parquet")
+    assert path.is_file()
+    client = MlflowClient(uri)
+    run = client.get_run(run_id)
+    assert (run.data.tags["tenant_id"], run.data.tags["stage"]) == (tenant, "score-pairs")
+    assert run.data.metrics["pairs"] == report.pairs
+    assert len(client.get_metric_history(run_id, "score_hist")) == 20
+
+
+async def seed_link_relevance(graph: GraphRepo, tenant: str) -> dict[str, str]:
+    """a -> b with a stored anchor vector, b -> c with a generic anchor, c -> a whose anchor
+    has no vector, and a -> d whose target has no content vector; every link has a sentence
+    vector."""
+    urls = {name: f"example.com/rel/{name}" for name in ("a", "b", "c", "d")}
+    await graph.upsert_pages(tenant, [Page(url=u, status_code=200) for u in urls.values()])
+    await graph.replace_links(
+        tenant,
+        list(urls.values()),
+        [
+            Link(
+                source_url=urls[s],
+                target_url=urls[t],
+                position=position,
+                anchor_text="x",
+                surrounding_text="",
+            )
+            for s, t, position in (("a", "b", 0), ("b", "c", 0), ("c", "a", 0), ("a", "d", 1))
+        ],
+    )
+    await graph._auto(
+        "UNWIND $rows AS row MATCH (p:Page {tenantId: $t, url: row.url}) "
+        "SET p.content_embedding = row.vec",
+        t=tenant,
+        rows=[
+            {"url": urls["a"], "vec": [1.0, 0.0, 0.0]},
+            {"url": urls["b"], "vec": [0.0, 1.0, 0.0]},
+            {"url": urls["c"], "vec": [0.0, 0.0, 1.0]},
+        ],
+    )
+    await graph._auto(
+        "UNWIND $rows AS row "
+        "MATCH (:Page {tenantId: $t, url: row.s})-[r:LINKS_TO]->(:Page {tenantId: $t, url: row.t}) "
+        "SET r.surroundingEmbedding = row.vec, r.anchorKey = row.key, r.anchorGeneric = row.generic",
+        t=tenant,
+        rows=[
+            {
+                "s": urls["a"],
+                "t": urls["b"],
+                "vec": [0.0, 1.0, 0.0],
+                "key": "trail shoes",
+                "generic": False,
+            },
+            {
+                "s": urls["b"],
+                "t": urls["c"],
+                "vec": [0.0, 0.6, 0.8],
+                "key": "click here",
+                "generic": True,
+            },
+            {
+                "s": urls["c"],
+                "t": urls["a"],
+                "vec": [0.6, 0.8, 0.0],
+                "key": "tents",
+                "generic": False,
+            },
+            {
+                "s": urls["a"],
+                "t": urls["d"],
+                "vec": [1.0, 0.0, 0.0],
+                "key": "trail shoes",
+                "generic": False,
+            },
+        ],
+    )
+    await graph._auto(
+        "CREATE (:Anchor {tenantId: $t, text: 'trail shoes', embedding: [0.0, 0.8, 0.6]}), "
+        "(:Anchor {tenantId: $t, text: 'click here', embedding: [0.0, 0.0, 1.0]})",
+        t=tenant,
+    )
+    # Every stored vector comes from one model, as embed-pages and embed-links write them.
+    await graph._auto(
+        "MATCH (p:Page {tenantId: $t}) WHERE p.content_embedding IS NOT NULL "
+        "SET p.embeddingModel = $m "
+        "WITH count(p) AS pages "
+        "MATCH (:Page {tenantId: $t})-[r:LINKS_TO]->() SET r.surroundingEmbeddingModel = $m "
+        "WITH count(r) AS links "
+        "MATCH (a:Anchor {tenantId: $t}) SET a.embeddingModel = $m",
+        t=tenant,
+        m=MODEL,
+    )
+    return urls
+
+
+MODEL = "voyage-4-large"
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        pytest.param(
+            "MATCH (a:Anchor {tenantId: $t, text: 'trail shoes'}) SET a.embeddingModel = $other",
+            id="anchor-from-another-model",
+        ),
+        pytest.param(
+            "MATCH (:Page {tenantId: $t})-[r:LINKS_TO]->() SET r.surroundingEmbeddingModel = $other",
+            id="sentences-from-another-model",
+        ),
+        pytest.param(
+            "MATCH (p:Page {tenantId: $t}) REMOVE p.embeddingModel", id="pages-without-a-model"
+        ),
+    ],
+)
+@pytest.mark.integration
+async def test_vectors_from_different_models_fail_score_links_without_writing_scores(
+    graph: GraphRepo,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", f"sqlite:///{tmp_path / 'mlflow.db'}")
+    await seed_link_relevance(graph, tenant)
+    await graph._auto(mismatch, t=tenant, other="voyage-3-large")
+
+    state = await flows.score_links_flow(tenant, return_state=True)
+
+    assert state.is_failed()
+    with pytest.raises(EmbeddingModelMismatchError):
+        await state.aresult()
+    [written] = await graph._auto(
+        "MATCH (:Page {tenantId: $t})-[r:LINKS_TO]->() "
+        "WHERE r.contextRelevance IS NOT NULL OR r.anchorTargetFit IS NOT NULL "
+        "RETURN count(r) AS n",
+        t=tenant,
+    )
+    assert written["n"] == 0, "no score may be written from mixed models"
+
+
+@pytest.mark.integration
+async def test_score_links_flow_scores_existing_links_and_logs_one_mlflow_run(
+    graph: GraphRepo,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    urls = await seed_link_relevance(graph, tenant)
+
+    report, run_id = await flows.score_links_flow(tenant)
+
+    # a -> d is cleared: its target has no content vector.
+    assert (report.links, report.scored) == (4, 3)
+    assert (report.generic_anchors, report.without_anchor_vector) == (1, 1)
+    assert report.context is not None
+    assert report.anchor is not None
+    assert (report.context.count, report.anchor.count) == (3, 1)
+    stored = {
+        (row.source_url, row.target_url): (row.context_relevance, row.anchor_target_fit)
+        for row in await graph.link_relevance(tenant)
+    }
+    # Neo4j's normalised cosine, (1 + cos) / 2.
+    assert set(stored) == {(urls["a"], urls["b"]), (urls["b"], urls["c"]), (urls["c"], urls["a"])}
+    assert stored[urls["a"], urls["b"]][0] == pytest.approx(1.0)
+    assert stored[urls["a"], urls["b"]][1] == pytest.approx(0.9)
+    assert stored[urls["b"], urls["c"]][0] == pytest.approx(0.9)
+    assert stored[urls["c"], urls["a"]][0] == pytest.approx(0.8)
+    assert (stored[urls["b"], urls["c"]][1], stored[urls["c"], urls["a"]][1]) == (None, None)
+    client = MlflowClient(uri)
+    run = client.get_run(run_id)
+    assert (run.data.tags["tenant_id"], run.data.tags["stage"]) == (tenant, "score-links")
+    assert run.data.metrics["scored"] == 3
+    for name in ("context_relevance_hist", "anchor_target_fit_hist"):
+        assert len(client.get_metric_history(run_id, name)) == 20, name
+    assert "relevance_histogram.json" in {a.path for a in client.list_artifacts(run_id)}

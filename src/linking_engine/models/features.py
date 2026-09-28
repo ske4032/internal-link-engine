@@ -81,6 +81,8 @@ class PairFeatures(BaseModel):
     source_outbound_density: float = Field(ge=0)
     # 1 / (outbound + 1).
     source_link_equity_share: float = Field(gt=0, le=1)
+    # Authority the source passes on; None when the source has no PageRank yet.
+    source_page_rank_percentile: float | None = Field(default=None, ge=0, lt=1)
 
     # ── hub structure: links mostly stay inside a hub ───────────────────────
     same_hub: bool | None

@@ -17,11 +17,15 @@ from linking_engine.ml.tracking import (
     duplicate_metrics,
     feature_metrics,
     keyword_metrics,
+    link_relevance_metrics,
     log_analytics,
     log_candidates,
     log_duplicates,
     log_features,
     log_keywords,
+    log_link_relevance,
+    log_scores,
+    score_metrics,
 )
 from linking_engine.models import (
     CandidateReport,
@@ -31,12 +35,17 @@ from linking_engine.models import (
     DuplicateGroup,
     DuplicateReport,
     FeatureReport,
+    FeatureWeight,
     HubReport,
     KeywordReport,
     KeywordRung,
     KeywordSource,
+    LinkRelevanceReport,
     OrphanLabel,
     PassReport,
+    ScoreDistribution,
+    ScoreReport,
+    ScorerWeights,
     TargetCandidates,
 )
 
@@ -488,6 +497,224 @@ def test_a_feature_run_logs_its_column_order_but_never_the_matrix(local_mlflow: 
         "columns.json",
     }
     assert load_dict(f"runs:/{run_id}/columns.json") == {"feature_columns": list(report.columns)}
+
+
+# ── baseline scoring ────────────────────────────────────────────────────────
+
+SCORE_WEIGHTS = ScorerWeights(
+    version="baseline-1",
+    features=(
+        FeatureWeight(column="content_cosine", weight=0.6, normalisation="percentile"),
+        FeatureWeight(column="target_ctr_gap", weight=0.4, direction="lower"),
+    ),
+)
+HISTOGRAM = (2, 0, 0, 1, *([0] * 12), 3, 0, 1, 3)
+
+
+def scored_report() -> ScoreReport:
+    return ScoreReport(
+        tenant_id="acme",
+        pairs=10,
+        weights=SCORE_WEIGHTS,
+        weights_hash="f" * 64,
+        tiers={1: 1, 2: 3, 3: 6},
+        score_p10=0.0,
+        score_p50=80.0,
+        score_p90=100.0,
+        score_histogram=HISTOGRAM,
+        top_contributors={"content_cosine": 7, "target_ctr_gap": 3},
+        missing_share={"content_cosine": 0.0, "target_ctr_gap": 0.4},
+        feature_cache_key="e" * 64,
+        seconds=0.5,
+        finished_at=datetime(2026, 9, 28, tzinfo=UTC),
+    )
+
+
+def test_score_metrics_are_counts_percentiles_shares_and_leaders() -> None:
+    assert score_metrics(scored_report()) == {
+        "pairs": 10,
+        "seconds": 0.5,
+        "tier_1": 1,
+        "tier_2": 3,
+        "tier_3": 6,
+        "score_p10": 0.0,
+        "score_p50": 80.0,
+        "score_p90": 100.0,
+        "missing_share_content_cosine": 0.0,
+        "missing_share_target_ctr_gap": 0.4,
+        "top_contributor_content_cosine": 7,
+        "top_contributor_target_ctr_gap": 3,
+    }
+
+
+def table(run_id: str, name: str) -> dict[str, list[object]]:
+    stored = load_dict(f"runs:/{run_id}/{name}")
+    columns = stored["columns"]
+    return {column: [row[i] for row in stored["data"]] for i, column in enumerate(columns)}
+
+
+def test_a_scoring_run_logs_metrics_a_stepped_histogram_and_tables(local_mlflow: str) -> None:
+    report = scored_report()
+
+    run_id = log_scores(report, "Baseline scoring for tenant acme.")
+
+    client = MlflowClient(local_mlflow)
+    run = client.get_run(run_id)
+    assert client.get_experiment(run.info.experiment_id).name == analytics_experiment("acme")
+    assert (run.info.run_name, run.data.tags["stage"]) == ("baseline scoring", "score-pairs")
+    assert run.data.tags["mlflow.note.content"] == "Baseline scoring for tenant acme."
+    assert run.data.params == {
+        "weights_version": "baseline-1",
+        "weights_hash": "f" * 64,
+        "feature_cache_key": "e" * 64,
+        "tier_shares": "0.1,0.3",
+    }
+    assert score_metrics(report).items() <= run.data.metrics.items()
+    history = sorted(client.get_metric_history(run_id, "score_hist"), key=lambda m: m.step)
+    assert [(m.step, m.value) for m in history] == list(enumerate(map(float, HISTOGRAM)))
+    assert {a.path for a in client.list_artifacts(run_id)} == {
+        "report.json",
+        "summary.md",
+        "score_histogram.json",
+        "tiers.json",
+        "weights.json",
+    }
+    histogram = table(run_id, "score_histogram.json")
+    assert (histogram["bin"], histogram["count"]) == (list(range(20)), list(HISTOGRAM))
+    assert (histogram["low"][0], histogram["high"][-1]) == (0.0, 100.0)
+    tiers = table(run_id, "tiers.json")
+    assert (tiers["tier"], tiers["pairs"]) == ([1, 2, 3], [1, 3, 6])
+    assert tiers["share"] == pytest.approx([0.1, 0.3, 0.6])
+    assert tiers["target_share"] == pytest.approx([0.1, 0.3, 0.6])
+    weights = table(run_id, "weights.json")
+    assert weights["column"] == ["content_cosine", "target_ctr_gap"]
+    assert (weights["weight"], weights["direction"]) == ([0.6, 0.4], ["higher", "lower"])
+    assert (weights["missing_share"], weights["top_contributor"]) == ([0.0, 0.4], [7, 3])
+
+
+# ── link relevance ──────────────────────────────────────────────────────────
+
+CONTEXT_HISTOGRAM = (0, 0, 1, 2, 4, 6, 8, 9, 7, 5, 3, 2, 4, 7, 9, 8, 6, 3, 1, 0)
+ANCHOR_HISTOGRAM = (0,) * 10 + (1, 2, 3, 4, 5, 4, 3, 2, 1, 0)
+
+
+def distribution(histogram: tuple[int, ...], split: float | None) -> ScoreDistribution:
+    return ScoreDistribution(
+        count=sum(histogram),
+        mean=0.55,
+        p10=0.2,
+        p25=0.35,
+        p50=0.5,
+        p75=0.7,
+        p90=0.8,
+        histogram=histogram,
+        split=split,
+        low_share=None if split is None else 0.45,
+    )
+
+
+def relevance_report(*, scored: bool = True, anchor: bool = True) -> LinkRelevanceReport:
+    return LinkRelevanceReport(
+        tenant_id="acme",
+        links=120,
+        scored=85 if scored else 0,
+        generic_anchors=12 if scored else 0,
+        without_anchor_vector=48 if scored else 0,
+        context=distribution(CONTEXT_HISTOGRAM, 0.52) if scored else None,
+        anchor=distribution(ANCHOR_HISTOGRAM, None) if scored and anchor else None,
+        seconds=3.5,
+        finished_at=datetime(2026, 9, 28, 12, 0, tzinfo=UTC),
+    )
+
+
+def test_a_run_logs_metrics_stepped_histograms_a_table_and_the_report(local_mlflow: str) -> None:
+    report = relevance_report()
+
+    run_id = log_link_relevance(report, "Link relevance for tenant acme.")
+
+    client = MlflowClient(local_mlflow)
+    run = client.get_run(run_id)
+    assert client.get_experiment(run.info.experiment_id).name == analytics_experiment("acme")
+    assert (run.info.run_name, run.data.tags["stage"]) == ("link relevance", "score-links")
+    assert (run.data.tags["tenant_id"], run.data.tags["kind"]) == ("acme", "pipeline")
+    assert run.data.tags["mlflow.note.content"] == "Link relevance for tenant acme."
+    assert run.data.params == {
+        "min_split_scores": "50",
+        "min_mode_gap": "0.05",
+        "split_seed": "0",
+        "histogram_bins": "20",
+    }
+    assert link_relevance_metrics(report).items() <= run.data.metrics.items()
+    for name, expected in (
+        ("context_relevance_hist", CONTEXT_HISTOGRAM),
+        ("anchor_target_fit_hist", ANCHOR_HISTOGRAM),
+    ):
+        history = sorted(client.get_metric_history(run_id, name), key=lambda m: m.step)
+        assert [(m.step, m.value) for m in history] == list(enumerate(map(float, expected)))
+    assert {a.path for a in client.list_artifacts(run_id)} == {
+        "report.json",
+        "summary.md",
+        "relevance_histogram.json",
+    }
+    rows = table(run_id, "relevance_histogram.json")
+    assert rows["score"] == ["context_relevance"] * 20 + ["anchor_target_fit"] * 20
+    assert rows["bin"] == list(range(20)) * 2
+    assert rows["count"] == [*CONTEXT_HISTOGRAM, *ANCHOR_HISTOGRAM]
+    edges = [round(i * 0.05, 6) for i in range(21)]
+    assert rows["low"] == edges[:-1] * 2
+    assert rows["high"] == edges[1:] * 2
+    assert load_dict(f"runs:/{run_id}/report.json") == report.model_dump(mode="json")
+    assert load_text(f"runs:/{run_id}/summary.md") == "Link relevance for tenant acme."
+
+
+def test_a_run_without_scored_links_logs_no_histogram(local_mlflow: str) -> None:
+    run_id = log_link_relevance(relevance_report(scored=False), "Nothing to score.")
+
+    client = MlflowClient(local_mlflow)
+    assert client.get_metric_history(run_id, "context_relevance_hist") == []
+    assert {a.path for a in client.list_artifacts(run_id)} == {"report.json", "summary.md"}
+    assert client.get_run(run_id).data.metrics["scored"] == 0
+
+
+def test_the_metrics_are_exactly_the_counts_and_each_scores_statistics() -> None:
+    stats = {"mean": 0.55, "p10": 0.2, "p25": 0.35, "p50": 0.5, "p75": 0.7, "p90": 0.8}
+
+    assert link_relevance_metrics(relevance_report()) == {
+        "links": 120,
+        "scored": 85,
+        "generic_anchors": 12,
+        "without_anchor_vector": 48,
+        "seconds": 3.5,
+        "context_relevance_count": sum(CONTEXT_HISTOGRAM),
+        **{f"context_relevance_{name}": value for name, value in stats.items()},
+        "context_relevance_split": 0.52,
+        "context_relevance_low_share": 0.45,
+        "anchor_target_fit_count": sum(ANCHOR_HISTOGRAM),
+        **{f"anchor_target_fit_{name}": value for name, value in stats.items()},
+    }
+    assert link_relevance_metrics(relevance_report(scored=False)) == {
+        "links": 120,
+        "scored": 0,
+        "generic_anchors": 0,
+        "without_anchor_vector": 0,
+        "seconds": 3.5,
+    }
+
+
+def test_a_run_without_anchor_fits_logs_only_the_context_histogram(local_mlflow: str) -> None:
+    run_id = log_link_relevance(relevance_report(anchor=False), "No anchor vectors yet.")
+
+    client = MlflowClient(local_mlflow)
+    assert client.get_metric_history(run_id, "anchor_target_fit_hist") == []
+    history = sorted(
+        client.get_metric_history(run_id, "context_relevance_hist"), key=lambda m: m.step
+    )
+    assert [(m.step, m.value) for m in history] == list(enumerate(map(float, CONTEXT_HISTOGRAM)))
+    rows = table(run_id, "relevance_histogram.json")
+    assert (rows["score"], rows["count"]) == (["context_relevance"] * 20, list(CONTEXT_HISTOGRAM))
+    assert not any(
+        name.startswith("anchor_target_fit") for name in client.get_run(run_id).data.metrics
+    )
 
 
 # ── duplicate pages ─────────────────────────────────────────────────────────

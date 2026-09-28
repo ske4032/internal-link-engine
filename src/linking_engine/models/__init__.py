@@ -80,6 +80,8 @@ from linking_engine.models.page import (
     TenantGraphCounts,
 )
 from linking_engine.models.recommendation import AnchorCandidate, Recommendation
+from linking_engine.models.relevance import LinkRelevance, LinkRelevanceReport, ScoreDistribution
+from linking_engine.models.scoring import FeatureWeight, ScoreReport, ScorerWeights
 from linking_engine.models.signals import (
     CtrCurve,
     GscMetrics,
@@ -121,6 +123,7 @@ __all__ = [
     "EmbeddingTarget",
     "ExtractedLink",
     "FeatureReport",
+    "FeatureWeight",
     "GraphLoadReport",
     "GscMetrics",
     "GscQuery",
@@ -141,6 +144,8 @@ __all__ = [
     "LinkEmbedReport",
     "LinkGraphSnapshot",
     "LinkRecord",
+    "LinkRelevance",
+    "LinkRelevanceReport",
     "LinkText",
     "OrphanLabel",
     "Page",
@@ -162,6 +167,9 @@ __all__ = [
     "Recommendation",
     "RecommendationStatus",
     "ResolvedKeyword",
+    "ScoreDistribution",
+    "ScoreReport",
+    "ScorerWeights",
     "SentenceTarget",
     "SignalReport",
     "StrategicKeyword",

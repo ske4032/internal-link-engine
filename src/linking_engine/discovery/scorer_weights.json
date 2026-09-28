@@ -1,0 +1,20 @@
+{
+  "version": "baseline-1",
+  "tier_shares": [0.1, 0.3],
+  "features": [
+    {"column": "content_cosine", "weight": 0.15, "direction": "higher", "normalisation": "percentile"},
+    {"column": "same_hub", "weight": 0.05, "direction": "higher", "normalisation": "identity"},
+    {"column": "content_agreement_same_topic_other_links", "weight": 0.05, "direction": "higher", "normalisation": "identity"},
+    {"column": "pair_query_overlap", "weight": 0.05, "direction": "higher", "normalisation": "identity"},
+    {"column": "pair_kw_overlap", "weight": 0.05, "direction": "higher", "normalisation": "identity"},
+    {"column": "target_is_orphan", "weight": 0.1, "direction": "higher", "normalisation": "identity"},
+    {"column": "target_saturation_ratio", "weight": 0.1, "direction": "lower", "normalisation": "percentile"},
+    {"column": "target_impressions_log", "weight": 0.05, "direction": "higher", "normalisation": "percentile"},
+    {"column": "target_ctr_gap", "weight": 0.05, "direction": "lower", "normalisation": "percentile"},
+    {"column": "target_keyword_gap", "weight": 0.05, "direction": "higher", "normalisation": "percentile"},
+    {"column": "source_link_equity_share", "weight": 0.1, "direction": "higher", "normalisation": "identity"},
+    {"column": "source_page_rank_percentile", "weight": 0.1, "direction": "higher", "normalisation": "identity"},
+    {"column": "target_hub_coverage", "weight": 0.05, "direction": "lower", "normalisation": "identity"},
+    {"column": "target_is_hub_pillar", "weight": 0.05, "direction": "higher", "normalisation": "identity"}
+  ]
+}

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import csv
 import io
+import time
 from importlib.metadata import version
 from typing import TYPE_CHECKING
 
 import mlflow
+from mlflow.entities import Metric
 
 from linking_engine.anchor.keywords import (
     BRAND_SUFFIX_SHARE,
@@ -16,6 +18,7 @@ from linking_engine.anchor.keywords import (
     MIN_QUERY_IMPRESSIONS,
     REPEATED_FALLBACK_PAGES,
 )
+from linking_engine.audit.relevance import MIN_MODE_GAP, MIN_SPLIT_SCORES, SPLIT_SEED
 from linking_engine.discovery.features import POSITION_BANDS
 from linking_engine.graph.algorithms import (
     DAMPING,
@@ -30,6 +33,8 @@ from linking_engine.graph.algorithms import (
     STABILITY_SEEDS,
 )
 from linking_engine.gsc import MIN_CURVE_IMPRESSIONS, MIN_CURVE_ROWS
+from linking_engine.models.relevance import HISTOGRAM_BINS
+from linking_engine.models.scoring import SCORE_HISTOGRAM_BINS
 
 if TYPE_CHECKING:
     from linking_engine.models import (
@@ -41,6 +46,9 @@ if TYPE_CHECKING:
         FeatureReport,
         HubReport,
         KeywordReport,
+        LinkRelevanceReport,
+        ScoreDistribution,
+        ScoreReport,
     )
 
 
@@ -342,3 +350,173 @@ def log_duplicates(report: DuplicateReport, summary: str) -> str:
             {"groups": [group.model_dump(mode="json") for group in report.groups]}, "groups.json"
         )
         return str(run.info.run_id)
+
+
+def score_metrics(report: ScoreReport) -> dict[str, float]:
+    """Counts, score percentiles, missing shares and top contributors of the run, flat;
+    percentiles are left out without pairs."""
+    metrics: dict[str, float] = {"pairs": float(report.pairs), "seconds": report.seconds}
+    metrics.update({f"tier_{tier}": float(count) for tier, count in report.tiers.items()})
+    for name in ("score_p10", "score_p50", "score_p90"):
+        value = getattr(report, name)
+        if value is not None:
+            metrics[name] = float(value)
+    metrics.update({f"missing_share_{name}": share for name, share in report.missing_share.items()})
+    metrics.update(
+        {f"top_contributor_{name}": float(count) for name, count in report.top_contributors.items()}
+    )
+    return metrics
+
+
+def score_tables(report: ScoreReport) -> dict[str, dict[str, list[object]]]:
+    """The run's histogram, tiers and weights as MLflow tables, keyed by artifact file."""
+    width = 100 / SCORE_HISTOGRAM_BINS
+    first, second = report.weights.tier_shares
+    targets = (first, second, 1 - first - second)
+    return {
+        "score_histogram.json": {
+            "bin": list(range(SCORE_HISTOGRAM_BINS)),
+            "low": [round(i * width, 6) for i in range(SCORE_HISTOGRAM_BINS)],
+            "high": [round((i + 1) * width, 6) for i in range(SCORE_HISTOGRAM_BINS)],
+            "count": list(report.score_histogram),
+        },
+        "tiers.json": {
+            "tier": [1, 2, 3],
+            "pairs": [report.tiers.get(tier, 0) for tier in (1, 2, 3)],
+            "share": [
+                report.tiers.get(tier, 0) / report.pairs if report.pairs else 0.0
+                for tier in (1, 2, 3)
+            ],
+            "target_share": list(targets),
+        },
+        "weights.json": {
+            "column": [f.column for f in report.weights.features],
+            "weight": [f.weight for f in report.weights.features],
+            "direction": [f.direction for f in report.weights.features],
+            "normalisation": [f.normalisation for f in report.weights.features],
+            "missing_share": [report.missing_share.get(f.column) for f in report.weights.features],
+            "top_contributor": [
+                report.top_contributors.get(f.column, 0) for f in report.weights.features
+            ],
+        },
+    }
+
+
+def log_scores(report: ScoreReport, summary: str) -> str:
+    """Log one scoring run from its report: summary metrics, the score histogram as the
+    step-indexed metric ``score_hist`` (step = bin), and tables; returns the MLflow run id."""
+    mlflow.set_experiment(analytics_experiment(report.tenant_id))
+    with mlflow.start_run(
+        run_name="baseline scoring",
+        tags={
+            "tenant_id": report.tenant_id,
+            "kind": "pipeline",
+            "stage": "score-pairs",
+            "mlflow.note.content": summary,
+        },
+    ) as run:
+        run_id = str(run.info.run_id)
+        mlflow.log_params(
+            {
+                "weights_version": report.weights.version,
+                "weights_hash": report.weights_hash,
+                "feature_cache_key": report.feature_cache_key,
+                "tier_shares": ",".join(map(str, report.weights.tier_shares)),
+            }
+        )
+        mlflow.log_metrics(score_metrics(report))
+        now = int(time.time() * 1000)
+        mlflow.MlflowClient().log_batch(
+            run_id,
+            metrics=[
+                Metric("score_hist", float(count), now, step)
+                for step, count in enumerate(report.score_histogram)
+            ],
+        )
+        mlflow.log_dict(report.model_dump(mode="json"), "report.json")
+        mlflow.log_text(summary, "summary.md")
+        for artifact, table in score_tables(report).items():
+            mlflow.log_table(table, artifact)
+        return run_id
+
+
+_RELEVANCE_COUNTS = ("links", "scored", "generic_anchors", "without_anchor_vector", "seconds")
+
+
+def _relevance_scores(report: LinkRelevanceReport) -> dict[str, ScoreDistribution]:
+    return {
+        name: found
+        for name, found in (
+            ("context_relevance", report.context),
+            ("anchor_target_fit", report.anchor),
+        )
+        if found is not None
+    }
+
+
+def link_relevance_metrics(report: LinkRelevanceReport) -> dict[str, float]:
+    """Counts, runtime and each score's statistics and split, flat; absent values left out."""
+    metrics = {name: float(getattr(report, name)) for name in _RELEVANCE_COUNTS}
+    for name, found in _relevance_scores(report).items():
+        metrics.update(
+            {
+                f"{name}_{field}": float(value)
+                for field, value in found.model_dump(exclude={"histogram"}).items()
+                if value is not None
+            }
+        )
+    return metrics
+
+
+def relevance_table(report: LinkRelevanceReport) -> dict[str, list[object]]:
+    """Both scores' histograms as one MLflow table, a row per score and bin over [0, 1]."""
+    width = 1 / HISTOGRAM_BINS
+    scores = _relevance_scores(report)
+    return {
+        "score": [name for name in scores for _ in range(HISTOGRAM_BINS)],
+        "bin": [step for _ in scores for step in range(HISTOGRAM_BINS)],
+        "low": [round(step * width, 6) for _ in scores for step in range(HISTOGRAM_BINS)],
+        "high": [round((step + 1) * width, 6) for _ in scores for step in range(HISTOGRAM_BINS)],
+        "count": [count for found in scores.values() for count in found.histogram],
+    }
+
+
+def log_link_relevance(report: LinkRelevanceReport, summary: str) -> str:
+    """Log one link relevance run from its report: statistics and splits as metrics, each
+    score's histogram as the step-indexed metric ``<score>_hist`` (step = bin) and as a table;
+    returns the MLflow run id."""
+    mlflow.set_experiment(analytics_experiment(report.tenant_id))
+    with mlflow.start_run(
+        run_name="link relevance",
+        tags={
+            "tenant_id": report.tenant_id,
+            "kind": "pipeline",
+            "stage": "score-links",
+            "mlflow.note.content": summary,
+        },
+    ) as run:
+        run_id = str(run.info.run_id)
+        mlflow.log_params(
+            {
+                "min_split_scores": MIN_SPLIT_SCORES,
+                "min_mode_gap": MIN_MODE_GAP,
+                "split_seed": SPLIT_SEED,
+                "histogram_bins": HISTOGRAM_BINS,
+            }
+        )
+        mlflow.log_metrics(link_relevance_metrics(report))
+        scores = _relevance_scores(report)
+        if scores:
+            now = int(time.time() * 1000)
+            mlflow.MlflowClient().log_batch(
+                run_id,
+                metrics=[
+                    Metric(f"{name}_hist", float(count), now, step)
+                    for name, found in scores.items()
+                    for step, count in enumerate(found.histogram)
+                ],
+            )
+            mlflow.log_table(relevance_table(report), "relevance_histogram.json")
+        mlflow.log_dict(report.model_dump(mode="json"), "report.json")
+        mlflow.log_text(summary, "summary.md")
+        return run_id

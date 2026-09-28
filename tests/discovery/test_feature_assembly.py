@@ -170,7 +170,7 @@ def test_the_columns_follow_the_model_field_by_field() -> None:
 
     assert (len(ids), len(KEY_COLUMNS)) == (8, 2)
     assert tuple(expected) == FEATURE_COLUMNS
-    assert len(FEATURE_COLUMNS) == 46
+    assert len(FEATURE_COLUMNS) == 47
 
 
 def test_the_code_digest_hashes_the_modules_that_compute_features() -> None:
@@ -371,6 +371,7 @@ def tenant() -> dict[str, PageContext]:
             "s",
             outbound=9,
             word_count=3000,
+            page_rank_percentile=0.73,
             hub_id=1,
             is_hub_pillar=True,
             link_community_id=0,
@@ -416,7 +417,7 @@ def test_a_pair_takes_target_features_from_the_target_and_source_ones_from_the_s
     assert found.pair_kw_overlap == pytest.approx(0.5)
     assert (found.target_kw_count, found.target_keyword_gap) == (2, 1)
     assert (found.target_inbound_count, found.target_crawl_depth) == (2, 3)
-    assert found.target_page_rank_percentile == 0.42
+    assert (found.target_page_rank_percentile, found.source_page_rank_percentile) == (0.42, 0.73)
     assert (found.source_outbound_count, found.source_link_equity_share) == (9, 0.1)
     assert found.source_outbound_density == pytest.approx(3.0)
     assert (found.same_hub, found.source_is_hub_pillar, found.target_is_hub_pillar) == (
