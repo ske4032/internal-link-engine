@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
@@ -11,6 +12,8 @@ from pydantic import ValidationError
 from pymongo import AsyncMongoClient
 from quality_seed import KEYWORDS, URLS, seed_quality
 from quality_seed import voyage as keyword_voyage
+from ranking_seed import seed_ranking
+from ranking_seed import voyage as ranking_voyage
 from store_state import graph_state, mongo_state
 from test_anchor_stage import GUIDE
 from test_anchor_stage import seed as seed_anchors
@@ -36,7 +39,7 @@ from linking_engine.errors import (
     EmbeddingRequestError,
     EmbeddingUnavailableError,
 )
-from linking_engine.models import DuplicateGroup, Link, LinkRecord, Page
+from linking_engine.models import DuplicateGroup, HeldOutSettings, Link, LinkRecord, Page
 from linking_engine.pipeline import flows
 from linking_engine.pipeline.duplicates import summarise_duplicates
 
@@ -1015,3 +1018,63 @@ async def test_quality_eval_without_a_voyage_key_reports_keyword_relevance_not_a
     run = MlflowClient(uri).get_run(run_id)
     assert run.data.tags["not_applicable"] == "keyword_relevance"
     assert not [name for name in run.data.metrics if name.startswith("keyword_relevance")]
+
+
+@pytest.mark.integration
+async def test_train_ranker_flow_logs_one_run_and_skips_with_too_few_groups(
+    graph: GraphRepo,
+    mongo: MongoRepo,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    monkeypatch.delenv("RANKER_PROMOTION", raising=False)
+    monkeypatch.setenv("VOYAGE_API_KEY", VOYAGE_KEY)
+    fake = ranking_voyage()
+    use(monkeypatch, fake)
+    await seed_ranking(graph, mongo, tenant)
+    stored_graph, stored_mongo = await graph_state(graph, tenant), await mongo_state(mongo)
+
+    report = await flows.train_ranker_flow(tenant, rounds=1, share=0.1, cache_dir=tmp_path)
+
+    assert await graph_state(graph, tenant) == stored_graph
+    assert await mongo_state(mongo) == stored_mongo
+    assert fake.call_count > 0, "the flow did not pass its Voyage client to the anchor choice"
+    assert report.skipped_reason is not None
+    assert (report.settings.rounds, report.settings.share) == (1, 0.1)
+    client = MlflowClient(uri)
+    experiment = client.get_experiment_by_name(f"ranker-{tenant}")
+    assert experiment is not None
+    [run] = client.search_runs([experiment.experiment_id])
+    assert run.data.tags["skipped_reason"] == report.skipped_reason
+
+
+@pytest.mark.integration
+async def test_rank_pairs_flow_ranks_with_the_baseline_without_a_promoted_model(
+    graph: GraphRepo,
+    mongo: MongoRepo,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", f"sqlite:///{tmp_path / 'mlflow.db'}")
+    await seed_ranking(graph, mongo, tenant)
+
+    report, path = await flows.rank_pairs_flow(tenant, tmp_path)
+
+    assert path == tmp_path / tenant / "ranked_pairs.parquet"
+    assert (report.scorer.value, report.fallback_reason) == ("baseline", "no promoted model")
+    assert pq.read_metadata(path).num_rows == report.pairs > 0
+
+
+def test_the_train_ranker_flow_defaults_are_the_held_out_settings_defaults() -> None:
+    parameters = inspect.signature(flows.train_ranker_flow.fn).parameters
+    defaults = HeldOutSettings()
+    assert (parameters["rounds"].default, parameters["share"].default) == (
+        defaults.rounds,
+        defaults.share,
+    ), "the flow hides a different share of the links than the settings it passes on"

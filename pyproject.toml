@@ -217,7 +217,6 @@ DEP002 = [
   # graph/repo.py
   # embedding/
   # ml/
-  "lightgbm",
   # serving and cross-cutting
   "redis",
   "orjson",

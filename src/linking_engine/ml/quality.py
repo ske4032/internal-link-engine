@@ -48,6 +48,8 @@ ALERT_BAND: Final = 0.2
 _BAND_TOLERANCE: Final = 1e-9
 _WORD: Final = re.compile(r"\w+")
 _HASH_RANGE: Final = 1 << 256
+# Ten folds of 0.1 fit the hash range, whatever the float error of 10 * 0.1.
+_FOLD_TOLERANCE: Final = 1e-9
 # Hiding a link moves these by itself (the held-out view recomputes them), inflating their AUC;
 # crawl depth is a stored BFS over links that still include the hidden ones, so it leaks them.
 _LINK_DERIVED_FIELDS: Final = (
@@ -130,19 +132,31 @@ def _pair_hash(seed: int, source: str, target: str) -> int:
 
 
 def hide_links(
-    pairs: Iterable[tuple[str, str]], *, share: float = HIDE_SHARE, seed: int = HIDE_SEED
+    pairs: Iterable[tuple[str, str]],
+    *,
+    share: float = HIDE_SHARE,
+    seed: int = HIDE_SEED,
+    fold: int = 0,
 ) -> frozenset[tuple[str, str]]:
-    """The pairs whose sha256 of (seed, source, target) falls below ``share`` of the hash
-    range, so a pair keeps its hidden or visible state from run to run whatever else changes;
-    the lowest hash when none does and there are pairs."""
+    """The pairs whose sha256 of (seed, source, target) falls in ``[fold * share,
+    (fold + 1) * share)`` of the hash range, so a pair keeps its hidden or visible state from
+    run to run whatever else changes and folds never overlap. Fold 0 takes the lowest hash when
+    no pair falls in it and there are pairs; no other fold then holds that pair."""
     if not 0 < share < 1:
         raise ValueError("share must be in (0, 1)")
+    if fold < 0 or (fold + 1) * share > 1 + _FOLD_TOLERANCE:
+        raise ValueError(f"fold must be in [0, {int((1 + _FOLD_TOLERANCE) / share) - 1}]")
     hashes = {pair: _pair_hash(seed, *pair) for pair in set(pairs)}
     if not hashes:
         return frozenset()
-    cut = int(share * _HASH_RANGE)
-    hidden = frozenset(pair for pair, value in hashes.items() if value < cut)
-    return hidden or frozenset({min(hashes, key=hashes.__getitem__)})
+    low, high = int(fold * share * _HASH_RANGE), int((fold + 1) * share * _HASH_RANGE)
+    hidden = frozenset(pair for pair, value in hashes.items() if low <= value < high)
+    lowest = min(hashes, key=hashes.__getitem__)
+    if fold == 0:
+        return hidden or frozenset({lowest})
+    if hashes[lowest] >= int(share * _HASH_RANGE):
+        return hidden - {lowest}
+    return hidden
 
 
 def auc(labels: npt.ArrayLike, scores: npt.ArrayLike) -> float | None:

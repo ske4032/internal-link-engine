@@ -54,6 +54,7 @@ from linking_engine.models import (
     EmbedRunReport,
     FeatureReport,
     GraphLoadReport,
+    HeldOutSettings,
     HubReport,
     KeywordReport,
     LinkEmbedReport,
@@ -61,6 +62,8 @@ from linking_engine.models import (
     PrepareReport,
     QualityBaseline,
     QualityReport,
+    RankerReport,
+    RankReport,
     ScoreReport,
     TenantConfig,
     TenantGraphCounts,
@@ -82,6 +85,7 @@ from linking_engine.pipeline.features import CACHE_DIR, assemble_features
 from linking_engine.pipeline.keywords import resolve_tenant_keywords, summarise_keywords
 from linking_engine.pipeline.link_relevance import score_links, summarise_link_relevance
 from linking_engine.pipeline.quality import evaluate_quality, summarise_quality
+from linking_engine.pipeline.ranker import rank_pairs, train_ranker
 from linking_engine.pipeline.scoring import score_pairs
 
 if TYPE_CHECKING:
@@ -882,3 +886,100 @@ async def anchor_selection_flow(
         mlflow_run,
     )
     return report, path, mlflow_run
+
+
+# Read-only against both stores; rounds are cached under their key, so a retry reuses the ones
+# already built. The run and the model go to MLflow, the alias moves only where allowed.
+@task(
+    name="train-ranker",
+    retries=1,
+    retry_delay_seconds=30,
+    retry_condition_fn=is_transient,
+    cache_policy=NONE,
+)
+async def train_ranker_task(
+    tenant_id: str, cache_dir: Path, rounds: int, share: float
+) -> RankerReport:
+    voyage = keyword_voyage(tenant_id)
+    async with await neo4j() as graph, await mongo() as repo:
+        await graph.check_server()
+        return await train_ranker(
+            graph,
+            repo,
+            tenant_id,
+            cache_dir=cache_dir,
+            voyage=voyage,
+            settings=HeldOutSettings(rounds=rounds, share=share),
+        )
+
+
+@flow(name="train-ranker")
+async def train_ranker_flow(
+    tenant_id: str,
+    rounds: int = HeldOutSettings().rounds,
+    share: float = HeldOutSettings().share,
+    cache_dir: Path = CACHE_DIR,
+) -> RankerReport:
+    """The tenant's LambdaMART ranker trained on held-out rounds of its own body links after
+    anchor-selection, evaluated against the baseline and the production model and logged to
+    MLflow; registered, and promoted only when it is better over the whole interval and
+    promotion is allowed. Nothing is written to the stores."""
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
+        logger.info(
+            "ranker training of tenant %s: %d rounds of %.0f%% of the body links",
+            tenant_id,
+            rounds,
+            share * 100,
+        )
+        report = await train_ranker_task(tenant_id, cache_dir, rounds, share)
+    ndcg = {entry.scorer.value: round(entry.ndcg_at_10, 4) for entry in report.metrics}
+    logger.info(
+        "%d positives; groups %d train, %d valid, %d test; %s; NDCG@10 %s; promotion %s; "
+        "model version %s; %.1fs",
+        report.positives,
+        report.train_groups,
+        report.valid_groups,
+        report.test_groups,
+        f"skipped: {report.skipped_reason}" if report.skipped_reason else "trained",
+        ndcg or "none",
+        report.promotion.reason if report.promotion else "none",
+        report.model_version or "none",
+        report.seconds,
+    )
+    return report
+
+
+# Read-only against both stores; the ranked pairs are renamed into place only when complete, so
+# a retry writes them again whole.
+@task(
+    name="rank-pairs",
+    retries=1,
+    retry_delay_seconds=30,
+    retry_condition_fn=is_transient,
+    cache_policy=NONE,
+)
+async def rank_pairs_task(tenant_id: str, cache_dir: Path) -> tuple[RankReport, Path]:
+    async with await neo4j() as graph, await mongo() as repo:
+        await graph.check_server()
+        return await rank_pairs(graph, repo, tenant_id, cache_dir=cache_dir)
+
+
+@flow(name="rank-pairs")
+async def rank_pairs_flow(tenant_id: str, cache_dir: Path = CACHE_DIR) -> tuple[RankReport, Path]:
+    """Every candidate pair scored and ranked within its source page by the tenant's
+    production ranker, else by the baseline scorer with the reason, written under
+    ``cache_dir``; nothing is written to the stores."""
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
+        logger.info("ranking the candidate pairs of tenant %s", tenant_id)
+        report, path = await rank_pairs_task(tenant_id, cache_dir)
+    logger.info(
+        "%d pairs ranked by %s%s; %s; %.1fs",
+        report.pairs,
+        report.scorer.value,
+        f" version {report.model_version}" if report.model_version else "",
+        f"fallback: {report.fallback_reason}" if report.fallback_reason else path,
+        report.seconds,
+    )
+    return report, path

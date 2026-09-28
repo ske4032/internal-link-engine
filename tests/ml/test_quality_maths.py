@@ -96,6 +96,38 @@ def test_the_hidden_share_must_be_strictly_between_zero_and_one(share: float) ->
         hide_links(PAIRS, share=share)
 
 
+def test_hide_links_folds_are_disjoint_and_fold0_matches_74() -> None:
+    folds = [hide_links(PAIRS, fold=r) for r in range(10)]
+
+    assert folds[0] == hide_links(PAIRS), "fold 0 is the quality evaluation's hidden set"
+    for r, fold in enumerate(folds):
+        low, high = int(r * 0.1 * 2**256), int((r + 1) * 0.1 * 2**256)
+        assert fold == {pair for pair in PAIRS if low <= pair_hash(HIDE_SEED, *pair) < high}
+    assert sum(len(fold) for fold in folds) == len(set().union(*folds)), "folds overlap"
+    assert set().union(*folds) == set(PAIRS), "ten folds of 0.1 cover every link"
+    shares = [hide_links(PAIRS, share=0.2, fold=r) for r in range(5)]
+    assert set().union(*shares) == set(PAIRS)
+    assert shares[0] == folds[0] | folds[1]
+
+
+def test_a_fold_never_repeats_the_link_fold_0_took_for_want_of_one() -> None:
+    few = [("a", "b"), ("c", "d"), ("e", "f")]
+    lowest = min(few, key=lambda pair: pair_hash(HIDE_SEED, *pair))
+
+    folds = [hide_links(few, fold=r) for r in range(10)]
+
+    assert folds[0] == {lowest}
+    assert all(lowest not in fold for fold in folds[1:])
+    assert sum(len(fold) for fold in folds) == len(set().union(*folds))
+    assert set().union(*folds) == set(few)
+
+
+@pytest.mark.parametrize(("share", "fold"), [(0.1, 10), (0.1, -1), (0.2, 5), (0.3, 3)])
+def test_hide_links_fold_out_of_range_raises(share: float, fold: int) -> None:
+    with pytest.raises(ValueError, match="fold"):
+        hide_links(PAIRS, share=share, fold=fold)
+
+
 def test_recall_and_the_random_baseline_on_planted_ranks() -> None:
     """Four hidden links planted at ranks 1, 6, 11 and 16 of their target's candidates, whose
     targets have 20, 20, 40 and 40 eligible sources."""
