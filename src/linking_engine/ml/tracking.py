@@ -52,8 +52,21 @@ if TYPE_CHECKING:
     )
 
 
+# MLflow 3's UI opens an experiment without a kind in its GenAI (tracing) view, which hides the
+# metrics, charts and tables pipeline runs log.
+EXPERIMENT_KIND_TAG = "mlflow.experimentKind"
+EXPERIMENT_KIND = "custom_model_development"
+
+
 def analytics_experiment(tenant_id: str) -> str:
     return f"analytics-{tenant_id}"
+
+
+def use_analytics_experiment(tenant_id: str) -> None:
+    """Make the tenant's experiment the active one, tagged to open in the model-training view."""
+    experiment = mlflow.set_experiment(analytics_experiment(tenant_id))
+    if experiment.tags.get(EXPERIMENT_KIND_TAG) != EXPERIMENT_KIND:
+        mlflow.set_experiment_tag(EXPERIMENT_KIND_TAG, EXPERIMENT_KIND)
 
 
 def analytics_metrics(
@@ -105,7 +118,7 @@ def log_analytics(
     tenant_id = communities.tenant_id
     if {centrality.tenant_id, hubs.tenant_id} != {tenant_id}:
         raise ValueError("all reports must come from the same tenant")
-    mlflow.set_experiment(analytics_experiment(tenant_id))
+    use_analytics_experiment(tenant_id)
     with mlflow.start_run(
         run_name="graph analytics",
         tags={
@@ -193,7 +206,7 @@ def candidate_table(found: CandidateSet) -> str:
 def log_candidates(found: CandidateSet, summary: str) -> str:
     """Log one candidate retrieval run with its description; returns the MLflow run id."""
     report = found.report
-    mlflow.set_experiment(analytics_experiment(report.tenant_id))
+    use_analytics_experiment(report.tenant_id)
     with mlflow.start_run(
         run_name="candidate retrieval",
         tags={
@@ -245,7 +258,7 @@ def keyword_metrics(report: KeywordReport) -> dict[str, float]:
 
 def log_keywords(report: KeywordReport, summary: str) -> str:
     """Log one keyword resolution run with its description; returns the MLflow run id."""
-    mlflow.set_experiment(analytics_experiment(report.tenant_id))
+    use_analytics_experiment(report.tenant_id)
     with mlflow.start_run(
         run_name="keyword resolution",
         tags={
@@ -292,7 +305,7 @@ def feature_metrics(report: FeatureReport) -> dict[str, float]:
 def log_features(report: FeatureReport, summary: str) -> str:
     """Log one feature assembly run with its description and column order, never the matrix;
     returns the MLflow run id."""
-    mlflow.set_experiment(analytics_experiment(report.tenant_id))
+    use_analytics_experiment(report.tenant_id)
     with mlflow.start_run(
         run_name="feature assembly",
         tags={
@@ -330,7 +343,7 @@ def duplicate_metrics(report: DuplicateReport) -> dict[str, float]:
 def log_duplicates(report: DuplicateReport, summary: str) -> str:
     """Log one duplicate grouping run with its description and every group's canonical and
     copies; returns the MLflow run id."""
-    mlflow.set_experiment(analytics_experiment(report.tenant_id))
+    use_analytics_experiment(report.tenant_id)
     with mlflow.start_run(
         run_name="duplicate pages",
         tags={
@@ -405,7 +418,7 @@ def score_tables(report: ScoreReport) -> dict[str, dict[str, list[object]]]:
 def log_scores(report: ScoreReport, summary: str) -> str:
     """Log one scoring run from its report: summary metrics, the score histogram as the
     step-indexed metric ``score_hist`` (step = bin), and tables; returns the MLflow run id."""
-    mlflow.set_experiment(analytics_experiment(report.tenant_id))
+    use_analytics_experiment(report.tenant_id)
     with mlflow.start_run(
         run_name="baseline scoring",
         tags={
@@ -485,7 +498,7 @@ def log_link_relevance(report: LinkRelevanceReport, summary: str) -> str:
     """Log one link relevance run from its report: statistics and splits as metrics, each
     score's histogram as the step-indexed metric ``<score>_hist`` (step = bin) and as a table;
     returns the MLflow run id."""
-    mlflow.set_experiment(analytics_experiment(report.tenant_id))
+    use_analytics_experiment(report.tenant_id)
     with mlflow.start_run(
         run_name="link relevance",
         tags={
