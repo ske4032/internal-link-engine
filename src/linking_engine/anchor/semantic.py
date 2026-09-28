@@ -107,7 +107,16 @@ def top_sentences(
     best first; a tie goes to the earlier sentence."""
     if count < 1:
         raise ValueError("count must be at least 1")
-    best = cosines(sentences, keywords).max(axis=1)
+    return top_sentences_by_similarity(cosines(sentences, keywords), count)
+
+
+def top_sentences_by_similarity(
+    similarity: npt.NDArray[np.float32 | np.float64], count: int = TOP_SENTENCES
+) -> list[int]:
+    """`top_sentences` from the sentence-to-keyword cosines, a row per sentence."""
+    if count < 1:
+        raise ValueError("count must be at least 1")
+    best = similarity.max(axis=1)
     order = np.lexsort((np.arange(len(best)), -best))
     return [int(row) for row in order[:count]]
 
@@ -129,7 +138,7 @@ def agrees(phrase: str, keyword: str, stems: Stems, brand: frozenset[str] = froz
 def _candidates(
     phrases: Sequence[Phrase],
     keywords: Sequence[tuple[int, str, KeywordSource]],
-    similarity: npt.NDArray[np.float64],
+    similarity: npt.NDArray[np.float32 | np.float64],
     threshold: float,
 ) -> list[tuple[int, int]]:
     """(phrase, keyword) rows at or above the threshold, best cosine first, then the earlier
@@ -161,7 +170,29 @@ def eligible_phrases(
     the source's language (``stems``): the only ones the best-target check has to look at."""
     if not phrases or not keywords:
         return []
-    similarity = cosines(phrase_vectors, keyword_vectors)
+    return eligible_phrases_by_similarity(
+        phrases,
+        keywords,
+        cosines(phrase_vectors, keyword_vectors),
+        threshold=threshold,
+        stems=stems,
+        brand=brand,
+    )
+
+
+def eligible_phrases_by_similarity(
+    phrases: Sequence[Phrase],
+    keywords: Sequence[tuple[int, str, KeywordSource]],
+    similarity: npt.NDArray[np.float32 | np.float64],
+    *,
+    threshold: float,
+    stems: Stems,
+    brand: frozenset[str] = frozenset(),
+) -> list[int]:
+    """`eligible_phrases` from the phrase-to-keyword cosines, rows aligned with ``phrases`` and
+    columns with ``keywords``."""
+    if not phrases or not keywords:
+        return []
     return sorted(
         {
             i
@@ -189,9 +220,30 @@ def best_other_cosines(
         return found
     for start in range(0, len(phrases), chunk):
         block = cosines(phrases[start : start + chunk], keys)
-        for row, columns in enumerate(excluded[start : start + chunk]):
-            block[row, list(columns)] = -np.inf
-        found[start : start + len(block)] = block.max(axis=1)
+        found[start : start + len(block)] = best_other_by_similarity(
+            block, range(len(block)), excluded[start : start + chunk]
+        )
+    return found
+
+
+def best_other_by_similarity(
+    similarity: npt.NDArray[np.float32 | np.float64],
+    rows: Sequence[int],
+    excluded: Sequence[Collection[int]],
+) -> npt.NDArray[np.float64]:
+    """For each of ``rows`` of the phrase-to-keyword cosines, its highest cosine to the keyword
+    columns other than its ``excluded`` ones, -inf when none remain."""
+    if len(excluded) != len(rows):
+        raise ValueError("one excluded set per row")
+    found = np.full(len(rows), -np.inf)
+    if not similarity.shape[1]:
+        return found
+    for position, (row, columns) in enumerate(zip(rows, excluded, strict=True)):
+        values = similarity[row]
+        if columns:
+            values = values.copy()
+            values[list(columns)] = -np.inf
+        found[position] = values.max()
     return found
 
 
@@ -213,7 +265,31 @@ def semantic_match(
     vectors are rows aligned with ``phrases`` and ``keywords``."""
     if not phrases or not keywords:
         return SemanticOutcome(None)
-    similarity = cosines(phrase_vectors, keyword_vectors)
+    return semantic_match_by_similarity(
+        index,
+        target_url,
+        phrases,
+        keywords,
+        cosines(phrase_vectors, keyword_vectors),
+        threshold=threshold,
+        other_best=other_best,
+    )
+
+
+def semantic_match_by_similarity(
+    index: SourceIndex,
+    target_url: str,
+    phrases: Sequence[Phrase],
+    keywords: Sequence[tuple[int, str, KeywordSource]],
+    similarity: npt.NDArray[np.float32 | np.float64],
+    *,
+    threshold: float,
+    other_best: Mapping[int, float] | None = None,
+) -> SemanticOutcome:
+    """`semantic_match` from the phrase-to-keyword cosines, rows aligned with ``phrases`` and
+    columns with ``keywords``."""
+    if not phrases or not keywords:
+        return SemanticOutcome(None)
     if similarity.shape != (len(phrases), len(keywords)):
         raise ValueError("one vector per phrase and per keyword")
     candidates = _candidates(phrases, keywords, similarity, threshold)
@@ -223,7 +299,7 @@ def semantic_match(
             continue
         agreeing = True
         rival = (other_best or {}).get(i, -np.inf)
-        if rival > similarity[i].max() + _TIE_TOLERANCE:
+        if rival > float(similarity[i].max()) + _TIE_TOLERANCE:
             continue
         phrase, (rank, keyword, source) = phrases[i], keywords[k]
         sentence = index.sentences[phrase.position]
