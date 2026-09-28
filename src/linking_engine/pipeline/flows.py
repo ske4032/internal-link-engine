@@ -13,6 +13,7 @@ from structlog.contextvars import bound_contextvars
 
 from linking_engine.discovery.candidates import retrieve_candidates, summarise_candidates
 from linking_engine.discovery.features import CHUNK_PAIRS, summarise_features
+from linking_engine.discovery.scoring import summarise_scores
 from linking_engine.embedding.voyage_client import VoyageClient, VoyageSettings
 from linking_engine.errors import (
     DatabaseAuthError,
@@ -30,6 +31,8 @@ from linking_engine.ml.tracking import (
     log_duplicates,
     log_features,
     log_keywords,
+    log_link_relevance,
+    log_scores,
 )
 from linking_engine.models import (
     CandidateSet,
@@ -42,7 +45,9 @@ from linking_engine.models import (
     HubReport,
     KeywordReport,
     LinkEmbedReport,
+    LinkRelevanceReport,
     PrepareReport,
+    ScoreReport,
     TenantConfig,
     TenantGraphCounts,
     VectorIndex,
@@ -58,6 +63,8 @@ from linking_engine.pipeline.embed import FLUSH_SIZE, embed_tenant
 from linking_engine.pipeline.embed_links import embed_links
 from linking_engine.pipeline.features import CACHE_DIR, assemble_features
 from linking_engine.pipeline.keywords import resolve_tenant_keywords, summarise_keywords
+from linking_engine.pipeline.link_relevance import score_links, summarise_link_relevance
+from linking_engine.pipeline.scoring import score_pairs
 
 if TYPE_CHECKING:
     from prefect.client.schemas.objects import State
@@ -537,3 +544,94 @@ async def feature_assembly_flow(
         mlflow_run,
     )
     return report, path, mlflow_run
+
+
+# Read-only against both stores; the feature matrix is reused from the cache when nothing
+# changed, and the scores file is renamed into place only when complete.
+@task(
+    name="score-pairs",
+    retries=1,
+    retry_delay_seconds=30,
+    retry_condition_fn=is_transient,
+    cache_policy=NONE,
+)
+async def score_pairs_task(tenant_id: str, cache_dir: Path) -> tuple[ScoreReport, Path]:
+    async with await neo4j() as graph, await mongo() as repo:
+        await graph.check_server()
+        return await score_pairs(graph, repo, tenant_id, cache_dir=cache_dir)
+
+
+@task(name="mlflow-log-scores", cache_policy=NONE)
+def log_scores_task(report: ScoreReport) -> str:
+    return log_scores(report, summarise_scores(report))
+
+
+@flow(name="score-pairs")
+async def score_pairs_flow(
+    tenant_id: str, cache_dir: Path = CACHE_DIR
+) -> tuple[ScoreReport, Path, str]:
+    """The baseline score, tier and top contributions of every candidate pair, written beside
+    the cached feature matrix; nothing is written to the stores, the run is logged to MLflow."""
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
+        logger.info("baseline scoring of tenant %s", tenant_id)
+        report, path = await score_pairs_task(tenant_id, cache_dir)
+        mlflow_run = log_scores_task(report)
+    logger.info(
+        "%d pairs scored with weights %s; tiers %s; p10 %s, p50 %s, p90 %s; %s; %.1fs; "
+        "mlflow run %s",
+        report.pairs,
+        report.weights.version,
+        report.tiers,
+        report.score_p10,
+        report.score_p50,
+        report.score_p90,
+        path,
+        report.seconds,
+        mlflow_run,
+    )
+    return report, path, mlflow_run
+
+
+# Both scores are recomputed from the stored vectors and replace the previous ones, so a retry
+# converges on the same edges.
+@task(
+    name="score-links",
+    retries=1,
+    retry_delay_seconds=30,
+    retry_condition_fn=is_transient,
+    cache_policy=NONE,
+)
+async def score_links_task(tenant_id: str) -> LinkRelevanceReport:
+    async with await neo4j() as graph:
+        await graph.check_server()
+        return await score_links(graph, tenant_id)
+
+
+@task(name="mlflow-log-link-relevance", cache_policy=NONE)
+def log_link_relevance_task(report: LinkRelevanceReport) -> str:
+    return log_link_relevance(report, summarise_link_relevance(report))
+
+
+@flow(name="score-links")
+async def score_links_flow(tenant_id: str) -> tuple[LinkRelevanceReport, str]:
+    """Context relevance and anchor-target fit of every existing body link, written on the
+    LINKS_TO edges after embed-links; their distributions are logged to MLflow."""
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
+        logger.info("scoring the existing links of tenant %s", tenant_id)
+        report = await score_links_task(tenant_id)
+        mlflow_run = log_link_relevance_task(report)
+    logger.info(
+        "%d of %d links scored; %d generic anchors, %d without an anchor vector; context split "
+        "%s, anchor split %s; %.1fs; mlflow run %s",
+        report.scored,
+        report.links,
+        report.generic_anchors,
+        report.without_anchor_vector,
+        report.context.split if report.context else None,
+        report.anchor.split if report.anchor else None,
+        report.seconds,
+        mlflow_run,
+    )
+    return report, mlflow_run

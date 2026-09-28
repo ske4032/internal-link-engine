@@ -39,6 +39,7 @@ from linking_engine.models import (
     KeywordSource,
     Link,
     LinkGraphSnapshot,
+    LinkRelevance,
     LinkText,
     Page,
     PageStructure,
@@ -74,6 +75,8 @@ VECTOR_INDEXES: Final = tuple(VECTOR_PROPERTIES)
 PAGE_BATCH: Final = 500
 LINK_BATCH: Final = 1000
 CENTRALITY_BATCH: Final = 5000
+# Source pages per link scoring transaction; a hub page alone can carry hundreds of links.
+LINK_SCORE_BATCH: Final = 200
 # anchor_tenant_text rejects index entries over ~8 KB (an 8149-byte text failed at 8150 on 5.26);
 # half of that leaves room for tenantId. A longer key would fail its flush on every run.
 ANCHOR_KEY_MAX_BYTES: Final = 4096
@@ -494,6 +497,41 @@ WITH k, EXISTS {
 WHERE k.isStrategic IS NULL OR k.isStrategic <> strategic
 SET k.isStrategic = strategic
 RETURN count(k) AS n
+"""
+_LINK_SOURCES: Final = """
+MATCH (s:Page {tenantId: $tenant})
+WHERE NOT coalesce(s.isPlaceholder, false) AND EXISTS { (s)-[:LINKS_TO]->() }
+RETURN s.url AS url
+"""
+# Both scores are Neo4j's normalised cosine against the target's content vector; a score that
+# cannot be computed is removed, so a rerun never leaves a stale one, also on a link whose
+# target became a placeholder (neither scored nor counted). The clamp only absorbs float error.
+# The hint pins the (tenantId, url) seek per source url.
+_SCORE_LINKS: Final = """
+UNWIND $urls AS source_url
+MATCH (s:Page {tenantId: $tenant, url: source_url})
+USING INDEX SEEK s:Page(tenantId, url)
+MATCH (s)-[r:LINKS_TO]->(t:Page {tenantId: $tenant})
+OPTIONAL MATCH (a:Anchor {tenantId: $tenant, text: r.anchorKey})
+WITH r, a.embedding AS anchor, NOT coalesce(t.isPlaceholder, false) AS crawled,
+     CASE WHEN coalesce(t.isPlaceholder, false) THEN null ELSE t.content_embedding END AS page
+WITH r, crawled, page,
+     CASE WHEN page IS NULL OR r.surroundingEmbedding IS NULL THEN null
+          ELSE vector.similarity.cosine(r.surroundingEmbedding, page) END AS context,
+     CASE WHEN page IS NULL OR anchor IS NULL OR coalesce(r.anchorGeneric, false) THEN null
+          ELSE vector.similarity.cosine(anchor, page) END AS fit
+SET r.contextRelevance = CASE WHEN context > 1 THEN 1.0 WHEN context < 0 THEN 0.0 ELSE context END,
+    r.anchorTargetFit = CASE WHEN fit > 1 THEN 1.0 WHEN fit < 0 THEN 0.0 ELSE fit END
+RETURN count(page) AS scored, count(CASE WHEN crawled AND page IS NULL THEN 1 END) AS cleared
+"""
+_LINK_RELEVANCE: Final = """
+MATCH (s:Page {tenantId: $tenant})-[r:LINKS_TO]->(t:Page {tenantId: $tenant})
+WHERE NOT coalesce(s.isPlaceholder, false) AND NOT coalesce(t.isPlaceholder, false)
+  AND t.content_embedding IS NOT NULL
+RETURN s.url AS source_url, r.position AS position, t.url AS target_url,
+       r.contextRelevance AS context_relevance, r.anchorTargetFit AS anchor_target_fit,
+       coalesce(r.anchorGeneric, false) AS anchor_generic
+ORDER BY source_url, position
 """
 _COMMUNITY_CONTEXT: Final = """
 MATCH (p:Page {tenantId: $tenant})
@@ -1318,6 +1356,16 @@ class GraphRepo:
         except ValidationError as error:
             raise DatabaseReadError("neo4j", f"page structure of {tenant_id!r}: {error}") from error
 
+    async def link_relevance(self, tenant_id: str) -> list[LinkRelevance]:
+        """The stored scores of every body link between crawled pages whose target has a
+        content vector, ordered by (source url, position)."""
+        _require_tenant(tenant_id)
+        rows = await self._read(_LINK_RELEVANCE, tenant=tenant_id)
+        try:
+            return [LinkRelevance.model_validate(row) for row in rows]
+        except ValidationError as error:
+            raise DatabaseReadError("neo4j", f"link relevance of {tenant_id!r}: {error}") from error
+
     async def page_languages(self, tenant_id: str) -> dict[str, str | None]:
         """The language of every crawled page; None when ingestion assigned none."""
         _require_tenant(tenant_id)
@@ -1433,6 +1481,23 @@ class GraphRepo:
                 return await session.execute_write(_write_hub_rows, tenant_id, chunks, rows)
         except (Neo4jError, DriverError) as error:
             raise _translate(error, write=True) from error
+
+    async def score_link_relevance(
+        self, tenant_id: str, *, batch_size: int = LINK_SCORE_BATCH
+    ) -> tuple[int, int]:
+        """Score every body link between crawled pages against its target's content vector,
+        ``batch_size`` source pages per transaction. Links whose target has no vector lose both
+        scores; so do links to a placeholder, uncounted. Returns (links scored, links cleared)."""
+        _require_tenant(tenant_id)
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        sources = [str(row["url"]) for row in await self._read(_LINK_SOURCES, tenant=tenant_id)]
+        scored = cleared = 0
+        for chunk in batched(sources, batch_size):
+            [row] = await self._write(_SCORE_LINKS, tenant=tenant_id, urls=list(chunk))
+            scored += _int_row(row, "scored")
+            cleared += _int_row(row, "cleared")
+        return scored, cleared
 
     async def replace_keyword_targets(
         self,
