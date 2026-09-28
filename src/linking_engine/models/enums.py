@@ -175,6 +175,20 @@ class UnanchoredReason(StrEnum):
     MEANING_SEARCH_NOT_RUN = "MEANING_SEARCH_NOT_RUN"
 
 
+class ScorerName(StrEnum):
+    """What ordered a source page's candidate pairs. The values name MLflow metrics."""
+
+    LEARNED = "learned"
+    # The same model trained without the columns that hiding a link moves by itself.
+    LEARNED_EXCL_LINK_COUNTS = "learned_excl_link_counts"
+    # The same model trained without the anchor placement columns, which a hidden link keeps.
+    LEARNED_EXCL_PLACEMENT = "learned_excl_placement"
+    # The hand-weighted scorer of #17.
+    BASELINE = "baseline"
+    # The registered model currently holding the production alias.
+    HOLDER = "holder"
+
+
 class RecommendationStatus(StrEnum):
     """Where a recommendation stands with the operator who reviewed it.
 

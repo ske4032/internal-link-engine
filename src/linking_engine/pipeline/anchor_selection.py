@@ -1,7 +1,7 @@
 """Choose every pair's anchor: the ladder's lexical rungs, the semantic rung for the pairs they
 miss, then scoring and choice, with the placement features of each choice. Writes the choices
 and the pairs left without an anchor, with advice, as Parquet per tenant; read-only against both
-stores."""
+stores. `compute_anchor_choices` chooses without writing, also on a held-out view."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import os
 import tempfile
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -43,7 +44,7 @@ from linking_engine.pipeline.semantic_anchors import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sequence
+    from collections.abc import Iterable, Mapping, Sequence, Set
 
     from linking_engine.embedding.voyage_client import VoyageClient
     from linking_engine.graph.repo import GraphRepo
@@ -55,6 +56,7 @@ if TYPE_CHECKING:
         KeywordSource,
         UnanchoredPair,
     )
+    from linking_engine.pipeline.anchors import AnchorView
 
 log = structlog.get_logger(__name__)
 
@@ -122,6 +124,18 @@ UNANCHORED_SCHEMA: Final = pa.schema(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class AnchorSelection:
+    """Every chosen anchor and alternative, the pairs left without one, and the report."""
+
+    choices: tuple[AnchorChoice, ...]
+    unanchored: tuple[UnanchoredPair, ...]
+    report: AnchorSelectionReport
+    # Why Voyage stopped being used by the end of the run, the placement vectors included;
+    # None when it served every text.
+    skipped_reason: str | None = None
+
+
 async def select_anchors(
     graph: GraphRepo,
     mongo: MongoRepo,
@@ -135,9 +149,55 @@ async def select_anchors(
     ``unanchored_pairs.parquet`` with their reason and advice, and the report.
     Without ``voyage`` (no key), or after an outage, the semantic rung is skipped and the
     lexical rungs still choose, scored without the parts that need vectors."""
-    started = time.perf_counter()
     folder = cache_folder(cache_dir, tenant_id)
-    run = await lexical_run(graph, mongo, tenant_id, cache_dir=cache_dir)
+    selection = await compute_anchor_choices(
+        graph, mongo, tenant_id, cache_dir=cache_dir, voyage=voyage
+    )
+    report = selection.report
+    path = await asyncio.to_thread(_write, folder, selection.choices, selection.unanchored)
+    log.info(
+        "anchors.selected",
+        stage=STAGE,
+        tenant_id=tenant_id,
+        pairs=report.pairs,
+        lexical_pairs=report.lexical_pairs,
+        semantic_invocations=report.semantic_invocations,
+        semantic_matched=report.semantic_matched,
+        zero_overlap_matches=report.zero_overlap_matches,
+        semantic_rejected_identifier=report.semantic_rejected_identifier,
+        semantic_rejected_other_target=report.semantic_rejected_other_target,
+        threshold=(None if report.semantic_skipped_reason is not None else report.threshold.value),
+        threshold_overridden=report.threshold.overridden,
+        semantic_skipped=report.semantic_skipped_reason is not None,
+        embedding_skipped=report.embedding_skipped_reason is not None,
+        chosen=report.chosen,
+        alternatives=report.alternatives,
+        unanchored={reason.value: n for reason, n in report.unanchored.items()},
+        chosen_types={kind.value: n for kind, n in report.chosen_types.items()},
+        targets=report.targets,
+        targets_with_anchor=report.targets_with_anchor,
+        features_filled=report.features_filled,
+        seconds=report.seconds,
+    )
+    return report, path
+
+
+async def compute_anchor_choices(
+    graph: GraphRepo,
+    mongo: MongoRepo,
+    tenant_id: str,
+    *,
+    cache_dir: Path,
+    voyage: VoyageClient | None,
+    view: AnchorView | None = None,
+) -> AnchorSelection:
+    """Every pair's anchor, alternatives and placement features, the pairs left without one,
+    and the report; nothing is written but the tenant's append-only vector caches. On a
+    held-out ``view``: its candidates, no bridges, and the hidden links' anchors neither in
+    their sources' existing spans nor among their targets' inbound anchors."""
+    started = time.perf_counter()
+    cache_folder(cache_dir, tenant_id)
+    run = await lexical_run(graph, mongo, tenant_id, cache_dir=cache_dir, view=view)
     profile = await mongo.get_anchor_type_profile(tenant_id) or AnchorTypeProfile()
     rules = await mongo.get_anchor_rules(tenant_id)
     generic_add, generic_remove = generic_overrides(rules.generic_add, rules.generic_remove)
@@ -149,6 +209,7 @@ async def select_anchors(
         {pair.target_url for pair in run.pairs},
         generic_add=generic_add,
         generic_remove=generic_remove,
+        hidden=frozenset() if view is None else view.hidden,
     )
 
     vectors = await AnchorVectors.load(graph, voyage, tenant_id, cache_dir=cache_dir)
@@ -198,11 +259,11 @@ async def select_anchors(
         )
         for pair in run.pairs
     ]
-    choices, unanchored = await asyncio.to_thread(
+    chosen, unanchored = await asyncio.to_thread(
         choose, pairs, existing=existing, profile=profile, brand=brand
     )
-    await vectors.ensure("sentences", [choice.match.sentence for choice in choices])
-    choices = [_placed(choice, vectors) for choice in choices]
+    await vectors.ensure("sentences", [choice.match.sentence for choice in chosen])
+    choices = tuple(_placed(choice, vectors) for choice in chosen)
 
     sentences_embedded, sentences_cached = vectors.counts("sentences")
     phrases_embedded, phrases_cached = vectors.counts("phrases")
@@ -232,32 +293,7 @@ async def select_anchors(
         targets=len({pair.target_url for pair in run.pairs}),
         started=started,
     )
-    path = await asyncio.to_thread(_write, folder, choices, unanchored)
-    log.info(
-        "anchors.selected",
-        stage=STAGE,
-        tenant_id=tenant_id,
-        pairs=report.pairs,
-        lexical_pairs=report.lexical_pairs,
-        semantic_invocations=report.semantic_invocations,
-        semantic_matched=report.semantic_matched,
-        zero_overlap_matches=report.zero_overlap_matches,
-        semantic_rejected_identifier=report.semantic_rejected_identifier,
-        semantic_rejected_other_target=report.semantic_rejected_other_target,
-        threshold=(None if report.semantic_skipped_reason is not None else report.threshold.value),
-        threshold_overridden=report.threshold.overridden,
-        semantic_skipped=report.semantic_skipped_reason is not None,
-        embedding_skipped=report.embedding_skipped_reason is not None,
-        chosen=report.chosen,
-        alternatives=report.alternatives,
-        unanchored={reason.value: n for reason, n in report.unanchored.items()},
-        chosen_types={kind.value: n for kind, n in report.chosen_types.items()},
-        targets=report.targets,
-        targets_with_anchor=report.targets_with_anchor,
-        features_filled=report.features_filled,
-        seconds=report.seconds,
-    )
-    return report, path
+    return AnchorSelection(choices, tuple(unanchored), report, vectors.skipped_reason())
 
 
 async def _inbound_anchors(
@@ -267,13 +303,16 @@ async def _inbound_anchors(
     *,
     generic_add: frozenset[str],
     generic_remove: frozenset[str],
+    hidden: Set[tuple[str, str]],
 ) -> dict[str, list[tuple[str, str]]]:
     """(anchor text, source url) of every descriptive existing link into each target: links
-    between crawled pages, generic anchors left out."""
+    between crawled pages, generic anchors and ``hidden`` links left out."""
     target_of = {
         (link.source_url, link.position): link.target_url
         for link in await graph.link_relevance(tenant_id)
-        if link.target_url in targets and not link.anchor_generic
+        if link.target_url in targets
+        and not link.anchor_generic
+        and (link.source_url, link.target_url) not in hidden
     }
     found: defaultdict[str, list[tuple[str, str]]] = defaultdict(list)
     if not target_of:

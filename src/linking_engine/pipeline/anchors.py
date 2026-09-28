@@ -2,7 +2,8 @@
 own copy, and write them as a Parquet file per tenant. Read-only against both stores.
 
 `lexical_run` does the reads and the ladder's rungs 1 to 2.5 in memory, so anchor selection
-reuses them; `extract_anchors` writes their matches.
+reuses them, on the stored graph or on a held-out view of it; `extract_anchors` writes their
+matches.
 """
 
 from __future__ import annotations
@@ -34,9 +35,11 @@ from linking_engine.models import ExtractionSettings
 from linking_engine.pipeline.bridges import BRIDGES_FILE
 
 if TYPE_CHECKING:
+    from collections.abc import Set
+
     from linking_engine.graph.repo import GraphRepo
     from linking_engine.ingest.mongo_repo import MongoRepo
-    from linking_engine.models import AnchorMatch, AnchorReport, KeywordSource
+    from linking_engine.models import AnchorMatch, AnchorReport, CandidateSet, KeywordSource
 
 log = structlog.get_logger(__name__)
 
@@ -69,6 +72,15 @@ class AnchorPair:
     # The source's retrieval cosine to the target: the candidate's, or the bridge link's.
     similarity: float
     bridge: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AnchorView:
+    """A held-out view of the tenant: the candidates retrieved on it, and the hidden links,
+    whose existing anchors count as never written."""
+
+    candidates: CandidateSet
+    hidden: frozenset[tuple[str, str]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,13 +133,24 @@ def cache_folder(cache_dir: Path, tenant_id: str) -> Path:
 
 
 async def lexical_run(
-    graph: GraphRepo, mongo: MongoRepo, tenant_id: str, *, cache_dir: Path
+    graph: GraphRepo,
+    mongo: MongoRepo,
+    tenant_id: str,
+    *,
+    cache_dir: Path,
+    view: AnchorView | None = None,
 ) -> LexicalRun:
-    """The reads of both anchor stages and every pair's lexical matches."""
+    """The reads of both anchor stages and every pair's lexical matches. On a held-out
+    ``view``: its candidates, no bridges, and no existing anchor of a hidden link."""
     folder = cache_folder(cache_dir, tenant_id)
     settings = await mongo.get_extraction_settings(tenant_id) or ExtractionSettings()
-    candidates = await retrieve_candidates(graph, tenant_id)
-    bridges = await asyncio.to_thread(_bridge_pairs, folder / BRIDGES_FILE)
+    hidden: frozenset[tuple[str, int]] = frozenset()
+    if view is None:
+        candidates = await retrieve_candidates(graph, tenant_id)
+        bridges = await asyncio.to_thread(_bridge_pairs, folder / BRIDGES_FILE)
+    else:
+        candidates, bridges = view.candidates, []
+        hidden = await hidden_edges(graph, tenant_id, view.hidden)
     found: dict[tuple[str, str], AnchorPair] = {}
     for entry in candidates.targets:
         for source, similarity in zip(entry.sources, entry.similarities, strict=True):
@@ -152,7 +175,7 @@ async def lexical_run(
     links: defaultdict[str, list[tuple[str, str]]] = defaultdict(list)
     async for texts in graph.iter_link_texts(tenant_id):
         for text in texts:
-            if text.source_url in wanted:
+            if text.source_url in wanted and (text.source_url, text.position) not in hidden:
                 links[text.source_url].append((text.anchor_text, text.surrounding_text))
 
     return await asyncio.to_thread(
@@ -165,6 +188,21 @@ async def lexical_run(
         brand,
         sources,
         links,
+    )
+
+
+async def hidden_edges(
+    graph: GraphRepo, tenant_id: str, hidden: Set[tuple[str, str]]
+) -> frozenset[tuple[str, int]]:
+    """(source url, position) of every edge of the ``hidden`` links. Link texts carry no target,
+    so they are joined through the scored links, whose targets all have a content vector: a
+    hidden link into a page without one is never a candidate either."""
+    if not hidden:
+        return frozenset()
+    return frozenset(
+        (link.source_url, link.position)
+        for link in await graph.link_relevance(tenant_id)
+        if (link.source_url, link.target_url) in hidden
     )
 
 
