@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path  # noqa: TC003 - Prefect validates flow parameters at runtime
 from typing import TYPE_CHECKING, Any
 
 from prefect import flow, get_run_logger, task
@@ -11,6 +12,7 @@ from prefect.runtime import flow_run
 from structlog.contextvars import bound_contextvars
 
 from linking_engine.discovery.candidates import retrieve_candidates, summarise_candidates
+from linking_engine.discovery.features import CHUNK_PAIRS, summarise_features
 from linking_engine.embedding.voyage_client import VoyageClient, VoyageSettings
 from linking_engine.errors import (
     DatabaseAuthError,
@@ -22,14 +24,16 @@ from linking_engine.graph.repo import GraphRepo
 from linking_engine.ingest.graph_load import load_tenant_graph
 from linking_engine.ingest.mongo_repo import CrawlSource, MongoRepo
 from linking_engine.ingest.prepare import BOILERPLATE_SHARE, NAV_SHARE, prepare_tenant
-from linking_engine.ml.tracking import log_analytics, log_candidates
+from linking_engine.ml.tracking import log_analytics, log_candidates, log_features, log_keywords
 from linking_engine.models import (
     CandidateSet,
     CentralityReport,
     CommunityReport,
     EmbedRunReport,
+    FeatureReport,
     GraphLoadReport,
     HubReport,
+    KeywordReport,
     LinkEmbedReport,
     PrepareReport,
     TenantConfig,
@@ -44,6 +48,8 @@ from linking_engine.pipeline.analytics import (
 )
 from linking_engine.pipeline.embed import FLUSH_SIZE, embed_tenant
 from linking_engine.pipeline.embed_links import embed_links
+from linking_engine.pipeline.features import CACHE_DIR, assemble_features
+from linking_engine.pipeline.keywords import resolve_tenant_keywords, summarise_keywords
 
 if TYPE_CHECKING:
     from prefect.client.schemas.objects import State
@@ -397,3 +403,99 @@ async def load_graph_flow(tenant_id: str) -> tuple[GraphLoadReport, TenantGraphC
         counts.fix_links,
     )
     return report, counts
+
+
+# Each source's keyword edges are replaced whole, so a retry converges on the same edges.
+@task(
+    name="resolve-keywords",
+    retries=1,
+    retry_delay_seconds=30,
+    retry_condition_fn=is_transient,
+    cache_policy=NONE,
+)
+async def resolve_keywords_task(tenant_id: str) -> KeywordReport:
+    async with await neo4j() as graph, await mongo() as repo:
+        await graph.check_server()
+        return await resolve_tenant_keywords(graph, repo, tenant_id)
+
+
+@task(name="mlflow-log-keywords", cache_policy=NONE)
+def log_keywords_task(report: KeywordReport) -> str:
+    return log_keywords(report, summarise_keywords(report))
+
+
+@flow(name="resolve-keywords")
+async def resolve_keywords_flow(tenant_id: str) -> tuple[KeywordReport, str]:
+    """Every crawled 2xx page's target keyword and the tenant's keyword edges, after load-graph
+    and before graph-analytics so the keyword communities see this run's keywords."""
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
+        logger.info("resolving the keywords of tenant %s", tenant_id)
+        report = await resolve_keywords_task(tenant_id)
+        mlflow_run = log_keywords_task(report)
+    logger.info(
+        "%d of %d pages resolved: %s; gsc %s (%d rejected); edges written %s, stale deleted %s; "
+        "%d strategic rows on uncrawled urls; %.1fs; mlflow run %s",
+        report.resolved,
+        report.pages,
+        {rung.value: count for rung, count in report.by_rung.items()},
+        "enabled" if report.gsc_enabled else "skipped",
+        report.gsc_rejected,
+        {source.value: count for source, count in report.edges_written.items()},
+        {source.value: count for source, count in report.stale_edges_deleted.items()},
+        report.skipped_rows,
+        report.seconds,
+        mlflow_run,
+    )
+    return report, mlflow_run
+
+
+# Read-only against both stores; the matrix file is renamed into place only when complete, so
+# a retry finds it cached or builds it again.
+@task(
+    name="feature-assembly",
+    retries=1,
+    retry_delay_seconds=30,
+    retry_condition_fn=is_transient,
+    cache_policy=NONE,
+)
+async def features_task(
+    tenant_id: str, cache_dir: Path, chunk_pairs: int
+) -> tuple[FeatureReport, Path]:
+    async with await neo4j() as graph, await mongo() as repo:
+        await graph.check_server()
+        return await assemble_features(
+            graph, repo, tenant_id, cache_dir=cache_dir, chunk_pairs=chunk_pairs
+        )
+
+
+@task(name="mlflow-log-features", cache_policy=NONE)
+def log_features_task(report: FeatureReport) -> str:
+    return log_features(report, summarise_features(report))
+
+
+@flow(name="feature-assembly")
+async def feature_assembly_flow(
+    tenant_id: str, cache_dir: Path = CACHE_DIR, chunk_pairs: int = CHUNK_PAIRS
+) -> tuple[FeatureReport, Path, str]:
+    """The features of every candidate pair, cached as Parquet under ``cache_dir``; nothing is
+    written to the stores, the report and the column order are logged to MLflow."""
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
+        logger.info("feature assembly of tenant %s, chunks of %d pairs", tenant_id, chunk_pairs)
+        report, path = await features_task(tenant_id, cache_dir, chunk_pairs)
+        mlflow_run = log_features_task(report)
+    logger.info(
+        "%d pairs in %d chunks, %d columns (%s); %d all null, %d constant; %s; %.1fs; "
+        "mlflow run %s",
+        report.pairs,
+        report.chunks,
+        len(report.columns),
+        "cache hit" if report.cache_hit else "built",
+        len(report.all_null_columns),
+        len(report.constant_columns),
+        path,
+        report.seconds,
+        mlflow_run,
+    )
+    return report, path, mlflow_run

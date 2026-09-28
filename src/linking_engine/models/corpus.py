@@ -102,6 +102,10 @@ class PageRecord(BaseModel):
     # Distinct crawled pages linking here from template lines, by zone; never edges.
     menu_inlinks: int = Field(default=0, ge=0)
     footer_inlinks: int = Field(default=0, ge=0)
+    # From the tenant's language rules; links are only made within one language.
+    language: str | None = None
+    # BFS over body, menu and footer links from the site root; None when unreachable.
+    crawl_depth: int | None = Field(default=None, ge=0)
 
 
 class CrawlPage(BaseModel):
@@ -131,6 +135,8 @@ class PageSummary(BaseModel):
     body_hash: str = Field(pattern=_SHA256_HEX)
     menu_inlinks: int = Field(default=0, ge=0)
     footer_inlinks: int = Field(default=0, ge=0)
+    language: str | None = None
+    crawl_depth: int | None = Field(default=None, ge=0)
 
 
 class LinkRecord(BaseModel):
@@ -168,6 +174,8 @@ class PrepareReport(BaseModel):
     pages_written: int = Field(ge=0)
     links_written: int = Field(ge=0)
     stale_links_deleted: int = Field(ge=0)
+    # Pages the crawl-depth BFS reached from the roots; a low share means the roots link nowhere.
+    pages_with_depth: int = Field(default=0, ge=0)
     finished_at: AwareDatetime
 
 

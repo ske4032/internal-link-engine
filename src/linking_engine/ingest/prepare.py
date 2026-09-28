@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 import structlog
 
+from linking_engine.ingest.depth import crawl_depths
 from linking_engine.ingest.markdown_clean import (
     body_hash,
     clean_meta,
@@ -22,6 +23,7 @@ from linking_engine.models import (
     CleanedPage,
     CrawlPage,
     Heading,
+    LanguageRules,
     LinkRecord,
     PageRecord,
     PrepareReport,
@@ -30,7 +32,7 @@ from linking_engine.models import (
 from linking_engine.urls import normalise_url, url_rules
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from linking_engine.ingest.mongo_repo import CrawlSource, MongoRepo
 
@@ -62,12 +64,59 @@ def keep_rank(doc: CrawlPage) -> tuple[bool, bool, int, str]:
     return (doc.status_code != 200, urlsplit(url).scheme != "https", len(url), url)
 
 
+def page_language(url: str, rules: LanguageRules) -> str:
+    """The language of the longest ``rules`` prefix matching the url key's path in whole
+    segments (``/de/`` matches ``/de`` and ``/de/x``, not ``/design``), else the default."""
+    path = _path_segments(url)
+    matched, language = -1, rules.default_language
+    for prefix, prefix_language in rules.prefixes:
+        segments = _prefix_segments(prefix)
+        if len(segments) > matched and path[: len(segments)] == segments:
+            matched, language = len(segments), prefix_language
+    return language
+
+
+def _path_segments(url: str) -> list[str]:
+    return url.split("?", 1)[0].partition("/")[2].split("/")
+
+
+def _prefix_segments(prefix: str) -> list[str]:
+    return [segment.lower() for segment in prefix.split("/") if segment]
+
+
+def _is_root(url: str, rules: LanguageRules) -> bool:
+    """A bare host, or a language home such as ``example.com/en``: a site whose root only
+    redirects to its language homes still gets depths."""
+    if "?" in url:
+        return False
+    if "/" not in url:
+        return True
+    path = _path_segments(url)
+    return any(path == _prefix_segments(prefix) for prefix, _ in rules.prefixes)
+
+
+def _followed_links(pages: Mapping[str, CleanedPage]) -> dict[str, set[str]]:
+    """Every url key each page links to from its body or from its menu and footer lines."""
+    edges: dict[str, set[str]] = {}
+    for url, page in pages.items():
+        targets = edges.setdefault(url, set())
+        linked = [str(link.target_url) for link in page.links if link.is_internal]
+        linked.extend(str(link.target_url) for link in page.template_links)
+        for target in linked:
+            try:
+                targets.add(normalise_url(target))
+            except ValueError:
+                continue
+    return edges
+
+
 def prepare_corpus(
     docs: Sequence[CrawlPage],
     *,
     source: str,
     boilerplate_share: float = BOILERPLATE_SHARE,
     nav_share: float = NAV_SHARE,
+    language_rules: LanguageRules = LanguageRules(),
 ) -> PreparedCorpus:
     """Pure: runs under whatever url rules are active, so call it inside the tenant's."""
     skipped: Counter[str] = Counter()
@@ -104,6 +153,11 @@ def prepare_corpus(
         for item in count_template_inlinks((key, page) for key, (_, page) in chosen.items())
         if item.url in chosen
     }
+    # Depth follows what a visitor can click, so template links count here though never as edges.
+    depths = crawl_depths(
+        _followed_links({key: page for key, (_, page) in chosen.items()}),
+        (key for key in chosen if _is_root(key, language_rules)),
+    )
     records: list[PageRecord] = []
     links: list[LinkRecord] = []
     for key, (doc, page) in chosen.items():
@@ -127,6 +181,8 @@ def prepare_corpus(
                 source=source,
                 menu_inlinks=found.menu_inlinks if found else 0,
                 footer_inlinks=found.footer_inlinks if found else 0,
+                language=page_language(key, language_rules),
+                crawl_depth=depths.get(key),
             )
         )
         links.extend(
@@ -162,15 +218,21 @@ async def prepare_tenant(
     boilerplate_share: float = BOILERPLATE_SHARE,
     nav_share: float = NAV_SHARE,
 ) -> tuple[PreparedCorpus, PrepareReport]:
-    """Read the crawl, prepare it under the tenant's url rules and, with ``write``, upsert it."""
+    """Read the crawl, prepare it under the tenant's url and language rules and, with
+    ``write``, upsert it."""
     if not tenant_id.strip():
         raise ValueError("tenant_id must be a non-empty string")
     rules = await mongo.get_url_rules(tenant_id)
+    language_rules = await mongo.get_language_rules(tenant_id)
     docs = [doc async for batch in source.iter_pages() for doc in batch]
     written = (0, 0, 0)
     with url_rules(rules):
         corpus = prepare_corpus(
-            docs, source=source_name, boilerplate_share=boilerplate_share, nav_share=nav_share
+            docs,
+            source=source_name,
+            boilerplate_share=boilerplate_share,
+            nav_share=nav_share,
+            language_rules=language_rules,
         )
         if write:
             await mongo.ensure_indexes()
@@ -192,6 +254,7 @@ async def prepare_tenant(
         pages_written=written[0],
         links_written=written[1],
         stale_links_deleted=written[2],
+        pages_with_depth=sum(1 for record in corpus.records if record.crawl_depth is not None),
         finished_at=datetime.now(UTC),
     )
     log.info("ingest.prepare", **report.model_dump(exclude={"skipped", "finished_at"}))

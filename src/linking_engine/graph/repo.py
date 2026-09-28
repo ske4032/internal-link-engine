@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
 from importlib.resources import files
@@ -34,10 +35,12 @@ from linking_engine.models import (
     EmbeddingSelection,
     EmbeddingTarget,
     IssueFlag,
+    KeywordSource,
     Link,
     LinkGraphSnapshot,
     LinkText,
     Page,
+    PageStructure,
     TargetSelection,
     TenantGraphCounts,
 )
@@ -54,6 +57,7 @@ if TYPE_CHECKING:
         AnchorKeyUpdate,
         EdgeRef,
         HubCentroid,
+        KeywordTarget,
         PageCentrality,
         PageCommunities,
         PageHub,
@@ -375,6 +379,75 @@ RETURN count(p) AS crawled_pages,
        count(CASE state WHEN 'without_vector' THEN 1 END) AS without_vector,
        collect(CASE state WHEN 'target'
          THEN {url: p.url, indexable_assumed: p.isIndexable IS NULL} END) AS targets
+"""
+# Inbound and outbound count distinct crawled pages, so repeated links between a pair count once.
+_PAGE_STRUCTURE: Final = """
+MATCH (p:Page {tenantId: $tenant})
+WHERE NOT coalesce(p.isPlaceholder, false)
+RETURN p.url AS url,
+       p.language AS language,
+       coalesce(p.wordCount, 0) AS word_count,
+       COUNT {
+         MATCH (s:Page {tenantId: $tenant})-[:LINKS_TO]->(p)
+         WHERE s <> p AND NOT coalesce(s.isPlaceholder, false)
+         RETURN DISTINCT s
+       } AS inbound,
+       COUNT {
+         MATCH (p)-[:LINKS_TO]->(t:Page {tenantId: $tenant})
+         WHERE t <> p AND NOT coalesce(t.isPlaceholder, false)
+         RETURN DISTINCT t
+       } AS outbound,
+       p.isOrphan AS is_orphan,
+       p.pageRankPercentile AS page_rank_percentile,
+       p.crawlDepth AS crawl_depth,
+       p.linkCommunityId AS link_community_id,
+       p.keywordCommunityId AS keyword_community_id,
+       p.contentCommunityId AS content_community_id,
+       p.hubId AS hub_id,
+       coalesce(p.isHubPillar, false) AS is_hub_pillar
+ORDER BY url
+"""
+_PAGE_LANGUAGES: Final = """
+MATCH (p:Page {tenantId: $tenant})
+WHERE NOT coalesce(p.isPlaceholder, false)
+RETURN p.url AS url, p.language AS language
+"""
+_KEYWORD_EDGE_PAGES: Final = """
+MATCH (p:Page {tenantId: $tenant})-[:TARGETS_KEYWORD {source: $source}]->()
+RETURN DISTINCT p.url AS url
+"""
+# Everything of the source on a page goes except its kept (text, language) pairs: all of it on a
+# placeholder, and any edge to another tenant's keyword.
+_PRUNE_KEYWORD_EDGES: Final = """
+UNWIND $pages AS page
+MATCH (p:Page {tenantId: $tenant, url: page.url})-[r:TARGETS_KEYWORD {source: $source}]->(k)
+WHERE coalesce(p.isPlaceholder, false)
+   OR NOT coalesce(k.tenantId = $tenant AND [k.text, k.language] IN page.keep, false)
+DELETE r
+RETURN count(r) AS n
+"""
+# Rows whose url is not a crawled page match nothing, so they create no Keyword either.
+_WRITE_KEYWORD_TARGETS: Final = """
+UNWIND $rows AS row
+MATCH (p:Page {tenantId: $tenant, url: row.url})
+WHERE NOT coalesce(p.isPlaceholder, false)
+MERGE (k:Keyword {tenantId: $tenant, text: row.text, language: row.language})
+MERGE (p)-[r:TARGETS_KEYWORD {source: $source}]->(k)
+SET r.priority = row.priority,
+    r.isPrimary = row.isPrimary,
+    r.rung = row.rung,
+    r.rank = row.rank,
+    r.resolved = CASE WHEN row.rung IS NULL THEN null ELSE true END
+RETURN count(DISTINCT row) AS n
+"""
+_MARK_STRATEGIC_KEYWORDS: Final = """
+MATCH (k:Keyword {tenantId: $tenant})
+WITH k, EXISTS {
+  (:Page {tenantId: $tenant})-[:TARGETS_KEYWORD {source: $strategic}]->(k)
+} AS strategic
+WHERE k.isStrategic IS NULL OR k.isStrategic <> strategic
+SET k.isStrategic = strategic
+RETURN count(k) AS n
 """
 _COMMUNITY_CONTEXT: Final = """
 MATCH (p:Page {tenantId: $tenant})
@@ -1158,6 +1231,29 @@ class GraphRepo:
                 "neo4j", f"candidate targets of {tenant_id!r}: {error}"
             ) from error
 
+    async def page_structure(self, tenant_id: str) -> list[PageStructure]:
+        """Language, size, body link counts, depth and cluster labels of every crawled page,
+        ordered by url."""
+        _require_tenant(tenant_id)
+        rows = await self._read(_PAGE_STRUCTURE, tenant=tenant_id)
+        try:
+            return [PageStructure.model_validate(row) for row in rows]
+        except ValidationError as error:
+            raise DatabaseReadError("neo4j", f"page structure of {tenant_id!r}: {error}") from error
+
+    async def page_languages(self, tenant_id: str) -> dict[str, str | None]:
+        """The language of every crawled page; None when ingestion assigned none."""
+        _require_tenant(tenant_id)
+        languages: dict[str, str | None] = {}
+        for row in await self._read(_PAGE_LANGUAGES, tenant=tenant_id):
+            url, language = row["url"], row["language"]
+            if not isinstance(url, str) or not (language is None or isinstance(language, str)):
+                raise DatabaseReadError(
+                    "neo4j", f"page {url!r} of {tenant_id!r} has language {language!r}"
+                )
+            languages[url] = language
+        return languages
+
     async def community_context(self, tenant_id: str) -> list[CommunityContext]:
         """Template inlink counts and the previous run's community ids of every crawled page."""
         _require_tenant(tenant_id)
@@ -1239,6 +1335,47 @@ class GraphRepo:
         try:
             async with self._driver.session(default_access_mode=WRITE_ACCESS) as session:
                 return await session.execute_write(_write_hub_rows, tenant_id, chunks, rows)
+        except (Neo4jError, DriverError) as error:
+            raise _translate(error, write=True) from error
+
+    async def replace_keyword_targets(
+        self,
+        tenant_id: str,
+        source: KeywordSource,
+        targets: Sequence[KeywordTarget],
+        *,
+        batch_size: int = LINK_BATCH,
+    ) -> tuple[int, int]:
+        """Make the tenant's ``source`` keyword edges exactly ``targets`` on crawled pages, in
+        one transaction. Rows on other urls are not written. Returns (written, stale deleted)."""
+        _require_tenant(tenant_id)
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        if any(target.source is not source for target in targets):
+            raise ValueError(f"every target must come from {source.value}")
+        keys = [(t.url, t.text, t.language) for t in targets]
+        if len(set(keys)) != len(keys):
+            raise ValueError("duplicate targets: one per (url, text, language)")
+        resolved = Counter(t.url for t in targets if t.rung is not None)
+        if any(count > 1 for count in resolved.values()):
+            raise ValueError("more than one resolved keyword on one page")
+        rows: list[Row] = [
+            {
+                "url": t.url,
+                "text": t.text,
+                "language": t.language,
+                "priority": t.priority,
+                "isPrimary": t.is_primary,
+                "rung": _to_property(t.rung),
+                "rank": t.rank,
+            }
+            for t in targets
+        ]
+        try:
+            async with self._driver.session(default_access_mode=WRITE_ACCESS) as session:
+                return await session.execute_write(
+                    _replace_keyword_rows, tenant_id, source, rows, batch_size
+                )
         except (Neo4jError, DriverError) as error:
             raise _translate(error, write=True) from error
 
@@ -1342,6 +1479,32 @@ async def _write_hub_rows(
     ids = [hub["hubId"] for hub in hubs]
     await _collect(tx, _RETIRE_HUBS, {"tenant": tenant_id, "ids": ids})
     return written
+
+
+async def _replace_keyword_rows(
+    tx: AsyncManagedTransaction,
+    tenant_id: str,
+    source: KeywordSource,
+    rows: list[Row],
+    batch_size: int,
+) -> tuple[int, int]:
+    params: Row = {"tenant": tenant_id, "source": source.value}
+    keep: dict[str, list[list[object]]] = {}
+    for row in rows:
+        keep.setdefault(str(row["url"]), []).append([row["text"], row["language"]])
+    existing = [str(row["url"]) for row in await _collect(tx, _KEYWORD_EDGE_PAGES, params)]
+    deleted = 0
+    for urls in batched(existing, batch_size):
+        pages = [{"url": url, "keep": keep.get(url, [])} for url in urls]
+        deleted += _int(await _collect(tx, _PRUNE_KEYWORD_EDGES, {**params, "pages": pages}))
+    written = 0
+    for chunk in batched(rows, batch_size):
+        written += _int(await _collect(tx, _WRITE_KEYWORD_TARGETS, {**params, "rows": list(chunk)}))
+    if source is KeywordSource.CLIENT_STRATEGIC:
+        await _collect(
+            tx, _MARK_STRATEGIC_KEYWORDS, {"tenant": tenant_id, "strategic": source.value}
+        )
+    return written, deleted
 
 
 async def _collect(

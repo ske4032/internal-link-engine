@@ -14,15 +14,23 @@ from linking_engine.ml.tracking import (
     analytics_metrics,
     candidate_metrics,
     candidate_table,
+    feature_metrics,
+    keyword_metrics,
     log_analytics,
     log_candidates,
+    log_features,
+    log_keywords,
 )
 from linking_engine.models import (
     CandidateReport,
     CandidateSet,
     CentralityReport,
     CommunityReport,
+    FeatureReport,
     HubReport,
+    KeywordReport,
+    KeywordRung,
+    KeywordSource,
     OrphanLabel,
     PassReport,
     TargetCandidates,
@@ -30,6 +38,9 @@ from linking_engine.models import (
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+# A deliberately low-entropy stand-in for a sha256 cache key.
+CACHE_KEY = "f" * 64
 
 
 @pytest.fixture
@@ -317,3 +328,158 @@ def test_candidate_runs_of_two_tenants_never_share_an_experiment(local_mlflow: s
     assert acme.info.experiment_id == analytics.info.experiment_id
     assert globex.info.experiment_id != acme.info.experiment_id
     assert globex.data.tags["tenant_id"] == "globex"
+
+
+# ── keyword resolution ──────────────────────────────────────────────────────
+
+
+def keyword_report(tenant: str = "acme") -> KeywordReport:
+    return KeywordReport(
+        tenant_id=tenant,
+        pages=6,
+        resolved=5,
+        by_rung={
+            KeywordRung.STRATEGIC: 1,
+            KeywordRung.GSC: 1,
+            KeywordRung.H1: 2,
+            KeywordRung.TITLE: 1,
+        },
+        gsc_enabled=True,
+        gsc_rows=123,
+        gsc_rejected=1,
+        brand_suffix="Acme",
+        brand_prefix=None,
+        fallbacks_rejected={"h1_repeated": 2, "title_generic": 1},
+        long_fallbacks=1,
+        secondary_keywords=4,
+        pages_with_secondaries=2,
+        edges_written={
+            KeywordSource.CLIENT_STRATEGIC: 2,
+            KeywordSource.GSC_OBSERVED: 1,
+            KeywordSource.INFERRED: 3,
+        },
+        stale_edges_deleted={
+            KeywordSource.CLIENT_STRATEGIC: 1,
+            KeywordSource.GSC_OBSERVED: 0,
+            KeywordSource.INFERRED: 0,
+        },
+        skipped_rows=2,
+        by_language={"en": 5, "de": 1},
+        seconds=0.5,
+        finished_at=datetime(2026, 9, 28, tzinfo=UTC),
+    )
+
+
+def test_keyword_metrics_are_flat_counts_per_rung_source_and_language() -> None:
+    assert keyword_metrics(keyword_report()) == {
+        "pages": 6,
+        "resolved": 5,
+        "gsc_enabled": 1,
+        "gsc_rows": 123,
+        "gsc_rejected": 1,
+        "skipped_rows": 2,
+        "seconds": 0.5,
+        "rung_strategic": 1,
+        "rung_gsc": 1,
+        "rung_h1": 2,
+        "rung_title": 1,
+        "edges_client_strategic": 2,
+        "edges_gsc_observed": 1,
+        "edges_inferred": 3,
+        "stale_client_strategic": 1,
+        "stale_gsc_observed": 0,
+        "stale_inferred": 0,
+        "pages_en": 5,
+        "pages_de": 1,
+        "rejected_h1_repeated": 2,
+        "rejected_title_generic": 1,
+        "long_fallbacks": 1,
+        "secondary_keywords": 4,
+        "pages_with_secondaries": 2,
+    }
+
+
+def test_a_keyword_run_is_logged_to_the_tenants_experiment(local_mlflow: str) -> None:
+    report = keyword_report()
+
+    run_id = log_keywords(report, "Keyword resolution for tenant acme.")
+
+    client = MlflowClient(local_mlflow)
+    run = client.get_run(run_id)
+    assert client.get_experiment(run.info.experiment_id).name == analytics_experiment("acme")
+    assert run.info.run_name == "keyword resolution"
+    assert (run.data.tags["stage"], run.data.tags["tenant_id"]) == ("resolve-keywords", "acme")
+    assert run.data.tags["mlflow.note.content"] == "Keyword resolution for tenant acme."
+    assert run.data.params == {
+        "min_curve_rows": "100",
+        "min_curve_impressions": "10000",
+        "min_query_impressions": "50",
+        "brand_suffix_share": "0.3",
+        "repeated_fallback_pages": "3",
+        "max_keyword_tokens": "12",
+        "max_secondary_queries": "4",
+    }
+    assert run.data.metrics == keyword_metrics(report)
+    assert {a.path for a in client.list_artifacts(run_id)} == {"report.json", "summary.md"}
+    assert load_dict(f"runs:/{run_id}/report.json") == report.model_dump(mode="json")
+
+
+# ── feature assembly ────────────────────────────────────────────────────────
+
+
+def feature_report(pairs: int = 12) -> FeatureReport:
+    return FeatureReport(
+        tenant_id="acme",
+        pairs=pairs,
+        columns=("content_cosine", "has_gsc_data", "context_relevance"),
+        chunks=3 if pairs else 0,
+        all_null_columns=("context_relevance",) if pairs else (),
+        constant_columns=("has_gsc_data",) if pairs else (),
+        null_share=(
+            {"content_cosine": 0.0, "has_gsc_data": 0.0, "context_relevance": 1.0} if pairs else {}
+        ),
+        has_gsc_data_share=0.25 if pairs else None,
+        cache_key=CACHE_KEY,
+        cache_hit=False,
+        seconds=1.5,
+        finished_at=datetime(2026, 9, 28, tzinfo=UTC),
+    )
+
+
+def test_feature_metrics_carry_counts_and_every_null_share() -> None:
+    assert feature_metrics(feature_report()) == {
+        "pairs": 12,
+        "chunks": 3,
+        "columns": 3,
+        "all_null_columns": 1,
+        "constant_columns": 1,
+        "seconds": 1.5,
+        "has_gsc_data_share": 0.25,
+        "null_share_content_cosine": 0.0,
+        "null_share_has_gsc_data": 0.0,
+        "null_share_context_relevance": 1.0,
+    }
+    assert "has_gsc_data_share" not in feature_metrics(feature_report(pairs=0))
+
+
+def test_a_feature_run_logs_its_column_order_but_never_the_matrix(local_mlflow: str) -> None:
+    report = feature_report()
+
+    run_id = log_features(report, "Feature assembly for tenant acme.")
+
+    client = MlflowClient(local_mlflow)
+    run = client.get_run(run_id)
+    assert client.get_experiment(run.info.experiment_id).name == analytics_experiment("acme")
+    assert (run.info.run_name, run.data.tags["stage"]) == ("feature assembly", "feature-assembly")
+    assert run.data.params == {
+        "cache_key": CACHE_KEY,
+        "cache_hit": "False",
+        "position_bands": "3,10,20,50",
+    }
+    assert run.data.metrics == feature_metrics(report)
+    assert {a.path for a in client.list_artifacts(run_id)} == {
+        "report.json",
+        "summary.md",
+        "columns.json",
+    }
+    assert load_dict(f"runs:/{run_id}/columns.json") == {"feature_columns": list(report.columns)}

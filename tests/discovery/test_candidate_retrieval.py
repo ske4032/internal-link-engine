@@ -58,6 +58,8 @@ class FakeGraph:
     # Crawled pages without a vector and placeholders only appear in the link graph.
     no_vector: tuple[str, ...] = ()
     placeholders: tuple[str, ...] = ()
+    # Crawled pages' languages; a page left out has none, as on a tenant without languages.
+    languages: dict[str, str] = field(default_factory=dict)
     reads: list[tuple[str, str, str | None]] = field(default_factory=list)
 
     async def candidate_targets(
@@ -79,6 +81,10 @@ class FakeGraph:
     ) -> dict[str, npt.NDArray[np.float32]]:
         self.reads.append(("page_vectors", tenant_id, index))
         return {u: np.asarray(self.vectors[u], dtype=np.float32) for u in sorted(self.vectors)}
+
+    async def page_languages(self, tenant_id: str) -> dict[str, str | None]:
+        self.reads.append(("page_languages", tenant_id, None))
+        return {u: self.languages.get(u) for u in sorted({*self.vectors, *self.no_vector})}
 
     async def link_graph(self, tenant_id: str) -> LinkGraphSnapshot:
         self.reads.append(("link_graph", tenant_id, None))
@@ -366,6 +372,7 @@ async def test_the_tenant_and_index_reach_every_read() -> None:
     assert sorted(graph.reads) == [
         ("candidate_targets", TENANT, "page_gnn"),
         ("link_graph", TENANT, None),
+        ("page_languages", TENANT, None),
         ("page_vectors", TENANT, "page_gnn"),
     ]
     assert found.report.index == "page_gnn"
@@ -437,7 +444,7 @@ def test_the_scorer_refuses_inconsistent_input(
     urls: list[str],
     vectors: list[Any],
     targets: list[str],
-    options: dict[str, int],
+    options: dict[str, Any],
     message: str,
 ) -> None:
     with pytest.raises(ValueError, match=message):
@@ -621,3 +628,62 @@ def test_targets_that_differ_from_the_selection_are_refused() -> None:
             search_seconds=0.0,
             seconds=0.0,
         )
+
+
+# ── same-language hard constraint ───────────────────────────────────────────
+
+
+def bilingual() -> FakeGraph:
+    """An English and a German section with identical vectors, page for page."""
+    vectors = {}
+    languages = {}
+    for lang in ("en", "de"):
+        for name, vector in (("a", [1.0, 0.0]), ("b", [0.9, 0.1]), ("c", [0.5, 0.5])):
+            vectors[page(f"{lang}/{name}")] = vector
+            languages[page(f"{lang}/{name}")] = lang
+    return FakeGraph(vectors, languages=languages)
+
+
+async def test_sources_are_only_ever_of_the_targets_language() -> None:
+    found = by_url(await retrieve(bilingual()))
+
+    for url, target in found.items():
+        language = url.split("/")[1]
+        assert target.sources, url
+        assert all(s.split("/")[1] == language for s in target.sources), (url, target.sources)
+        # Three pages of the language, less the target itself.
+        assert target.eligible == 2, url
+    assert found[page("en/a")].sources == (page("en/b"), page("en/c"))
+    assert found[page("de/a")].sources == (page("de/b"), page("de/c"))
+
+
+async def test_a_link_from_another_language_never_makes_a_source() -> None:
+    graph = bilingual()
+    graph.links = [(page("de/b"), page("en/a"))]
+
+    found = by_url(await retrieve(graph))
+
+    assert found[page("en/a")].sources == (page("en/b"), page("en/c"))
+
+
+async def test_a_tenant_without_languages_is_one_partition() -> None:
+    vectors, links = random_tenant(12, seed=4)
+    without = await retrieve(FakeGraph(vectors, links=links), per_target=5)
+    single = await retrieve(
+        FakeGraph(vectors, links=links, languages=dict.fromkeys(vectors, "en")), per_target=5
+    )
+
+    assert without.targets == single.targets
+    assert without.report.candidates == 12 * 5
+
+
+async def test_a_page_without_a_language_only_meets_pages_without_one() -> None:
+    graph = FakeGraph(
+        {page("a"): [1, 0], page("b"): [1, 0.1], page("c"): [0.9, 0.1], page("d"): [1, 0.2]},
+        languages={page("c"): "en", page("d"): "en"},
+    )
+
+    found = by_url(await retrieve(graph))
+
+    assert found[page("a")].sources == (page("b"),)
+    assert found[page("c")].sources == (page("d"),)

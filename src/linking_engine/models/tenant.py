@@ -6,7 +6,9 @@ these from the environment with a ``TENANT_`` prefix without a Mongo document
 existing yet, and every field still has the shipped default from the Data Model.
 """
 
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Self
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,6 +28,29 @@ class AnchorTypeProfile(BaseModel):
     partial: float = Field(default=0.20, ge=0, le=1)
     natural: float = Field(default=0.50, ge=0, le=1)
     branded: float = Field(default=0.15, ge=0, le=1)
+
+
+class LanguageRules(BaseModel):
+    """How a tenant's pages get their language: links are only ever made within one language.
+
+    A page takes the language of the longest url path prefix that matches it, else the
+    tenant's default. A single-language site needs no prefixes.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    default_language: str = Field(default="en", min_length=2)
+    # (url path prefix, language), e.g. ("/de/", "de").
+    prefixes: tuple[tuple[str, str], ...] = ()
+
+    @model_validator(mode="after")
+    def _prefixes(self) -> Self:
+        paths = [path for path, _ in self.prefixes]
+        if len(set(paths)) != len(paths):
+            raise ValueError("duplicate language prefixes")
+        if any(not path.startswith("/") or len(language) < 2 for path, language in self.prefixes):
+            raise ValueError("a language prefix is a path starting with / and a language code")
+        return self
 
 
 class AnchorRules(BaseModel):
@@ -91,7 +116,5 @@ class TenantConfig(BaseSettings):
 
     # ── output shaping ──────────────────────────────────────────────────────
     client_tier: str = "STARTER"
-    lifecycle_boost_enabled: bool = True
-    reserved_new_page_slot_pct: float = Field(default=0.15, ge=0, le=1)
     diversity_cap_pct: float = Field(default=0.15, ge=0, le=1)
     max_recommendations_per_source: int = Field(default=10, ge=1)

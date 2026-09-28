@@ -9,6 +9,14 @@ from typing import TYPE_CHECKING
 
 import mlflow
 
+from linking_engine.anchor.keywords import (
+    BRAND_SUFFIX_SHARE,
+    MAX_KEYWORD_TOKENS,
+    MAX_SECONDARY_QUERIES,
+    MIN_QUERY_IMPRESSIONS,
+    REPEATED_FALLBACK_PAGES,
+)
+from linking_engine.discovery.features import POSITION_BANDS
 from linking_engine.graph.algorithms import (
     DAMPING,
     HUB_MATCH_SIMILARITY,
@@ -21,6 +29,7 @@ from linking_engine.graph.algorithms import (
     SEED,
     STABILITY_SEEDS,
 )
+from linking_engine.gsc import MIN_CURVE_IMPRESSIONS, MIN_CURVE_ROWS
 
 if TYPE_CHECKING:
     from linking_engine.models import (
@@ -28,7 +37,9 @@ if TYPE_CHECKING:
         CandidateSet,
         CentralityReport,
         CommunityReport,
+        FeatureReport,
         HubReport,
+        KeywordReport,
     )
 
 
@@ -188,4 +199,109 @@ def log_candidates(found: CandidateSet, summary: str) -> str:
         mlflow.log_dict(report.model_dump(mode="json"), "report.json")
         mlflow.log_text(summary, "summary.md")
         mlflow.log_text(candidate_table(found), "targets.csv")
+        return str(run.info.run_id)
+
+
+def keyword_metrics(report: KeywordReport) -> dict[str, float]:
+    """Counts of the run, flat: per rung, per edge source, per page language and per
+    rejected fallback reason."""
+    metrics: dict[str, float] = {
+        "pages": float(report.pages),
+        "resolved": float(report.resolved),
+        "gsc_enabled": float(report.gsc_enabled),
+        "gsc_rows": float(report.gsc_rows),
+        "gsc_rejected": float(report.gsc_rejected),
+        "skipped_rows": float(report.skipped_rows),
+        "seconds": report.seconds,
+    }
+    metrics.update({f"rung_{rung.value.lower()}": float(n) for rung, n in report.by_rung.items()})
+    metrics.update(
+        {f"edges_{source.value.lower()}": float(n) for source, n in report.edges_written.items()}
+    )
+    metrics.update(
+        {
+            f"stale_{source.value.lower()}": float(n)
+            for source, n in report.stale_edges_deleted.items()
+        }
+    )
+    metrics.update({f"pages_{language}": float(n) for language, n in report.by_language.items()})
+    metrics.update(
+        {f"rejected_{reason}": float(n) for reason, n in report.fallbacks_rejected.items()}
+    )
+    metrics["long_fallbacks"] = float(report.long_fallbacks)
+    metrics["secondary_keywords"] = float(report.secondary_keywords)
+    metrics["pages_with_secondaries"] = float(report.pages_with_secondaries)
+    return metrics
+
+
+def log_keywords(report: KeywordReport, summary: str) -> str:
+    """Log one keyword resolution run with its description; returns the MLflow run id."""
+    mlflow.set_experiment(analytics_experiment(report.tenant_id))
+    with mlflow.start_run(
+        run_name="keyword resolution",
+        tags={
+            "tenant_id": report.tenant_id,
+            "kind": "pipeline",
+            "stage": "resolve-keywords",
+            "mlflow.note.content": summary,
+        },
+    ) as run:
+        mlflow.log_params(
+            {
+                "min_curve_rows": MIN_CURVE_ROWS,
+                "min_curve_impressions": MIN_CURVE_IMPRESSIONS,
+                "min_query_impressions": MIN_QUERY_IMPRESSIONS,
+                "brand_suffix_share": BRAND_SUFFIX_SHARE,
+                "repeated_fallback_pages": REPEATED_FALLBACK_PAGES,
+                "max_keyword_tokens": MAX_KEYWORD_TOKENS,
+                "max_secondary_queries": MAX_SECONDARY_QUERIES,
+            }
+        )
+        mlflow.log_metrics(keyword_metrics(report))
+        mlflow.log_dict(report.model_dump(mode="json"), "report.json")
+        mlflow.log_text(summary, "summary.md")
+        return str(run.info.run_id)
+
+
+def feature_metrics(report: FeatureReport) -> dict[str, float]:
+    """Counts of the run and every column's null share, flat; the GSC share is left out
+    without pairs."""
+    metrics: dict[str, float] = {
+        "pairs": float(report.pairs),
+        "chunks": float(report.chunks),
+        "columns": float(len(report.columns)),
+        "all_null_columns": float(len(report.all_null_columns)),
+        "constant_columns": float(len(report.constant_columns)),
+        "seconds": report.seconds,
+    }
+    if report.has_gsc_data_share is not None:
+        metrics["has_gsc_data_share"] = report.has_gsc_data_share
+    metrics.update({f"null_share_{name}": share for name, share in report.null_share.items()})
+    return metrics
+
+
+def log_features(report: FeatureReport, summary: str) -> str:
+    """Log one feature assembly run with its description and column order, never the matrix;
+    returns the MLflow run id."""
+    mlflow.set_experiment(analytics_experiment(report.tenant_id))
+    with mlflow.start_run(
+        run_name="feature assembly",
+        tags={
+            "tenant_id": report.tenant_id,
+            "kind": "pipeline",
+            "stage": "feature-assembly",
+            "mlflow.note.content": summary,
+        },
+    ) as run:
+        mlflow.log_params(
+            {
+                "cache_key": report.cache_key,
+                "cache_hit": report.cache_hit,
+                "position_bands": ",".join(map(str, POSITION_BANDS)),
+            }
+        )
+        mlflow.log_metrics(feature_metrics(report))
+        mlflow.log_dict(report.model_dump(mode="json"), "report.json")
+        mlflow.log_text(summary, "summary.md")
+        mlflow.log_dict({"feature_columns": list(report.columns)}, "columns.json")
         return str(run.info.run_id)

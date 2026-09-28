@@ -6,8 +6,8 @@ import pytest
 from pymongo import AsyncMongoClient
 
 from linking_engine.ingest.mongo_repo import CrawlSource
-from linking_engine.ingest.prepare import prepare_corpus, prepare_tenant
-from linking_engine.models import CrawlPage
+from linking_engine.ingest.prepare import page_language, prepare_corpus, prepare_tenant
+from linking_engine.models import CrawlPage, LanguageRules
 from linking_engine.urls import UrlRules
 
 if TYPE_CHECKING:
@@ -77,6 +77,35 @@ def test_urls_sharing_a_key_keep_the_200_https_shortest_one() -> None:
     assert len(corpus.merged) == 2
 
 
+def test_a_page_takes_the_language_of_its_longest_matching_prefix() -> None:
+    rules = LanguageRules(
+        default_language="en", prefixes=(("/de/", "de"), ("/de/at/", "de-at"), ("/FR", "fr"))
+    )
+
+    assert page_language("example.com/de", rules) == "de"
+    assert page_language("example.com/de/produkte", rules) == "de"
+    assert page_language("example.com/de/at/produkte", rules) == "de-at"
+    assert page_language("example.com/fr/produits?page=2", rules) == "fr"
+    # Whole segments only, and the root belongs to no prefix.
+    assert page_language("example.com/design", rules) == "en"
+    assert page_language("example.com", rules) == "en"
+    assert page_language("example.com?lang=de", rules) == "en"
+
+
+def test_every_record_gets_a_language_english_without_rules() -> None:
+    plain = prepare_corpus(SITE, source="s")
+    german = prepare_corpus(
+        SITE,
+        source="s",
+        language_rules=LanguageRules(default_language="de", prefixes=(("/a", "fr"),)),
+    )
+
+    assert {r.language for r in plain.records} == {"en"}
+    languages = {str(r.url): r.language for r in german.records}
+    assert languages.pop("example.com/a") == "fr"
+    assert set(languages.values()) == {"de"}
+
+
 @pytest.mark.integration
 async def test_the_stage_reads_the_crawl_applies_tenant_rules_and_writes_only_when_asked(
     mongo: MongoRepo, mongo_uri: str, tenant: str
@@ -106,6 +135,9 @@ async def test_the_stage_reads_the_crawl_applies_tenant_rules_and_writes_only_wh
     await client[source_db]["crawl_pages"].insert_many([*news, *stories])
     await client.close()
     await mongo.set_url_rules(tenant, UrlRules(keep_params=frozenset({"pg"})))
+    await mongo.set_language_rules(
+        tenant, LanguageRules(default_language="fr", prefixes=(("/news", "de"),))
+    )
 
     async with await CrawlSource.connect(mongo_uri, source_db, "crawl_pages") as source:
         _, dry = await prepare_tenant(source, mongo, tenant, source_name="s", write=False)
@@ -122,6 +154,15 @@ async def test_the_stage_reads_the_crawl_applies_tenant_rules_and_writes_only_wh
     assert (report.pages_written, report.links_written) == (7, 2)
     stored = [s async for batch in mongo.iter_page_summaries(tenant) for s in batch]
     assert len(stored) == 7
+    assert {s.url: s.language for s in stored if s.language != "fr"} == {
+        "example.com/news": "de",
+        "example.com/news?pg=2": "de",
+    }
+    # /news is the home of its language prefix, so a root; nothing it links to was crawled.
+    assert (dry.pages_with_depth, report.pages_with_depth) == (1, 1)
+    assert {s.url: s.crawl_depth for s in stored if s.crawl_depth is not None} == {
+        "example.com/news": 0
+    }
 
 
 async def test_the_stage_rejects_a_blank_tenant() -> None:

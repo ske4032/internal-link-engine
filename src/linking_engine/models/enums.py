@@ -55,10 +55,7 @@ class IssueFlag(StrEnum):
 
 
 class LifecycleStage(StrEnum):
-    """How far a page has travelled from publication to settled performance.
-
-    Drives the lifecycle boost and the reserved new-page recommendation slots.
-    """
+    """How far a page has travelled from publication to settled performance."""
 
     NEW = "NEW"
     EMERGING = "EMERGING"
@@ -109,6 +106,15 @@ class ClusterAgreement(StrEnum):
     OTHER_TOPIC_SAME_LINKS = "OTHER_TOPIC_SAME_LINKS"
     OTHER_TOPIC_OTHER_LINKS = "OTHER_TOPIC_OTHER_LINKS"
     UNKNOWN_TOPIC = "UNKNOWN_TOPIC"
+
+
+class KeywordRung(StrEnum):
+    """Which step of the keyword resolution chain chose a page's target keyword."""
+
+    STRATEGIC = "STRATEGIC"
+    GSC = "GSC"
+    H1 = "H1"
+    TITLE = "TITLE"
 
 
 class KeywordSource(StrEnum):

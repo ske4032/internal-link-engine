@@ -4,6 +4,7 @@ Signals are ranker inputs, never gates: a pair with no overlap still goes on, ca
 weak signal. Cluster ids are labels of one run, compared within that run only.
 """
 
+from itertools import pairwise
 from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -18,6 +19,51 @@ class GscQuery(BaseModel):
 
     url: str = Field(min_length=1)
     query: str
+
+
+class GscQueryStats(BaseModel):
+    """One stored GSC query row with its metrics, for the CTR curve and opportunity value."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    url: str = Field(min_length=1)
+    query: str
+    impressions: int = Field(ge=0)
+    clicks: int = Field(default=0, ge=0)
+    position: float = Field(ge=1)
+
+
+class GscMetrics(BaseModel):
+    """A page's GSC totals over the last 28 days."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    url: str = Field(min_length=1)
+    impressions_28d: int = Field(ge=0)
+    clicks_28d: int = Field(ge=0)
+    avg_position: float | None = Field(default=None, ge=1)
+    query_count: int = Field(ge=0)
+
+
+class CtrCurve(BaseModel):
+    """A tenant's expected CTR per integer position 1..len(ctr), from its own GSC data.
+
+    Non-increasing by construction: a lower position never expects a higher CTR.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    ctr: tuple[float, ...] = Field(min_length=1)
+    rows: int = Field(ge=0)
+    impressions: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _non_increasing(self) -> Self:
+        if any(not 0 <= value <= 1 for value in self.ctr):
+            raise ValueError("ctr values are shares in [0, 1]")
+        if any(b > a for a, b in pairwise(self.ctr)):
+            raise ValueError("ctr must not increase with position")
+        return self
 
 
 class StrategicKeyword(BaseModel):

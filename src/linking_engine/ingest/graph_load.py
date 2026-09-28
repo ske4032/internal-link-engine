@@ -33,6 +33,8 @@ async def load_tenant_graph(
                     body_hash=summary.body_hash,
                     menu_inlinks=summary.menu_inlinks,
                     footer_inlinks=summary.footer_inlinks,
+                    language=summary.language,
+                    crawl_depth=summary.crawl_depth,
                 )
                 for summary in summaries
             ],
