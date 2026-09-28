@@ -38,6 +38,7 @@ from linking_engine.ml.ranker_tracking import (
 )
 from linking_engine.ml.ranking import (
     EXCL_PLACEMENT_COLUMNS,
+    LABEL_COLUMN,
     LIKE_FOR_LIKE_COLUMNS,
     MIN_TEST_GROUPS,
     MIN_TRAIN_GROUPS,
@@ -58,6 +59,7 @@ from linking_engine.pipeline.ranker import RANKED_SCHEMA, rank_pairs, train_rank
 from linking_engine.pipeline.ranking_data import load_rounds
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
     from mlflow.entities import Run
@@ -328,7 +330,23 @@ async def test_promotion_gate_rejects_worse_model_and_local_runs_never_move_alia
     assert run_of(tenant, "4").data.tags["promoted"] == "false"
     assert aliases(tenant) == {ALIAS: "3"}, "an equal model took the alias"
 
-    worse = await trained(RankerParams(max_rounds=1, num_leaves=2, min_data_in_leaf=200))
+    # Trained on inverted labels, so it is worse on every platform: a weak but honest model can
+    # tie or beat the holder on a planted tenant, depending on LightGBM's float arithmetic.
+    def inverted(
+        train_frame: pandas.DataFrame,
+        valid_frame: pandas.DataFrame,
+        columns: Sequence[str],
+        params: RankerParams,
+    ) -> Trained:
+        return train(
+            train_frame.assign(**{LABEL_COLUMN: 1 - train_frame[LABEL_COLUMN]}),
+            valid_frame.assign(**{LABEL_COLUMN: 1 - valid_frame[LABEL_COLUMN]}),
+            columns,
+            params,
+        )
+
+    monkeypatch.setattr(ranker, "train", inverted)
+    worse = await trained()
 
     assert worse.promotion is not None
     assert worse.promotion.rival is ScorerName.HOLDER
