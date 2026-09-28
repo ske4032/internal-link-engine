@@ -11,6 +11,7 @@ not fetch it, compute it, or log it.
 """
 
 from linking_engine.models.audit import LinkAuditResult
+from linking_engine.models.bridges import BridgeLink, BridgeReport, HubPair
 from linking_engine.models.candidates import (
     CandidateReport,
     CandidateSet,
@@ -51,6 +52,7 @@ from linking_engine.models.embedding import (
 from linking_engine.models.enums import (
     ActionType,
     AnchorType,
+    BridgeReason,
     ClusterAgreement,
     ContentGapFinding,
     IssueFlag,
@@ -101,6 +103,9 @@ __all__ = [
     "AnchorRules",
     "AnchorType",
     "AnchorTypeProfile",
+    "BridgeLink",
+    "BridgeReason",
+    "BridgeReport",
     "CandidateReport",
     "CandidateSet",
     "CandidateTarget",
@@ -130,6 +135,7 @@ __all__ = [
     "GscQueryStats",
     "Heading",
     "HubCentroid",
+    "HubPair",
     "HubReport",
     "IssueFlag",
     "Keyword",

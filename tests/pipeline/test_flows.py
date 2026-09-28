@@ -4,9 +4,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 from mlflow import MlflowClient
-from mlflow.artifacts import load_dict
+from mlflow.artifacts import load_dict, load_text
 from prefect.states import Failed
 from pymongo import AsyncMongoClient
+from test_bridge_stage import HUB_PAGES
+from test_bridge_stage import seed as seed_bridges
+from test_bridge_stage import url as bridge_url
 from test_embed import DIM, record, seed, seed_plain, url
 from test_embed_links import text_vector
 from test_feature_stage import seed as seed_features
@@ -732,3 +735,40 @@ async def test_score_links_flow_scores_existing_links_and_logs_one_mlflow_run(
     for name in ("context_relevance_hist", "anchor_target_fit_hist"):
         assert len(client.get_metric_history(run_id, name)) == 20, name
     assert "relevance_histogram.json" in {a.path for a in client.list_artifacts(run_id)}
+
+
+@pytest.mark.integration
+async def test_hub_bridges_flow_writes_both_files_and_logs_one_run_without_urls(
+    graph: GraphRepo,
+    mongo: MongoRepo,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    await seed_bridges(graph, tenant, links=[("a0", "b0")])
+
+    report, path, run_id = await flows.hub_bridges_flow(tenant, tmp_path / "bridges")
+
+    assert path == tmp_path / "bridges" / tenant / "bridges.parquet"
+    assert path.with_name("hub_pairs.parquet").is_file()
+    assert report.bridge_links > 0
+    client = MlflowClient(uri)
+    run = client.get_run(run_id)
+    assert (run.data.tags["tenant_id"], run.data.tags["stage"]) == (tenant, "hub-bridges")
+    assert run.data.metrics["bridge_links"] == report.bridge_links
+    stored = load_dict(f"runs:/{run_id}/hub_pairs.json")
+    assert len(stored["data"]) == report.hub_pairs
+    logged = " ".join(
+        [
+            *map(str, run.data.params.values()),
+            *map(str, run.data.tags.values()),
+            str(stored),
+            load_text(f"runs:/{run_id}/report.json"),
+            load_text(f"runs:/{run_id}/summary.md"),
+        ]
+    )
+    pages = [bridge_url(name) for names in HUB_PAGES.values() for name in names]
+    assert [u for u in pages if u in logged] == [], "page urls reached the MLflow run"

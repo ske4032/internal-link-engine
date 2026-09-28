@@ -108,6 +108,17 @@ class ClusterAgreement(StrEnum):
     UNKNOWN_TOPIC = "UNKNOWN_TOPIC"
 
 
+class BridgeReason(StrEnum):
+    """Why a hub pair is proposed a bridge."""
+
+    # An edge of the maximum spanning tree over hub centroid similarity: keeps all hubs connected.
+    SPANNING_TREE = "SPANNING_TREE"
+    # One of a hub's nearest hubs by centroid similarity.
+    NEAREST_HUB = "NEAREST_HUB"
+    # Among the highest bridge-gap pairs: shared topic or demand, few links.
+    BRIDGE_GAP = "BRIDGE_GAP"
+
+
 class KeywordRung(StrEnum):
     """Which step of the keyword resolution chain chose a page's target keyword."""
 

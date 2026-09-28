@@ -16,6 +16,7 @@ import pytest
 from linking_engine.models.enums import (
     ActionType,
     AnchorType,
+    BridgeReason,
     ClusterAgreement,
     ContentGapFinding,
     IssueFlag,
@@ -47,6 +48,7 @@ ENUM_CASES = [
     (PageType, ("PILLAR", "CATEGORY", "PRODUCT", "ARTICLE")),
     (KeywordSource, ("CLIENT_STRATEGIC", "GSC_OBSERVED", "INFERRED")),
     (KeywordRung, ("STRATEGIC", "GSC", "H1", "TITLE")),
+    (BridgeReason, ("SPANNING_TREE", "NEAREST_HUB", "BRIDGE_GAP")),
     (
         ClusterAgreement,
         (

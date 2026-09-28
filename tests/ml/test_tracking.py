@@ -14,13 +14,16 @@ from linking_engine.ml.tracking import (
     EXPERIMENT_KIND_TAG,
     analytics_experiment,
     analytics_metrics,
+    bridge_metrics,
     candidate_metrics,
     candidate_table,
     duplicate_metrics,
     feature_metrics,
+    hub_pair_table,
     keyword_metrics,
     link_relevance_metrics,
     log_analytics,
+    log_bridges,
     log_candidates,
     log_duplicates,
     log_features,
@@ -30,6 +33,8 @@ from linking_engine.ml.tracking import (
     score_metrics,
 )
 from linking_engine.models import (
+    BridgeReason,
+    BridgeReport,
     CandidateReport,
     CandidateSet,
     CentralityReport,
@@ -38,6 +43,7 @@ from linking_engine.models import (
     DuplicateReport,
     FeatureReport,
     FeatureWeight,
+    HubPair,
     HubReport,
     KeywordReport,
     KeywordRung,
@@ -807,3 +813,140 @@ def test_a_duplicate_run_logs_every_group_to_the_tenants_experiment(local_mlflow
         ]
     }
     assert load_text(f"{artifacts}/summary.md") == "Exact duplicate pages of tenant acme."
+
+
+# ── hub bridges ─────────────────────────────────────────────────────────────
+
+TREE, NEAREST, GAP = BridgeReason.SPANNING_TREE, BridgeReason.NEAREST_HUB, BridgeReason.BRIDGE_GAP
+SHARED = ("trail shoes", "waterproof boots")
+
+
+def bridges_report() -> BridgeReport:
+    return BridgeReport(
+        tenant_id="acme",
+        floor_share=0.05,
+        hubs=4,
+        noise_pages=7,
+        hub_pairs=2,
+        components_before=3,
+        components_after=1,
+        directions_below_floor=3,
+        links_needed=5,
+        bridge_links=4,
+        alternatives=6,
+        directions_short=1,
+        by_reason={TREE: 2, NEAREST: 1, GAP: 1},
+        gsc_used=True,
+        seconds=0.75,
+        finished_at=datetime(2026, 9, 28, tzinfo=UTC),
+    )
+
+
+def bridge_pairs() -> list[HubPair]:
+    return [
+        HubPair(
+            language="en",
+            hub_a=0,
+            hub_b=3,
+            size_a=40,
+            size_b=12,
+            pages_ab=1,
+            pages_ba=0,
+            link_density=0.002,
+            centroid_cosine=0.7,
+            query_jaccard=0.25,
+            shared_queries=SHARED,
+            bridge_gap=0.33,
+            reasons=(TREE, GAP),
+        ),
+        HubPair(
+            language=None,
+            hub_a=1,
+            hub_b=2,
+            size_a=5,
+            size_b=6,
+            pages_ab=2,
+            pages_ba=3,
+            link_density=0.1,
+            centroid_cosine=0.2,
+            bridge_gap=-4.8,
+        ),
+    ]
+
+
+def test_bridge_metrics_are_every_count_and_the_pairs_per_reason() -> None:
+    assert bridge_metrics(bridges_report()) == {
+        "hubs": 4,
+        "noise_pages": 7,
+        "hub_pairs": 2,
+        "components_before": 3,
+        "components_after": 1,
+        "directions_below_floor": 3,
+        "links_needed": 5,
+        "bridge_links": 4,
+        "alternatives": 6,
+        "directions_short": 1,
+        "gsc_used": 1,
+        "seconds": 0.75,
+        "pairs_spanning_tree": 2,
+        "pairs_nearest_hub": 1,
+        "pairs_bridge_gap": 1,
+    }
+
+
+def test_the_hub_pair_table_counts_shared_queries_without_naming_them() -> None:
+    found = hub_pair_table(bridge_pairs())
+
+    assert found["hub_a"] == [0, 1]
+    assert found["language"] == ["en", None]
+    assert found["shared_query_count"] == [2, 0]
+    assert found["reasons"] == ["SPANNING_TREE,BRIDGE_GAP", ""]
+    assert found["query_jaccard"] == [0.25, None]
+    assert "shared_queries" not in found
+    cells = " ".join(str(value) for column in found.values() for value in column)
+    assert not [query for query in SHARED if query in cells]
+
+
+def test_a_bridge_run_logs_counts_and_the_pair_table_but_no_queries_or_urls(
+    local_mlflow: str,
+) -> None:
+    report = bridges_report()
+
+    run_id = log_bridges(report, bridge_pairs(), "Hub bridges for tenant acme.")
+
+    client = MlflowClient(local_mlflow)
+    run = client.get_run(run_id)
+    assert client.get_experiment(run.info.experiment_id).name == analytics_experiment("acme")
+    assert (run.info.run_name, run.data.tags["stage"]) == ("hub bridges", "hub-bridges")
+    assert run.data.tags["mlflow.note.content"] == "Hub bridges for tenant acme."
+    assert run.data.params == {
+        "floor_share": "0.05",
+        "nearest_hubs": "2",
+        "top_gap_pairs": "3",
+        "alternatives": "2",
+        "density_weight": "50.0",
+        "relevance_decimals": "2",
+        "cosine_weight": "0.4",
+        "jaccard_weight": "0.6",
+        "shared_queries": "10",
+    }
+    assert run.data.metrics == bridge_metrics(report)
+    assert {a.path for a in client.list_artifacts(run_id)} == {
+        "hub_pairs.json",
+        "report.json",
+        "summary.md",
+    }
+    rows = table(run_id, "hub_pairs.json")
+    assert (rows["hub_a"], rows["hub_b"], rows["shared_query_count"]) == ([0, 1], [3, 2], [2, 0])
+    assert load_dict(f"runs:/{run_id}/report.json") == report.model_dump(mode="json")
+    logged = " ".join(
+        [
+            *map(str, run.data.params.values()),
+            *map(str, run.data.tags.values()),
+            *run.data.metrics,
+            *(str(v) for column in rows.values() for v in column),
+            load_text(f"runs:/{run_id}/report.json"),
+            load_text(f"runs:/{run_id}/summary.md"),
+        ]
+    )
+    assert not [query for query in SHARED if query in logged], "shared queries leaked into the run"
