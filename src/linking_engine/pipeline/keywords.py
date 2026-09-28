@@ -144,12 +144,12 @@ async def resolve_tenant_keywords(
     # Brand affixes and template fallbacks come from every page, so they are found before
     # any page is resolved.
     titles: list[str | None] = []
-    fallbacks: list[tuple[str, ...]] = []
+    fallbacks: list[tuple[tuple[str, ...], str]] = []
     async for batch in mongo.iter_page_records(tenant_id):
         for page in batch:
             if _resolvable(page):
                 titles.append(page.meta_title)
-                fallbacks.append(fallback_texts(page))
+                fallbacks.append((fallback_texts(page), page.body_hash))
     prefix, suffix = brand_affixes(titles)
     repeated = repeated_fallbacks(fallbacks, suffix, prefix)
     del titles, fallbacks
