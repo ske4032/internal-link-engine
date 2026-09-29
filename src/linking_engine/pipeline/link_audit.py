@@ -56,6 +56,10 @@ if TYPE_CHECKING:
 log = structlog.get_logger(__name__)
 
 STAGE: Final = "link-audit"
+# The roadmap bands of the fixable-link rate: below the first, discovery is the product and the
+# audit a feature; above the second, the audit is the product.
+FIXABLE_FEATURE: Final = 0.10
+FIXABLE_PRODUCT: Final = 0.30
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,6 +363,27 @@ def _describe(name: str, found: ScoreDistribution | None, scale: float = 1.0) ->
     )
 
 
+def fixable_band(rate: float) -> str:
+    """The roadmap band a fixable-link rate falls in."""
+    if rate < FIXABLE_FEATURE:
+        return f"below {FIXABLE_FEATURE:.0%}: the audit is a feature, discovery is the product"
+    if rate > FIXABLE_PRODUCT:
+        return f"above {FIXABLE_PRODUCT:.0%}: the audit is the product"
+    return f"{FIXABLE_FEATURE:.0%}-{FIXABLE_PRODUCT:.0%}: both the audit and discovery matter"
+
+
+def _fixable(report: LinkAuditReport) -> str:
+    rates = [
+        f"{rate:.1%} of {label} ({fixable_band(rate)})"
+        for label, rate in (
+            ("all audited links", report.fixable_rate),
+            ("the links into crawled pages", report.verified_fixable_rate),
+        )
+        if rate is not None
+    ]
+    return f"Fixable-link rate: {'; '.join(rates) if rates else 'no audited links'}."
+
+
 def summarise_link_audit(report: LinkAuditReport) -> str:
     """A short prose record of one audit run, for the MLflow run description; no urls."""
     counts = ", ".join(f"{flag.value} {n}" for flag, n in sorted(report.by_flag.items())) or "none"
@@ -389,6 +414,7 @@ def summarise_link_audit(report: LinkAuditReport) -> str:
                 else "."
             ),
             f"Flags: {counts}. Verdicts: {verdicts}.",
+            _fixable(report),
             f"{report.index_like_pages} index-like source pages, whose links are never removed. "
             f"{report.listing_pages} listing pages above the link density fence, whose links "
             "are never reanchored or removed.",

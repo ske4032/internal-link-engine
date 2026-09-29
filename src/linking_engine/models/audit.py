@@ -202,6 +202,18 @@ class LinkAuditReport(BaseModel):
     seconds: float = Field(ge=0)
     finished_at: datetime
 
+    @property
+    def fixable_rate(self) -> float | None:
+        """Links with a verdict over every audited link; None without links."""
+        return sum(self.by_verdict.values()) / self.links if self.links else None
+
+    @property
+    def verified_fixable_rate(self) -> float | None:
+        """Links with a verdict over the links into a crawled page, the only ones the audit
+        can judge; None without such links."""
+        verified = self.links - self.unverified
+        return sum(self.by_verdict.values()) / verified if verified else None
+
     @model_validator(mode="after")
     def _consistent(self) -> Self:
         if set(self.by_verdict) - AUDIT_VERDICTS:

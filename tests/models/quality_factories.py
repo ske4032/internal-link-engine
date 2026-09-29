@@ -24,6 +24,7 @@ from linking_engine.models import (
     RetrievalCheck,
     ScoreDistribution,
     ScorerCheck,
+    SourceExtractability,
 )
 
 if TYPE_CHECKING:
@@ -102,6 +103,17 @@ def scorer(**fields: object) -> ScorerCheck:
     return ScorerCheck.model_validate(values)
 
 
+def source(**fields: object) -> SourceExtractability:
+    values: dict[str, object] = {
+        "pairs": 4,
+        "found_primary": 0.25,
+        "found_set": 0.5,
+        "words_primary": 0.5,
+        **fields,
+    }
+    return SourceExtractability.model_validate(values)
+
+
 def extractability(**fields: object) -> KeywordExtractability:
     values: dict[str, object] = {
         "pairs": 8,
@@ -113,6 +125,13 @@ def extractability(**fields: object) -> KeywordExtractability:
         "words_primary": 0.5,
         "words_set": 0.75,
         "stem_set_threshold": 0.6,
+        # Two of the eight pairs have a target that resolved no keyword.
+        "by_source": {
+            KeywordRung.H1: source(),
+            KeywordRung.STRATEGIC: source(
+                pairs=2, found_primary=0.5, found_set=1.0, words_primary=1.0
+            ),
+        },
         **fields,
     }
     return KeywordExtractability.model_validate(values)

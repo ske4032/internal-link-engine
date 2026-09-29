@@ -146,3 +146,33 @@ def test_a_non_canonical_copy_cannot_be_its_own_canonical_page() -> None:
             anchor_text="dry sack",
             target_canonical_url="example.com/copy",
         )
+
+
+# A report with no audited links, and one whose every link points at an uncrawled page.
+NO_LINKS: dict[str, object] = {
+    "links": 0,
+    "unverified": 0,
+    "healthy": 0,
+    "by_verdict": {},
+    "proposals": 0,
+    "keyword_cosines": 0,
+}
+ALL_UNVERIFIED = {**NO_LINKS, "links": 2, "unverified": 2}
+
+
+@pytest.mark.parametrize(
+    ("fields", "rates"),
+    [
+        ({}, (2 / 4, 2 / 3)),
+        ({"healthy": 3, "by_verdict": {}, "proposals": 0}, (0.0, 0.0)),
+        (ALL_UNVERIFIED, (0.0, None)),
+        (NO_LINKS, (None, None)),
+    ],
+    ids=["verdicts", "no-verdicts", "all-unverified", "no-links"],
+)
+def test_the_fixable_rates_are_verdicts_over_all_links_and_over_verified_links(
+    fields: dict[str, object], rates: tuple[float | None, float | None]
+) -> None:
+    audited = report(**fields)
+
+    assert (audited.fixable_rate, audited.verified_fixable_rate) == rates

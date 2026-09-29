@@ -187,6 +187,23 @@ class ScorerCheck(BaseModel):
         return self
 
 
+class SourceExtractability(BaseModel):
+    """Extractability over the pairs whose target's primary keyword came from one rung."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    pairs: int = Field(ge=1)
+    found_primary: float = Field(ge=0, le=1)
+    found_set: float = Field(ge=0, le=1)
+    words_primary: float = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Self:
+        if self.found_primary > self.found_set:
+            raise ValueError("the primary keyword cannot match more pairs than its set")
+        return self
+
+
 class KeywordExtractability(BaseModel):
     """Candidate pairs whose source copy carries the target's keyword as the extraction ladder
     finds it, existing anchors aside: the primary keyword against any of its ranked set."""
@@ -206,9 +223,14 @@ class KeywordExtractability(BaseModel):
     words_primary: float = Field(ge=0, le=1)
     words_set: float = Field(ge=0, le=1)
     stem_set_threshold: float = Field(gt=0, le=1)
+    # The same by the rung the target's primary keyword was resolved at; pairs whose target
+    # resolved none are counted above only.
+    by_source: dict[KeywordRung, SourceExtractability] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
+        if sum(part.pairs for part in self.by_source.values()) > self.pairs:
+            raise ValueError("the sources cannot hold more pairs than the whole")
         if self.found_primary > self.found_set or self.words_primary > self.words_set:
             raise ValueError("the primary keyword cannot match more pairs than its set")
         rungs = self.exact_set + self.stemmed_set + self.stem_set_set
