@@ -786,6 +786,42 @@ def test_no_cap_keeps_the_full_guarantee() -> None:
     assert (out.summary.orphan_slots, out.summary.pages_at_cap) == (3, 0)
 
 
+def test_the_summary_states_the_guarantee_held_to_the_cap() -> None:
+    a, t = url("a"), url("t")
+    out = run(
+        make_inputs(
+            {(a, t): 1.0}, choices=[choice(a, t, "dome tent")], pages=(page("a"), page("t"))
+        )
+    )[1]
+    report = RecommendationReport(
+        tenant_id=TENANT,
+        run_id="run-1",
+        scorer=ScorerName.BASELINE,
+        limit_per_source=10,
+        content_gap_limit=3,
+        words_per_link=200,
+        guaranteed_inbound_links=3,
+        guaranteed_inbound_below=1,
+        max_suggested_inbound=2,
+        summary=out.summary,
+        pairs_not_assessed=0,
+        seconds=1.5,
+        finished_at=AT,
+    )
+
+    def text(links: int, cap: int) -> str:
+        return summarise_recommendations(
+            report.model_copy(
+                update={"guaranteed_inbound_links": links, "max_suggested_inbound": cap}
+            )
+        )
+
+    assert "guaranteed 2 (set 3, held to the cap of 2):" in text(3, 2)
+    assert "guaranteed 2:" in text(2, 5)
+    assert "held to the cap" not in text(2, 5)
+    assert "guaranteed 3:" in text(3, 0)
+
+
 def test_a_slot_can_come_from_beyond_the_sources_first_links() -> None:
     s, o = url("s"), url("o")
     x = [url(f"x{i}") for i in range(3)]

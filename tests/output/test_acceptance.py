@@ -121,6 +121,7 @@ from linking_engine.pipeline.bridges import BRIDGES_FILE, HUB_PAIRS_FILE
 from linking_engine.pipeline.features import ANCHOR_CHOICES_FILE
 from linking_engine.pipeline.ranker import RANKED_PAIRS_FILE
 from linking_engine.pipeline.recommendations import (
+    effective_guarantee,
     publish_recommendations,
     summarise_recommendations,
 )
@@ -416,7 +417,9 @@ async def test_orphans_endpoint_serves_rescue_with_reasons(
 
     for rescue in rescues:
         url = rescue.profile.url
-        assert rescue.guaranteed == a.run.guaranteed_inbound_links
+        assert rescue.guaranteed == effective_guarantee(
+            a.run.guaranteed_inbound_links, a.run.max_suggested_inbound
+        )
         assert rescue.suggested_in == len(suggested_into[url]), url
         assert (rescue.unmet_reason is None) == (rescue.suggested_in >= rescue.guaranteed), url
         assert list(rescue.sources) == sorted(
