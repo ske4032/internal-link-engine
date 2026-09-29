@@ -310,6 +310,14 @@ SET p.pageRank = row.pageRank,
     p.betweennessPercentile = row.betweennessPercentile
 RETURN count(p) AS n
 """
+# A page kept out of the pipeline leaves the graph with its edges; a link into it recreates it as
+# a placeholder, like any page that was not crawled.
+_DELETE_PAGES: Final = """
+MATCH (p:Page {tenantId: $tenant})
+WHERE p.url IN $urls
+DETACH DELETE p
+RETURN count(*) AS n
+"""
 # A page that was crawled before and is now only a link target keeps no stale scores.
 _CLEAR_PLACEHOLDER_CENTRALITY: Final = """
 MATCH (p:Page {tenantId: $tenant, isPlaceholder: true})
@@ -846,6 +854,16 @@ class GraphRepo:
             ]
             written += await self._write_all(_UPSERT_PAGES, len(rows), tenant=tenant_id, rows=rows)
         return written
+
+    async def delete_pages(
+        self, tenant_id: str, urls: Sequence[str], *, batch_size: int = PAGE_BATCH
+    ) -> int:
+        """Delete these pages of the tenant with every edge they have. Returns the count."""
+        _require_tenant(tenant_id)
+        deleted = 0
+        for chunk in batched([normalise_url(url) for url in urls], batch_size):
+            deleted += _int(await self._write(_DELETE_PAGES, tenant=tenant_id, urls=list(chunk)))
+        return deleted
 
     async def upsert_placeholders(
         self, tenant_id: str, urls: Sequence[str], *, batch_size: int = PAGE_BATCH

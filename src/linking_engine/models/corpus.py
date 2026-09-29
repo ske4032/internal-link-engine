@@ -6,11 +6,13 @@ preparation extracts every link while it strips the markup, and the clean body
 keeps the anchor words in place.
 """
 
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Literal
+from typing import Final, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, HttpUrl
 
+from linking_engine.models.enums import ExclusionReason
 from linking_engine.urls import UrlKey
 
 
@@ -152,6 +154,28 @@ class LinkRecord(BaseModel):
     is_internal: bool
 
 
+# The plain label an excluded page carries, for whoever reviews the tenant's pages.
+EXCLUSION_LABELS: Final[Mapping[ExclusionReason, str]] = {
+    ExclusionReason.SITEMAP: "sitemap page, not evaluated",
+    ExclusionReason.TENANT_EXCLUDED: "excluded by the tenant's settings",
+    ExclusionReason.INSUFFICIENT_CONTENT: "insufficient content: mostly links, please review",
+}
+
+
+class ExcludedPage(BaseModel):
+    """A crawled page kept out of the pipeline, with why; ``excluded_pages`` document."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    url: UrlKey
+    reason: ExclusionReason
+    label: str = Field(min_length=1)
+    words: int = Field(ge=0)
+    # Words inside the page's body links.
+    link_words: int = Field(ge=0)
+    links: int = Field(ge=0)
+
+
 class PrepareReport(BaseModel):
     """Outcome of preparing one tenant's crawl; the written counts are 0 on a dry run."""
 
@@ -176,6 +200,8 @@ class PrepareReport(BaseModel):
     stale_links_deleted: int = Field(ge=0)
     # Pages the crawl-depth BFS reached from the roots; a low share means the roots link nowhere.
     pages_with_depth: int = Field(default=0, ge=0)
+    # Pages kept out of the pipeline, by reason.
+    excluded: dict[ExclusionReason, int] = Field(default_factory=dict)
     finished_at: AwareDatetime
 
 
@@ -188,6 +214,8 @@ class GraphLoadReport(BaseModel):
     external_links_skipped: int = Field(ge=0)
     self_links_skipped: int = Field(ge=0)
     stale_links_deleted: int = Field(ge=0)
+    # Nodes of pages kept out of the pipeline, removed before loading.
+    excluded_pages_removed: int = Field(default=0, ge=0)
     finished_at: datetime
 
 

@@ -56,7 +56,6 @@ from linking_engine.audit.links import (
     MIN_IQR,
     OVER_OPTIMISED_MIN,
     OVER_OPTIMISED_SHARE,
-    PAGINATION_PARAMS,
 )
 from linking_engine.audit.relevance import MIN_MODE_GAP, MIN_SPLIT_SCORES, SPLIT_SEED
 from linking_engine.discovery.bridges import (
@@ -103,6 +102,7 @@ from linking_engine.models.anchors import SENTENCE_INDEX_BINS, UNANCHORED_ADVICE
 from linking_engine.models.audit import AUDIT_VERDICTS
 from linking_engine.models.relevance import HISTOGRAM_BINS
 from linking_engine.models.scoring import SCORE_HISTOGRAM_BINS
+from linking_engine.urls import PAGINATION_PARAMS
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
