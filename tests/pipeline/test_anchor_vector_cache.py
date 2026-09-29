@@ -117,7 +117,12 @@ def digest(path: Path) -> str:
 
 
 def leftovers(cache_dir: Path) -> list[str]:
-    return sorted(p.name for p in cache_dir.rglob("*") if p.is_file() and p.suffix != ".parquet")
+    # The tenant's lock file stays by design; anything else is a temp file left behind.
+    return sorted(
+        p.name
+        for p in cache_dir.rglob("*")
+        if p.is_file() and p.suffix != ".parquet" and p.name != ".lock"
+    )
 
 
 @pytest.mark.parametrize("kind", KINDS)

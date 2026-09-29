@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from functools import partial
 from pathlib import Path  # noqa: TC003 - Prefect validates flow parameters at runtime
 from typing import TYPE_CHECKING, Any
 
@@ -41,6 +42,7 @@ from linking_engine.ml.tracking import (
     log_keywords,
     log_link_audit,
     log_link_relevance,
+    log_pipeline,
     log_quality,
     log_recommendations,
     log_scores,
@@ -63,6 +65,7 @@ from linking_engine.models import (
     LinkAuditReport,
     LinkEmbedReport,
     LinkRelevanceReport,
+    PipelineReport,
     PrepareReport,
     QualityBaseline,
     QualityReport,
@@ -99,9 +102,16 @@ from linking_engine.pipeline.recommendations import (
     summarise_recommendations,
 )
 from linking_engine.pipeline.scoring import score_pairs
+from linking_engine.pipeline.tenant_pipeline import (
+    StoredOutputs,
+    run_pipeline,
+    summarise_pipeline,
+)
 
 if TYPE_CHECKING:
     from prefect.client.schemas.objects import State
+
+    from linking_engine.pipeline.tenant_pipeline import Runner
 
 
 async def neo4j() -> GraphRepo:
@@ -1119,3 +1129,83 @@ async def recommendations_flow(
         mlflow_run,
     )
     return report, mlflow_run
+
+
+@task(name="mlflow-log-pipeline", cache_policy=NONE)
+def log_pipeline_task(report: PipelineReport) -> str:
+    return log_pipeline(report, summarise_pipeline(report))
+
+
+def stage_runners(
+    tenant_id: str, source_db: str | None, source_collection: str | None, cache_dir: Path
+) -> dict[str, Runner]:
+    """Every stage flow of the tenant; prepare-corpus only with a crawl source."""
+    runners: dict[str, Runner] = {
+        "load-graph": partial(load_graph_flow, tenant_id),
+        "embed-pages": partial(embed_pages_flow, tenant_id),
+        "embed-links": partial(embed_links_flow, tenant_id),
+        "resolve-keywords": partial(resolve_keywords_flow, tenant_id),
+        "graph-analytics": partial(graph_analytics_flow, tenant_id),
+        "score-links": partial(score_links_flow, tenant_id),
+        "hub-bridges": partial(hub_bridges_flow, tenant_id, cache_dir),
+        "quality-eval": partial(quality_eval_flow, tenant_id, cache_dir),
+        "candidate-retrieval": partial(candidate_retrieval_flow, tenant_id),
+        "anchor-selection": partial(anchor_selection_flow, tenant_id, cache_dir),
+        "anchor-extraction": partial(anchor_extraction_flow, tenant_id, cache_dir),
+        "train-ranker": partial(train_ranker_flow, tenant_id, cache_dir=cache_dir),
+        "rank-pairs": partial(rank_pairs_flow, tenant_id, cache_dir),
+        "link-audit": partial(link_audit_flow, tenant_id, cache_dir),
+        "feature-assembly": partial(feature_assembly_flow, tenant_id, cache_dir),
+        "score-pairs": partial(score_pairs_flow, tenant_id, cache_dir),
+        "recommendations": partial(recommendations_flow, tenant_id, cache_dir),
+    }
+    if source_db is not None and source_collection is not None:
+        runners["prepare-corpus"] = partial(
+            prepare_corpus_flow, tenant_id, source_db, source_collection
+        )
+    return runners
+
+
+@flow(name="tenant-pipeline")
+async def tenant_pipeline_flow(
+    tenant_id: str,
+    source_db: str | None = None,
+    source_collection: str | None = None,
+    *,
+    retrain: bool = False,
+    from_stage: str | None = None,
+    reports: bool = False,
+    cache_dir: Path = CACHE_DIR,
+) -> PipelineReport:
+    """Every stage flow of the tenant, each started once the stages it needs have finished and
+    independent ones side by side: the core stages, the reports with ``reports`` and
+    train-ranker with ``retrain``; with ``from_stage`` only that stage and those after it, once
+    the stored outputs before it are found. The run is logged to MLflow before a failure is
+    raised."""
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
+        logger.info(
+            "pipeline of tenant %s from %s; retrain %s, reports %s",
+            tenant_id,
+            from_stage or "the first stage",
+            retrain,
+            reports,
+        )
+        report = await run_pipeline(
+            tenant_id,
+            stage_runners(tenant_id, source_db, source_collection, cache_dir),
+            StoredOutputs(tenant_id, cache_dir, neo4j, mongo),
+            log_pipeline_task,
+            cache_dir=cache_dir,
+            retrain=retrain,
+            from_stage=from_stage,
+            reports=reports,
+            pipeline_run_id=flow_run.root_flow_run_id,
+        )
+    logger.info(
+        "%d stages finished in %.1fs: %s",
+        len(report.stages),
+        report.seconds,
+        ", ".join(f"{r.stage} {r.seconds:.1f}s" for r in report.stages if r.seconds is not None),
+    )
+    return report

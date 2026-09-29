@@ -269,3 +269,45 @@ async def test_a_slow_first_request_is_awaited_without_polling_the_finished_ones
 
     assert [e.url for e in embedded] == [page(i, 5).url for i in range(3)]
     assert 1 <= wakeups <= 3, f"{wakeups} wake-ups for three requests"
+
+
+# ── one budget per API key ──────────────────────────────────────────────────
+
+
+async def test_two_clients_of_one_key_are_paced_as_one(clock: FakeClock) -> None:
+    """Two stages embedding at once: 40 tokens a request against 100 a minute, whichever client
+    sends it, so two requests start per minute between them."""
+    sdk = ScriptedVoyage(clock=clock)
+    first, second = (voyage(sdk, max_concurrent_requests=8, tokens_per_minute=100) for _ in "ab")
+
+    await asyncio.gather(
+        first.embed([page(i, 40) for i in range(4)]),
+        second.embed([page(i, 40) for i in range(4, 8)]),
+    )
+
+    assert sorted(start for _, start in sdk.started) == [60.0 * (i // 2) for i in range(8)]
+
+
+async def test_two_clients_of_one_key_share_the_requests_in_flight() -> None:
+    sdk = ScriptedVoyage(delays=dict.fromkeys(range(12), 0.02))
+    first, second = (voyage(sdk, max_concurrent_requests=3) for _ in "ab")
+
+    await asyncio.gather(
+        first.embed([page(i, 5) for i in range(6)]),
+        second.embed([page(i, 5) for i in range(6, 12)]),
+    )
+
+    assert sdk.most_in_flight == 3
+
+
+async def test_a_client_of_another_key_has_its_own_budget(clock: FakeClock) -> None:
+    sdk = ScriptedVoyage(clock=clock)
+    mine = voyage(sdk, tokens_per_minute=100)
+    other = voyage(sdk, api_key="other", tokens_per_minute=100)
+
+    await asyncio.gather(
+        mine.embed([page(i, 40) for i in range(2)]),
+        other.embed([page(i, 40) for i in range(2, 4)]),
+    )
+
+    assert [start for _, start in sdk.started] == [0.0] * 4

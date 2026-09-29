@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from neo4j.exceptions import TransientError
 
 from linking_engine.errors import (
     DatabaseAuthError,
@@ -13,6 +14,7 @@ from linking_engine.graph.repo import (
     PAGE_PROPERTIES,
     VECTOR_INDEXES,
     GraphRepo,
+    _translate,
     load_migrations,
     split_statements,
     status_issue,
@@ -60,6 +62,17 @@ def test_migrations_are_packaged_in_filename_order() -> None:
     assert names == sorted(names)
     assert names[:3] == ["001_schema.cypher", "002_vectors.cypher", "003_status_code.cypher"]
     assert all(m.statements for m in load_migrations())
+
+
+@pytest.mark.parametrize("write", [True, False])
+def test_a_deadlock_that_outlasts_the_drivers_retries_is_retried_as_an_outage(write: bool) -> None:
+    """The driver retries a TransientError inside a managed transaction; one it still raises
+    after its retry window must reach the stage as unavailable, which the stage retries, not as
+    a failed write."""
+    found = _translate(TransientError("deadlock detected"), write=write)
+
+    assert type(found) is DatabaseUnavailableError
+    assert "deadlock detected" in str(found)
 
 
 async def test_unreachable_server_raises_unavailable() -> None:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections import Counter
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
@@ -11,6 +13,8 @@ from link_audit_seed import PAGES as AUDIT_PAGES
 from link_audit_seed import seed_link_audit
 from mlflow import MlflowClient
 from mlflow.artifacts import load_dict, load_text
+from prefect import flow
+from prefect.runtime import flow_run
 from prefect.states import Failed
 from pydantic import ValidationError
 from pymongo import AsyncMongoClient
@@ -44,17 +48,28 @@ from linking_engine.errors import (
     EmbeddingRequestError,
     EmbeddingUnavailableError,
 )
-from linking_engine.models import DuplicateGroup, HeldOutSettings, Link, LinkRecord, Page
+from linking_engine.models import (
+    DuplicateGroup,
+    HeldOutSettings,
+    Link,
+    LinkRecord,
+    Page,
+    StageStatus,
+)
 from linking_engine.pipeline import flows, recommendations
 from linking_engine.pipeline.duplicates import summarise_duplicates
+from linking_engine.pipeline.tenant_pipeline import NEEDS, REPORT_STAGES, PipelineFailedError
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
+    from mlflow.entities import Run
+
     from linking_engine.graph.repo import GraphRepo
     from linking_engine.ingest.mongo_repo import MongoRepo
     from linking_engine.models import CandidateSet
+    from linking_engine.pipeline.tenant_pipeline import Runner
 
 
 @pytest.fixture(scope="session")
@@ -1145,3 +1160,178 @@ async def test_recommendations_flow_publishes_the_output_and_logs_one_run_withou
     words = {word.strip(".,;:()") for word in load_text(f"runs:/{run_id}/summary.md").split()}
     logged = {*run.data.tags.values(), *run.data.params.values(), *run.data.metrics, *words}
     assert not logged & {A, S, T, U}
+
+
+CORE_STAGES = [stage for stage in NEEDS if stage not in REPORT_STAGES and stage != "train-ranker"]
+SOURCE = ("crawls", "crawl_pages")
+
+
+class PipelineStages:
+    """Fake stage flows and stored outputs of one tenant. Each stage is a Prefect flow that
+    records when it starts and ends and the flow runs it sees, then fails or writes the files
+    recommendations reads; link-audit completes an audit."""
+
+    def __init__(
+        self, folder: Path, *, failing: str | None = None, until_failed: tuple[str, ...] = ()
+    ) -> None:
+        self.folder = folder
+        self.folder.mkdir(parents=True)
+        self.failing = failing
+        # Stages that finish only once the failing stage's flow run has failed; it fails once
+        # they have started.
+        self.until_failed = until_failed
+        self.begun = {stage: asyncio.Event() for stage in NEEDS}
+        self.failed = asyncio.Event()
+        self.events: list[tuple[str, str]] = []
+        # Each stage's own flow run id and its root flow run id.
+        self.runs: dict[str, tuple[str, str]] = {}
+        self.audit_at: datetime | None = None
+
+    def runners(
+        self, _tenant: str, source_db: str | None, source_collection: str | None, _cache: Path
+    ) -> dict[str, Runner]:
+        source = source_db is not None and source_collection is not None
+        return {
+            stage: self.stage_flow(stage) for stage in NEEDS if source or stage != "prepare-corpus"
+        }
+
+    def stage_flow(self, stage: str) -> Runner:
+        @flow(name=f"fake-{stage}")
+        async def run() -> str:
+            self.events.append(("start", stage))
+            self.runs[stage] = (str(flow_run.id), str(flow_run.root_flow_run_id))
+            self.begun[stage].set()
+            await asyncio.sleep(0.01)
+            if stage in self.until_failed:
+                await asyncio.wait_for(self.failed.wait(), timeout=30)
+            if stage == self.failing:
+                begun = (self.begun[s].wait() for s in self.until_failed)
+                await asyncio.wait_for(asyncio.gather(*begun), timeout=30)
+            self.events.append(("end", stage))
+            if stage == self.failing:
+                raise RuntimeError(f"{stage} broke")
+            for name, writer in recommendations.REQUIRED_FILES:
+                if writer == stage:
+                    (self.folder / name).write_bytes(b"")
+            if stage == "link-audit":
+                self.audit_at = datetime.now(UTC)
+            return stage
+
+        # The waiting stages are released once the failed flow run has returned, so the
+        # scheduler holds the failure before they finish.
+        async def runner() -> str:
+            try:
+                return await run()
+            finally:
+                if stage == self.failing:
+                    self.failed.set()
+
+        return runner
+
+    async def audit_completed(self) -> datetime | None:
+        return self.audit_at
+
+    def at(self, kind: str, stage: str) -> int:
+        return self.events.index((kind, stage))
+
+
+@pytest.fixture
+def pipeline_mlflow(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, prefect_api: None
+) -> MlflowClient:
+    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    return MlflowClient(uri)
+
+
+def fake_stages(
+    monkeypatch: pytest.MonkeyPatch,
+    cache: Path,
+    tenant: str,
+    *,
+    failing: str | None = None,
+    until_failed: tuple[str, ...] = (),
+) -> PipelineStages:
+    stages = PipelineStages(cache / tenant, failing=failing, until_failed=until_failed)
+    monkeypatch.setattr(flows, "stage_runners", stages.runners)
+    monkeypatch.setattr(flows, "StoredOutputs", lambda *_: stages)
+    return stages
+
+
+def pipeline_run(client: MlflowClient, tenant: str) -> Run:
+    experiment = client.get_experiment_by_name(f"analytics-{tenant}")
+    assert experiment is not None
+    [run] = client.search_runs([experiment.experiment_id], "tags.kind = 'pipeline'")
+    return run
+
+
+async def test_the_tenant_pipeline_flow_runs_every_planned_stage_as_a_subflow_in_dependency_order(
+    tenant: str, pipeline_mlflow: MlflowClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cache = tmp_path / "cache"
+    stages = fake_stages(monkeypatch, cache, tenant)
+
+    report = await flows.tenant_pipeline_flow(tenant, *SOURCE, cache_dir=cache)
+
+    assert {r.stage: r.status for r in report.stages} == dict.fromkeys(CORE_STAGES, StageStatus.OK)
+    own_runs = {own for own, _ in stages.runs.values()} - {report.pipeline_run_id}
+    assert len(own_runs) == len(CORE_STAGES), "every stage runs as a flow run of its own"
+    for stage in CORE_STAGES:
+        for needed in (n for n in NEEDS[stage] if n in CORE_STAGES):
+            assert stages.at("end", needed) < stages.at("start", stage), (
+                f"{stage} started before {needed} finished"
+            )
+    assert pipeline_run(pipeline_mlflow, tenant).data.tags["status"] == "ok"
+
+
+async def test_a_failing_stage_fails_the_flow_and_stops_its_dependants(
+    tenant: str, pipeline_mlflow: MlflowClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cache = tmp_path / "cache"
+    # embed-links breaks while embed-pages and resolve-keywords, started beside it, still run.
+    running = ("embed-pages", "resolve-keywords")
+    stages = fake_stages(monkeypatch, cache, tenant, failing="embed-links", until_failed=running)
+
+    state = await flows.tenant_pipeline_flow(tenant, *SOURCE, cache_dir=cache, return_state=True)
+
+    assert state.is_failed()
+    with pytest.raises(PipelineFailedError) as failed:
+        await state.result()
+    assert failed.value.failed == ("embed-links",)
+    for stage in running:
+        assert stages.at("start", stage) < stages.at("end", "embed-links") < stages.at("end", stage)
+    # Everything that reads embed-links' vectors, directly or through score-links, is skipped;
+    # the stages whose inputs finished are not started after the failure.
+    skipped = ("score-links", "quality-eval", "anchor-selection", "link-audit", "rank-pairs")
+    expected = {
+        **dict.fromkeys(CORE_STAGES, StageStatus.NOT_RUN),
+        **dict.fromkeys(("prepare-corpus", "load-graph", *running), StageStatus.OK),
+        "embed-links": StageStatus.FAILED,
+        **dict.fromkeys((*skipped, "recommendations"), StageStatus.SKIPPED),
+    }
+    assert sorted(stages.runs) == sorted(("prepare-corpus", "load-graph", "embed-links", *running))
+    run = pipeline_run(pipeline_mlflow, tenant)
+    assert run.data.tags["status"] == "failed"
+    logged = load_dict(f"runs:/{run.info.run_id}/stages.json")
+    assert {stage: record["status"] for stage, record in logged.items()} == {
+        stage: status.value for stage, status in expected.items()
+    }
+    assert logged["embed-links"]["error"] == "RuntimeError"
+
+
+async def test_stage_subflows_share_the_pipelines_root_run_id(
+    tenant: str, pipeline_mlflow: MlflowClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cache = tmp_path / "cache"
+    stages = fake_stages(monkeypatch, cache, tenant)
+
+    state = await flows.tenant_pipeline_flow(tenant, *SOURCE, cache_dir=cache, return_state=True)
+
+    pipeline = str(state.state_details.flow_run_id)
+    report = await state.result()
+    assert sorted(stages.runs) == sorted(CORE_STAGES)
+    assert {stage: root for stage, (_, root) in stages.runs.items()} == dict.fromkeys(
+        CORE_STAGES, pipeline
+    )
+    assert report.pipeline_run_id == pipeline
+    assert pipeline_run(pipeline_mlflow, tenant).data.tags["pipeline_run_id"] == pipeline

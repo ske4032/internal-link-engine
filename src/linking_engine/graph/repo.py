@@ -18,6 +18,7 @@ from neo4j.exceptions import (
     Neo4jError,
     ServiceUnavailable,
     SessionExpired,
+    TransientError,
 )
 from pydantic import AnyUrl, ValidationError
 
@@ -590,6 +591,19 @@ RETURN s.url AS source_url, r.position AS position, t.url AS target_url,
        r.contextRelevance AS context_relevance, r.anchorTargetFit AS anchor_target_fit,
        coalesce(r.anchorGeneric, false) AS anchor_generic
 ORDER BY source_url, position
+"""
+# Existence only: the scan stops at the first match.
+_HAS_LINK_RELEVANCE: Final = """
+MATCH (:Page {tenantId: $tenant})-[r:LINKS_TO]->(:Page {tenantId: $tenant})
+WHERE r.contextRelevance IS NOT NULL
+RETURN true AS found
+LIMIT 1
+"""
+_HAS_CENTRALITY: Final = """
+MATCH (p:Page {tenantId: $tenant})
+WHERE p.pageRankPercentile IS NOT NULL
+RETURN true AS found
+LIMIT 1
 """
 _AUDIT_CANONICALS: Final = """
 MATCH (p:Page {tenantId: $tenant})
@@ -1481,6 +1495,11 @@ class GraphRepo:
         except ValidationError as error:
             raise DatabaseReadError("neo4j", f"page structure of {tenant_id!r}: {error}") from error
 
+    async def has_centrality(self, tenant_id: str) -> bool:
+        """Whether any page of the tenant has a stored PageRank percentile."""
+        _require_tenant(tenant_id)
+        return bool(await self._read(_HAS_CENTRALITY, tenant=tenant_id))
+
     async def page_facts(self, tenant_id: str) -> list[PageFacts]:
         """Every crawled page's language, type, size, body link counts, depth, rank, hub,
         orphan, dead-end and duplicate state, ordered by url."""
@@ -1521,6 +1540,11 @@ class GraphRepo:
             return [LinkRelevance.model_validate(row) for row in rows]
         except ValidationError as error:
             raise DatabaseReadError("neo4j", f"link relevance of {tenant_id!r}: {error}") from error
+
+    async def has_link_relevance(self, tenant_id: str) -> bool:
+        """Whether any body link of the tenant has a stored context relevance."""
+        _require_tenant(tenant_id)
+        return bool(await self._read(_HAS_LINK_RELEVANCE, tenant=tenant_id))
 
     async def audit_edges(self, tenant_id: str) -> list[AuditEdge]:
         """Every body link from a crawled page of the tenant, into placeholders too, with what
@@ -2029,6 +2053,10 @@ def _translate(error: Neo4jError | DriverError, *, write: bool) -> DatabaseError
         return DatabaseAuthError("neo4j", "credentials rejected")
     if isinstance(error, ServiceUnavailable | SessionExpired):
         return DatabaseUnavailableError("neo4j", f"server unavailable: {error}")
+    # A deadlock or lock timeout still failing after the driver's own retries: a later run can
+    # succeed, so it is retried as an outage, not failed as a rejected write.
+    if isinstance(error, TransientError):
+        return DatabaseUnavailableError("neo4j", f"transient error: {error}")
     kind = DatabaseWriteError if write else DatabaseReadError
     return kind("neo4j", f"{type(error).__name__}: {error}")
 

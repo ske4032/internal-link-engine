@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
+import weakref
 from collections import deque
 from typing import TYPE_CHECKING, Final, NamedTuple, Protocol, Self
 
@@ -206,6 +208,26 @@ class TokenPacer:
                 await pace_sleep(delay)
 
 
+class _Budget(NamedTuple):
+    pacer: TokenPacer
+    slots: asyncio.Semaphore
+
+
+# One budget per API key and limits in each event loop, drawn on by every client with them, so
+# stages embedding at once stay within the account's limits together.
+_BUDGETS: Final[
+    weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[tuple[str, int, int], _Budget]]
+] = weakref.WeakKeyDictionary()
+
+
+def _budget(key: tuple[str, int, int]) -> _Budget:
+    budgets = _BUDGETS.setdefault(asyncio.get_running_loop(), {})
+    if key not in budgets:
+        _, per_minute, requests = key
+        budgets[key] = _Budget(TokenPacer(per_minute), asyncio.Semaphore(requests))
+    return budgets[key]
+
+
 class VoyageClient:
     """Embeds page texts as documents with Voyage, in token-budgeted batches."""
 
@@ -234,8 +256,12 @@ class VoyageClient:
             )
         self._sdk = sdk
         self._tokenizer = tokenizer
-        # One budget per client, shared by every call through it.
-        self._pacer = TokenPacer(settings.tokens_per_minute)
+        # The key is hashed, so the registry never holds the secret.
+        self._budget_key = (
+            hashlib.sha256(settings.api_key.get_secret_value().encode()).hexdigest(),
+            settings.tokens_per_minute,
+            settings.max_concurrent_requests,
+        )
 
     @property
     def model(self) -> str:
@@ -256,10 +282,10 @@ class VoyageClient:
     async def iter_embed(self, pages: Sequence[PageText]) -> AsyncGenerator[EmbeddingBatch]:
         """One batch of unit-norm vectors per Voyage request, in input order.
 
-        Up to ``max_concurrent_requests`` requests are under way, each paced to the token budget
-        and retried on its own; batches are yielded in order as they complete, so memory stays
-        bounded by the window. The first request failing after its retries cancels the others
-        and raises.
+        Up to ``max_concurrent_requests`` requests are under way, across every client of the API
+        key in the process, each paced to the key's token budget and retried on its own; batches
+        are yielded in order as they complete, so memory stays bounded by the window. The first
+        request failing after its retries cancels the others and raises.
         """
         if not pages:
             return
@@ -321,10 +347,13 @@ class VoyageClient:
     async def _embed_batch(self, batch: Sequence[_Prepared]) -> EmbeddingBatch:
         texts = [item.text for item in batch]
         tokens = sum(item.tokens for item in batch)
-        throttled = await self._pacer.acquire(tokens)
-        started = time.perf_counter()
-        result, retries = await self._call(texts)
-        latency_ms = round((time.perf_counter() - started) * 1000)
+        budget = _budget(self._budget_key)
+        # A slot first, so tokens are counted when the request starts, not while it queues.
+        async with budget.slots:
+            throttled = await budget.pacer.acquire(tokens)
+            started = time.perf_counter()
+            result, retries = await self._call(texts)
+            latency_ms = round((time.perf_counter() - started) * 1000)
         vectors = self._validate(result, expected=len(batch))
         log.info(
             "embedding.batch",
