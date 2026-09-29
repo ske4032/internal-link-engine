@@ -37,6 +37,7 @@ from linking_engine.models import (
     GscQuery,
     GscQueryStats,
     LanguageRules,
+    LinkAuditResult,
     LinkRecord,
     PageRecord,
     PageSummary,
@@ -101,6 +102,24 @@ INDEXES: Final[dict[str, tuple[IndexModel, ...]]] = {
             name="tenant_source_target",
         ),
         IndexModel([("tenantId", ASCENDING), ("auditedAt", DESCENDING)], name="tenant_audited"),
+        IndexModel(
+            [
+                ("tenantId", ASCENDING),
+                ("runId", ASCENDING),
+                ("sourceUrl", ASCENDING),
+                ("position", ASCENDING),
+            ],
+            unique=True,
+            name="tenant_run_source_position",
+        ),
+    ),
+    # One marker per completed audit run; a run without one is never read as the latest.
+    "link_audit_runs": (
+        IndexModel([("tenantId", ASCENDING), ("runId", ASCENDING)], unique=True, name="tenant_run"),
+        IndexModel(
+            [("tenantId", ASCENDING), ("auditedAt", DESCENDING), ("runId", DESCENDING)],
+            name="tenant_audited_run",
+        ),
     ),
     "recommendations": (
         IndexModel(
@@ -593,6 +612,122 @@ class MongoRepo:
             rows.extend(_from_document(StrategicKeyword, document) for document in documents)
         return sorted(rows, key=lambda row: (row.url, row.keyword, row.language))
 
+    async def insert_link_audit(
+        self,
+        tenant_id: str,
+        run_id: str,
+        docs: Sequence[LinkAuditResult],
+        *,
+        batch_size: int = WRITE_BATCH,
+    ) -> int:
+        """Add one audit run to the tenant's history, one document per edge. A retried run
+        rewrites its own documents and never another run's. Returns the documents written."""
+        _require_tenant(tenant_id)
+        if not run_id.strip():
+            raise ValueError("run_id must be a non-empty string")
+        if any(doc.run_id != run_id for doc in docs):
+            raise ValueError(f"every document must belong to run {run_id!r}")
+        edges = [(doc.source_url, doc.position) for doc in docs]
+        if len(set(edges)) != len(edges):
+            raise ValueError("one document per edge: duplicate (source_url, position)")
+        ops = [
+            UpdateOne(
+                {
+                    "tenantId": tenant_id,
+                    "runId": run_id,
+                    "sourceUrl": doc.source_url,
+                    "position": doc.position,
+                },
+                {"$set": {**_to_document(doc), "tenantId": tenant_id}},
+                upsert=True,
+            )
+            for doc in docs
+        ]
+        written, _ = await self._bulk("link_audit", ops, batch_size)
+        return written
+
+    async def complete_link_audit(
+        self,
+        tenant_id: str,
+        run_id: str,
+        *,
+        audited_at: datetime,
+        documents: int,
+        edges: int,
+    ) -> None:
+        """Mark a run complete once its last link_audit and edge batches are written; only a
+        marked run is ever read as the latest. ``documents`` must equal the run's stored
+        documents, ``edges`` is the edges written back. Marking a run again rewrites its marker."""
+        _require_tenant(tenant_id)
+        if not run_id.strip():
+            raise ValueError("run_id must be a non-empty string")
+        if documents < 0 or edges < 0:
+            raise ValueError("documents and edges cannot be negative")
+        stored = await _retrying(
+            partial(
+                self._db["link_audit"].count_documents, {"tenantId": tenant_id, "runId": run_id}
+            ),
+            write=False,
+            what="count link audit documents",
+        )
+        if stored != documents:
+            raise DatabaseWriteError(
+                "mongodb",
+                f"run {run_id!r} of {tenant_id!r} has {stored} of {documents} link audit "
+                "documents; not marked complete",
+            )
+        await _retrying(
+            partial(
+                self._db["link_audit_runs"].update_one,
+                {"tenantId": tenant_id, "runId": run_id},
+                {
+                    "$set": {
+                        "auditedAt": audited_at,
+                        "completedAt": datetime.now(UTC),
+                        "documents": documents,
+                        "edges": edges,
+                    }
+                },
+                upsert=True,
+            ),
+            write=True,
+            what="mark link audit run complete",
+        )
+
+    async def latest_link_audit(self, tenant_id: str) -> tuple[LinkAuditResult, ...]:
+        """The tenant's most recent completed audit run, ordered by source url and position;
+        empty when none was completed. The latest auditedAt picks the run, the greatest runId
+        breaks a tie."""
+        _require_tenant(tenant_id)
+        marker = await _retrying(
+            partial(
+                self._db["link_audit_runs"].find_one,
+                {"tenantId": tenant_id},
+                {"_id": 0, "runId": 1},
+                sort=[("auditedAt", DESCENDING), ("runId", DESCENDING)],
+            ),
+            write=False,
+            what="read latest link audit run",
+        )
+        if marker is None:
+            return ()
+        run_id = marker.get("runId")
+        if not isinstance(run_id, str) or not run_id:
+            raise DatabaseReadError("mongodb", f"the latest link audit of {tenant_id!r} has no run")
+        collection = self._db["link_audit"]
+        query: Document = {"tenantId": tenant_id, "runId": run_id}
+        projection = dict.fromkeys(_keys(LinkAuditResult), 1)
+
+        # One index-ordered cursor; a retry re-reads the run from the start.
+        async def read() -> list[Document]:
+            cursor = collection.find(query, projection).sort(
+                [("sourceUrl", ASCENDING), ("position", ASCENDING)]
+            )
+            return await cursor.to_list()
+
+        documents = await _retrying(read, write=False, what="read link audit")
+        return tuple(_from_document(LinkAuditResult, document) for document in documents)
+
     async def get_pages(
         self, tenant_id: str, urls: Sequence[str], *, batch_size: int = READ_BATCH
     ) -> list[PageRecord]:
@@ -711,6 +846,8 @@ def _bson(value: object) -> object:
         return str(value)
     if isinstance(value, tuple | list):
         return [_bson(item) for item in value]
+    if isinstance(value, set | frozenset):
+        return [_bson(item) for item in sorted(value, key=str)]
     if isinstance(value, dict):
         return {to_camel(str(key)): _bson(item) for key, item in value.items()}
     return value

@@ -45,6 +45,19 @@ from linking_engine.anchor.semantic import (
     THRESHOLD_BOUNDS,
     TOP_SENTENCES,
 )
+from linking_engine.audit.links import (
+    ALIGNMENT_COSINE_SHARE,
+    ALIGNMENT_JACCARD_SHARE,
+    ALIGNMENT_WEIGHT,
+    CONTEXT_WEIGHT,
+    FENCE_IQRS,
+    FIT_WEIGHT,
+    GENERIC_CAP,
+    MIN_IQR,
+    OVER_OPTIMISED_MIN,
+    OVER_OPTIMISED_SHARE,
+    PAGINATION_PARAMS,
+)
 from linking_engine.audit.relevance import MIN_MODE_GAP, MIN_SPLIT_SCORES, SPLIT_SEED
 from linking_engine.discovery.bridges import (
     ALTERNATIVES,
@@ -84,9 +97,10 @@ from linking_engine.ml.quality import (
     has_signal,
     quality_metrics,
 )
-from linking_engine.models import QualityBaseline
+from linking_engine.models import IssueFlag, QualityBaseline
 from linking_engine.models.anchors import SCORE_HISTOGRAM_BINS as ANCHOR_SCORE_BINS
 from linking_engine.models.anchors import SENTENCE_INDEX_BINS, UNANCHORED_ADVICE
+from linking_engine.models.audit import AUDIT_VERDICTS
 from linking_engine.models.relevance import HISTOGRAM_BINS
 from linking_engine.models.scoring import SCORE_HISTOGRAM_BINS
 
@@ -106,6 +120,7 @@ if TYPE_CHECKING:
         HubPair,
         HubReport,
         KeywordReport,
+        LinkAuditReport,
         LinkRelevanceReport,
         QualityReport,
         ScoreDistribution,
@@ -593,6 +608,154 @@ def log_link_relevance(report: LinkRelevanceReport, summary: str) -> str:
                 ],
             )
             mlflow.log_table(relevance_table(report), "relevance_histogram.json")
+        mlflow.log_dict(report.model_dump(mode="json"), "report.json")
+        mlflow.log_text(summary, "summary.md")
+        return run_id
+
+
+_AUDIT_COUNTS = (
+    "links",
+    "unverified",
+    "healthy",
+    "source_pages",
+    "index_like_pages",
+    "listing_pages",
+    "sitemap_pages",
+    "sitemap_links",
+    "paginated_pages",
+    "paginated_links",
+    "ladder_pairs",
+    "proposals",
+    "keyword_cosines",
+    "seconds",
+)
+
+
+def _audit_scores(report: LinkAuditReport) -> dict[str, ScoreDistribution]:
+    return {
+        name: found
+        for name, found in (
+            ("keyword_alignment", report.keyword_alignment),
+            ("context_relevance", report.context_relevance),
+            ("anchor_target_fit", report.anchor_target_fit),
+            ("equity_efficiency", report.equity_efficiency),
+            ("anchor_quality", report.anchor_quality),
+        )
+        if found is not None
+    }
+
+
+def link_audit_metrics(report: LinkAuditReport) -> dict[str, float]:
+    """Counts by flag and verdict, the cut-offs the tenant's links gave and each score's
+    statistics and split, flat; absent values left out."""
+    metrics = {name: float(getattr(report, name)) for name in _AUDIT_COUNTS}
+    metrics["embeddings"] = float(report.embeddings)
+    metrics.update(
+        {f"flag_{flag.value.lower()}": float(report.by_flag.get(flag, 0)) for flag in IssueFlag}
+    )
+    metrics.update(
+        {
+            f"verdict_{verdict.value.lower()}": float(report.by_verdict.get(verdict, 0))
+            for verdict in sorted(AUDIT_VERDICTS)
+        }
+    )
+    metrics.update(
+        {
+            f"cutoff_{cutoff.name}": cutoff.value
+            for cutoff in report.cutoffs
+            if cutoff.value is not None
+        }
+    )
+    for name, found in _audit_scores(report).items():
+        metrics.update(
+            {
+                f"{name}_{field}": float(value)
+                for field, value in found.model_dump(exclude={"histogram"}).items()
+                if value is not None
+            }
+        )
+    return metrics
+
+
+def link_audit_tables(report: LinkAuditReport) -> dict[str, dict[str, list[object]]]:
+    """The reasons given and how many links each, the cut-offs with how they were derived, and
+    every score's histogram, a row per score and bin over [0, 1]; no urls."""
+    width = 1 / HISTOGRAM_BINS
+    scores = _audit_scores(report)
+    reasons = sorted(report.by_reason.items())
+    return {
+        "audit_reasons.json": {
+            "reason": [reason.value for reason, _ in reasons],
+            "links": [count for _, count in reasons],
+        },
+        "audit_cutoffs.json": {
+            "cutoff": [cutoff.name for cutoff in report.cutoffs],
+            "value": [cutoff.value for cutoff in report.cutoffs],
+            "reason": [cutoff.reason for cutoff in report.cutoffs],
+        },
+        "audit_histogram.json": {
+            "score": [name for name in scores for _ in range(HISTOGRAM_BINS)],
+            "bin": [step for _ in scores for step in range(HISTOGRAM_BINS)],
+            "low": [round(step * width, 6) for _ in scores for step in range(HISTOGRAM_BINS)],
+            "high": [
+                round((step + 1) * width, 6) for _ in scores for step in range(HISTOGRAM_BINS)
+            ],
+            "count": [count for found in scores.values() for count in found.histogram],
+        },
+    }
+
+
+def log_link_audit(report: LinkAuditReport, summary: str) -> str:
+    """Log one link audit run from its report in the tenant's analytics experiment: counts and
+    cut-offs as metrics, each score's histogram as the step-indexed metric ``<score>_hist``
+    (step = bin), reasons, cut-offs and histograms as tables; returns the MLflow run id."""
+    use_analytics_experiment(report.tenant_id)
+    with mlflow.start_run(
+        run_name="link audit",
+        tags={
+            "tenant_id": report.tenant_id,
+            "kind": "pipeline",
+            "stage": "link-audit",
+            "audit_run_id": report.run_id,
+            "mlflow.note.content": summary,
+        },
+    ) as run:
+        run_id = str(run.info.run_id)
+        mlflow.log_params(
+            {
+                "alignment_jaccard_share": ALIGNMENT_JACCARD_SHARE,
+                "alignment_cosine_share": ALIGNMENT_COSINE_SHARE,
+                "alignment_weight": ALIGNMENT_WEIGHT,
+                "fit_weight": FIT_WEIGHT,
+                "context_weight": CONTEXT_WEIGHT,
+                "generic_cap": GENERIC_CAP,
+                "over_optimised_min": OVER_OPTIMISED_MIN,
+                "over_optimised_share": OVER_OPTIMISED_SHARE,
+                "fence_iqrs": FENCE_IQRS,
+                "min_iqr": MIN_IQR,
+                "pagination_params": ",".join(sorted(PAGINATION_PARAMS)),
+                "min_split_scores": MIN_SPLIT_SCORES,
+                "min_mode_gap": MIN_MODE_GAP,
+                "split_seed": SPLIT_SEED,
+                "histogram_bins": HISTOGRAM_BINS,
+                "embeddings_skipped_reason": report.embeddings_skipped_reason or "none",
+                "vectors_skipped_reason": report.vectors_skipped_reason or "none",
+            }
+        )
+        mlflow.log_metrics(link_audit_metrics(report))
+        scores = _audit_scores(report)
+        if scores:
+            now = int(time.time() * 1000)
+            mlflow.MlflowClient().log_batch(
+                run_id,
+                metrics=[
+                    Metric(f"{name}_hist", float(count), now, step)
+                    for name, found in scores.items()
+                    for step, count in enumerate(found.histogram)
+                ],
+            )
+        for artifact, table in link_audit_tables(report).items():
+            mlflow.log_table(table, artifact)
         mlflow.log_dict(report.model_dump(mode="json"), "report.json")
         mlflow.log_text(summary, "summary.md")
         return run_id

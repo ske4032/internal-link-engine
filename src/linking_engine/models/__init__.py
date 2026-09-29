@@ -20,7 +20,13 @@ from linking_engine.models.anchors import (
     SemanticThreshold,
     UnanchoredPair,
 )
-from linking_engine.models.audit import LinkAuditResult
+from linking_engine.models.audit import (
+    AuditCutoff,
+    AuditEdge,
+    AuditReason,
+    LinkAuditReport,
+    LinkAuditResult,
+)
 from linking_engine.models.bridges import BridgeLink, BridgeReport, HubPair
 from linking_engine.models.candidates import (
     CandidateReport,
@@ -156,6 +162,9 @@ __all__ = [
     "AnchorSelectionReport",
     "AnchorType",
     "AnchorTypeProfile",
+    "AuditCutoff",
+    "AuditEdge",
+    "AuditReason",
     "BridgeLink",
     "BridgeReason",
     "BridgeReport",
@@ -209,6 +218,7 @@ __all__ = [
     "LanguageRules",
     "LifecycleStage",
     "Link",
+    "LinkAuditReport",
     "LinkAuditResult",
     "LinkEmbedReport",
     "LinkGraphSnapshot",

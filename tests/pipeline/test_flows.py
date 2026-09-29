@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import inspect
+from collections import Counter
 from typing import TYPE_CHECKING
 
 import pyarrow.parquet as pq
 import pytest
+from link_audit_seed import AUDITED as AUDIT_LINKS
+from link_audit_seed import PAGES as AUDIT_PAGES
+from link_audit_seed import seed_link_audit
 from mlflow import MlflowClient
 from mlflow.artifacts import load_dict, load_text
 from prefect.states import Failed
@@ -1078,3 +1082,31 @@ def test_the_train_ranker_flow_defaults_are_the_held_out_settings_defaults() -> 
         defaults.rounds,
         defaults.share,
     ), "the flow hides a different share of the links than the settings it passes on"
+
+
+@pytest.mark.integration
+async def test_link_audit_flow_audits_the_tenant_and_logs_one_mlflow_run_without_urls(
+    graph: GraphRepo,
+    mongo: MongoRepo,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    await seed_link_audit(graph, mongo, tenant)
+
+    report, run_id = await flows.link_audit_flow(tenant, cache_dir=tmp_path / "cache")
+
+    # Without a Voyage key alignment stays lexical; the planted verdicts do not depend on it.
+    assert report.embeddings
+    assert report.keyword_cosines == 0
+    assert report.by_verdict == Counter(link.a2.verdict for link in AUDIT_LINKS if link.a2.verdict)
+    assert {r.run_id for r in await mongo.latest_link_audit(tenant)} == {report.run_id}
+    run = MlflowClient(uri).get_run(run_id)
+    assert (run.data.tags["tenant_id"], run.data.tags["stage"]) == (tenant, "link-audit")
+    assert run.data.tags["audit_run_id"] == report.run_id
+    assert run.data.metrics["links"] == len(AUDIT_LINKS)
+    summary = load_text(f"runs:/{run_id}/summary.md")
+    assert not [page.path for page in AUDIT_PAGES if page.path in summary]

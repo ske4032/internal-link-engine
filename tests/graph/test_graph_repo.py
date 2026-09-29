@@ -281,7 +281,9 @@ def test_status_issue(code: int | None, flag: IssueFlag | None) -> None:
 
 
 @pytest.mark.integration
-async def test_links_to_non_2xx_pages_are_flagged_fix(graph: GraphRepo, tenant: str) -> None:
+async def test_links_to_non_2xx_pages_carry_the_status_and_count_as_fix(
+    graph: GraphRepo, tenant: str
+) -> None:
     await graph.upsert_pages(
         tenant,
         [
@@ -298,38 +300,38 @@ async def test_links_to_non_2xx_pages_are_flagged_fix(graph: GraphRepo, tenant: 
     await graph.replace_links(tenant, [url("/src")], links)
 
     stored = {str(lk.target_url): lk for lk in await graph.links_from(tenant, [url("/src")])}
-    assert stored[url("/moved")].issue_flags == {IssueFlag.REDIRECTED}
-    assert stored[url("/moved")].verdict is ActionType.FIX
-    assert stored[url("/gone")].issue_flags == {IssueFlag.BROKEN}
-    assert stored[url("/gone")].verdict is ActionType.FIX
-    for healthy in ("/ok", "/ghost"):
-        assert stored[url(healthy)].issue_flags == frozenset()
-        assert stored[url(healthy)].verdict is None
+    targets = ("/ok", "/moved", "/gone", "/ghost")
+    statuses = {target: stored[url(target)].target_status_code for target in targets}
+    assert statuses == {"/ok": 200, "/moved": 301, "/gone": 404, "/ghost": None}
+    # Flags and verdicts are the link audit's to write, never the load's.
+    assert all(lk.issue_flags == frozenset() and lk.verdict is None for lk in stored.values())
     counts = await graph.counts(tenant)
     assert (counts.redirected_pages, counts.broken_pages, counts.fix_links) == (1, 1, 2)
 
 
 @pytest.mark.integration
-async def test_status_change_reflags_inbound_links_and_keeps_audit_flags(
+async def test_status_change_updates_inbound_links_and_keeps_the_audit_result(
     graph: GraphRepo, tenant: str
 ) -> None:
     await graph.upsert_pages(tenant, [page("/src"), page("/t", status_code=503)])
     await graph.replace_links(tenant, [url("/src")], [link("/src", "/t", 0)])
     await graph._auto(
-        "MATCH (:Page {tenantId: $t})-[r:LINKS_TO]->() SET r.issueFlags = r.issueFlags + 'GENERIC'",
+        "MATCH (:Page {tenantId: $t})-[r:LINKS_TO]->() "
+        "SET r.issueFlags = ['BROKEN', 'GENERIC'], r.verdict = 'FIX'",
         t=tenant,
     )
+    assert (await graph.counts(tenant)).fix_links == 1
 
     await graph.upsert_pages(tenant, [page("/t")])
     [recovered] = await graph.links_from(tenant, [url("/src")])
-    assert recovered.issue_flags == {IssueFlag.GENERIC}
-    assert recovered.verdict is None
     assert recovered.target_status_code == 200
+    assert recovered.issue_flags == {IssueFlag.BROKEN, IssueFlag.GENERIC}
+    assert recovered.verdict is ActionType.FIX
+    assert (await graph.counts(tenant)).fix_links == 0
 
     await graph.upsert_pages(tenant, [page("/t", status_code=410)])
     [broken] = await graph.links_from(tenant, [url("/src")])
-    assert broken.issue_flags == {IssueFlag.GENERIC, IssueFlag.BROKEN}
-    assert broken.verdict is ActionType.FIX
+    assert broken.target_status_code == 410
     assert (await graph.counts(tenant)).fix_links == 1
 
 
