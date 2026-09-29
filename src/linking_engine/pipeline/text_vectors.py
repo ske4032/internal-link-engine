@@ -5,15 +5,18 @@ themselves are never stored, and tenants never share a cache, even for identical
 cache only grows, so no text is paid for twice, also when quality evaluation and anchor selection
 ask for different keywords. Keywords keep the quality evaluation's float32 file; sentences and
 phrases are float16 under ``text_vectors/``. A cache is read and rewritten in batches, so only
-the wanted rows are ever held, never the whole file.
+the wanted rows are ever held, never the whole file. Every write holds the tenant's lock and
+merges into the file as it is then, so stages writing at once never lose each other's rows.
 """
 
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import os
 import tempfile
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal
@@ -42,6 +45,12 @@ FLUSH_TEXTS: Final = 10_000
 # thread and no pre-buffering a file is read page by page, never a whole column chunk at once.
 BATCH_ROWS: Final = 1024
 _BUFFER_BYTES: Final = 1 << 20
+# A tenant's writers queue on its lock file across processes, and a loop's coroutines on an
+# asyncio lock first, so none of them holds a thread while it waits.
+_LOCK_NAME: Final = ".lock"
+_LOOP_LOCKS: Final[
+    weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[Path, asyncio.Lock]]
+] = weakref.WeakKeyDictionary()
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,8 +94,7 @@ class TextVectors:
 class _Cached:
     rows: Rows
     keys: frozenset[str]
-    # Whether the file's rows are kept when it is rewritten, less the broken rows of the model.
-    keep: bool
+    # Rows of the model that are no usable vector, dropped at the next write.
     broken: frozenset[str]
 
 
@@ -100,6 +108,15 @@ def cache_path(cache_dir: Path, tenant_id: str, kind: Kind) -> Path:
     if tenant_id in {".", ".."} or Path(tenant_id).name != tenant_id:
         raise ValueError("tenant_id must be usable as a directory name")
     return cache_dir.joinpath(tenant_id, *_LAYOUTS[kind].parts)
+
+
+def _lock_path(cache_dir: Path, tenant_id: str) -> Path:
+    # One lock for every kind of the tenant's caches.
+    return cache_path(cache_dir, tenant_id, "sentences").with_name(_LOCK_NAME)
+
+
+def _loop_lock(lock: Path) -> asyncio.Lock:
+    return _LOOP_LOCKS.setdefault(asyncio.get_running_loop(), {}).setdefault(lock, asyncio.Lock())
 
 
 def _schema(tenant_id: str, kind: Kind, dimension: int) -> pa.Schema:
@@ -129,6 +146,7 @@ async def text_rows(
     FLUSH_TEXTS texts. Embedding errors propagate, and the texts embedded before one stay
     cached."""
     path = cache_path(cache_dir, tenant_id, kind)
+    lock = _lock_path(cache_dir, tenant_id)
     wanted = {text_key(text): text for text in sorted(set(texts))}
     schema = _schema(tenant_id, kind, voyage.dimension)
     cached = await asyncio.to_thread(
@@ -138,22 +156,23 @@ async def text_rows(
     fresh = np.empty((len(missing), voyage.dimension), _LAYOUTS[kind].dtype)
     keys: list[str] = []
     written = 0
-    keep, drop = cached.keep, cached.broken
+    drop = cached.broken
     api_tokens = 0
 
     async def flush() -> None:
-        nonlocal written, keep, drop
-        await asyncio.to_thread(
-            _write,
-            path,
-            schema,
-            voyage.model,
-            keys[written:],
-            fresh[written : len(keys)],
-            keep=keep,
-            drop=drop,
-        )
-        written, keep, drop = len(keys), True, frozenset()
+        nonlocal written, drop
+        async with _loop_lock(lock):
+            await asyncio.to_thread(
+                _write,
+                lock,
+                path,
+                schema,
+                voyage.model,
+                keys[written:],
+                fresh[written : len(keys)],
+                drop=drop,
+            )
+        written, drop = len(keys), frozenset()
 
     try:
         if missing:
@@ -276,13 +295,12 @@ def _read(
     *,
     stage: str,
 ) -> _Cached:
-    """The cached rows of the ``wanted`` keys (key to text) from ``model``, and whether the file
-    is kept when rewritten; nothing is kept when the file is missing, belongs to another tenant
-    or dimension, or cannot be read. A wanted row that is not a usable vector is left out and
-    dropped at the next write, so it is embedded again."""
+    """The cached rows of the ``wanted`` keys (key to text) from ``model``; none when the file is
+    missing, belongs to another tenant or dimension, or cannot be read. A wanted row that is not
+    a usable vector is left out and dropped at the next write, so it is embedded again."""
     dimension = schema.field("vector").type.list_size
     nothing = _Cached(
-        Rows([], np.empty((0, dimension), _LAYOUTS[kind].dtype)), frozenset(), False, frozenset()
+        Rows([], np.empty((0, dimension), _LAYOUTS[kind].dtype)), frozenset(), frozenset()
     )
     if not path.is_file():
         return nothing
@@ -317,7 +335,7 @@ def _read(
             rows=len(broken),
         )
     held = [key for key, ok in zip(keys, usable, strict=True) if ok]
-    return _Cached(Rows([wanted[key] for key in held], matrix), frozenset(held), True, broken)
+    return _Cached(Rows([wanted[key] for key in held], matrix), frozenset(held), broken)
 
 
 def _open(path: Path) -> pq.ParquetFile:
@@ -385,52 +403,83 @@ def _gather(
 
 
 def _write(
+    lock: Path,
     path: Path,
     schema: pa.Schema,
     model: str,
     keys: list[str],
     matrix: npt.NDArray[np.floating],
     *,
-    keep: bool,
     drop: frozenset[str],
 ) -> None:
-    """``matrix`` as rows of ``model`` keyed by ``keys``, after the file's rows when ``keep``,
-    less the rows of ``model`` whose key is in ``drop``; the file is streamed, never loaded."""
-    order = sorted(range(len(keys)), key=keys.__getitem__)
-    vector = schema.field("vector").type
-    table = pa.table(
-        {
-            "model": pa.array([model] * len(keys), type=pa.string()),
-            "text_sha256": pa.array([keys[i] for i in order], type=pa.string()),
-            "vector": pa.FixedSizeListArray.from_arrays(
-                pa.array(matrix[order].reshape(-1)), type=vector
-            ),
-        },
-        schema=schema,
-    )
-    dropped = pa.array(sorted(drop), type=pa.string())
+    """``matrix`` as rows of ``model`` keyed by ``keys``, merged under the tenant's ``lock``
+    into the file as it is now: its rows stay when it holds ``schema``, less the rows of
+    ``model`` whose key is in ``drop``, and a key it already holds for ``model`` is not added
+    again. The file is streamed, never loaded."""
+    lock.parent.mkdir(parents=True, exist_ok=True)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Written beside the cache path and renamed, so a file at that path is always complete.
-    handle, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    os.close(handle)
-    temp = Path(name)
+    # The lock is released when its file is closed.
+    with lock.open("a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        # Written beside the cache path and renamed, so a file at that path is always complete.
+        handle, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+        os.close(handle)
+        temp = Path(name)
+        try:
+            new = pa.array(keys, type=pa.string())
+            dropped = pa.array(sorted(drop), type=pa.string())
+            present: set[str] = set()
+            # Only the model repeats; keys and vectors gain nothing from a dictionary.
+            with pq.ParquetWriter(temp, schema, use_dictionary=["model"]) as writer:
+                for batch in _current(path, schema):
+                    if drop:
+                        batch = batch.filter(pc.invert(_keyed(batch, model, dropped)))
+                    keyed = _keyed(batch, model, new)
+                    present.update(batch.column("text_sha256").filter(keyed).to_pylist())
+                    writer.write_batch(batch)
+                order = sorted(
+                    (i for i, key in enumerate(keys) if key not in present), key=keys.__getitem__
+                )
+                writer.write_table(
+                    pa.table(
+                        {
+                            "model": pa.array([model] * len(order), type=pa.string()),
+                            "text_sha256": pa.array([keys[i] for i in order], type=pa.string()),
+                            "vector": pa.FixedSizeListArray.from_arrays(
+                                pa.array(matrix[order].reshape(-1)),
+                                type=schema.field("vector").type,
+                            ),
+                        },
+                        schema=schema,
+                    )
+                )
+            temp.replace(path)
+        finally:
+            temp.unlink(missing_ok=True)
+
+
+def _current(path: Path, schema: pa.Schema) -> Iterator[pa.RecordBatch]:
+    """The rows of the file at ``path`` when it holds ``schema``; none when it is missing, holds
+    another tenant's or dimension's rows, or cannot be opened. A file that opens but fails while
+    it is read raises, naming the file and how to rebuild it."""
     try:
-        # Only the model repeats; unique keys and vector values gain nothing from a dictionary.
-        with pq.ParquetWriter(temp, schema, use_dictionary=["model"]) as writer:
-            if keep and path.is_file():
-                with _open(path) as kept:
-                    for batch in _batches(kept, None):
-                        if drop:
-                            batch = batch.filter(
-                                pc.invert(
-                                    pc.and_(
-                                        pc.equal(batch.column("model"), model),
-                                        pc.is_in(batch.column("text_sha256"), value_set=dropped),
-                                    )
-                                )
-                            )
-                        writer.write_batch(batch)
-            writer.write_table(table)
-        temp.replace(path)
-    finally:
-        temp.unlink(missing_ok=True)
+        file = _open(path)
+    except (OSError, pa.ArrowException):
+        return
+    with file:
+        if file.schema_arrow.equals(schema, check_metadata=True):
+            try:
+                yield from _batches(file, None)
+            except (OSError, pa.ArrowException) as error:
+                raise ValueError(
+                    f"vector cache {path} is unreadable ({type(error).__name__}); "
+                    f"delete {path} to rebuild it"
+                ) from error
+
+
+def _keyed(batch: pa.RecordBatch, model: str, keys: pa.Array) -> pa.Array:
+    """Which rows of ``batch`` are of ``model`` and keyed by one of ``keys``."""
+    return pc.and_(
+        pc.equal(batch.column("model"), model),
+        pc.is_in(batch.column("text_sha256"), value_set=keys),
+    )

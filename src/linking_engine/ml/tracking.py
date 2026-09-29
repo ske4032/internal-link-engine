@@ -14,6 +14,7 @@ import mlflow
 import structlog
 from mlflow.entities import Metric
 from mlflow.exceptions import MlflowException
+from prefect.runtime import flow_run
 
 from linking_engine.anchor.extraction import (
     MAX_INNER_STOP_WORDS,
@@ -135,6 +136,7 @@ if TYPE_CHECKING:
         KeywordReport,
         LinkAuditReport,
         LinkRelevanceReport,
+        PipelineReport,
         QualityReport,
         RecommendationReport,
         ScoreDistribution,
@@ -159,6 +161,18 @@ def use_analytics_experiment(tenant_id: str) -> None:
     experiment = mlflow.set_experiment(analytics_experiment(tenant_id))
     if experiment.tags.get(EXPERIMENT_KIND_TAG) != EXPERIMENT_KIND:
         mlflow.set_experiment_tag(EXPERIMENT_KIND_TAG, EXPERIMENT_KIND)
+
+
+def pipeline_tags() -> dict[str, str]:
+    """The Prefect root flow run as pipeline_run_id, which every stage run of one
+    tenant-pipeline run shares; empty outside a flow run."""
+    root = flow_run.root_flow_run_id
+    return {"pipeline_run_id": str(root)} if root else {}
+
+
+def start_stage_run(run_name: str, tags: dict[str, str]) -> mlflow.ActiveRun:
+    """Start a stage's run in the active experiment, tagged with its pipeline run."""
+    return mlflow.start_run(run_name=run_name, tags={**tags, **pipeline_tags()})
 
 
 def analytics_metrics(
@@ -211,7 +225,7 @@ def log_analytics(
     if {centrality.tenant_id, hubs.tenant_id} != {tenant_id}:
         raise ValueError("all reports must come from the same tenant")
     use_analytics_experiment(tenant_id)
-    with mlflow.start_run(
+    with start_stage_run(
         run_name="graph analytics",
         tags={
             "tenant_id": tenant_id,
@@ -333,7 +347,7 @@ def log_candidates(found: CandidateSet, summary: str) -> str:
     """Log one candidate retrieval run with its description; returns the MLflow run id."""
     report = found.report
     use_analytics_experiment(report.tenant_id)
-    with mlflow.start_run(
+    with start_stage_run(
         run_name="candidate retrieval",
         tags={
             "tenant_id": report.tenant_id,
@@ -385,7 +399,7 @@ def keyword_metrics(report: KeywordReport) -> dict[str, float]:
 def log_keywords(report: KeywordReport, summary: str) -> str:
     """Log one keyword resolution run with its description; returns the MLflow run id."""
     use_analytics_experiment(report.tenant_id)
-    with mlflow.start_run(
+    with start_stage_run(
         run_name="keyword resolution",
         tags={
             "tenant_id": report.tenant_id,
@@ -432,7 +446,7 @@ def log_features(report: FeatureReport, summary: str) -> str:
     """Log one feature assembly run with its description and column order, never the matrix;
     returns the MLflow run id."""
     use_analytics_experiment(report.tenant_id)
-    with mlflow.start_run(
+    with start_stage_run(
         run_name="feature assembly",
         tags={
             "tenant_id": report.tenant_id,
@@ -470,7 +484,7 @@ def log_duplicates(report: DuplicateReport, summary: str) -> str:
     """Log one duplicate grouping run with its description and every group's canonical and
     copies; returns the MLflow run id."""
     use_analytics_experiment(report.tenant_id)
-    with mlflow.start_run(
+    with start_stage_run(
         run_name="duplicate pages",
         tags={
             "tenant_id": report.tenant_id,
@@ -545,7 +559,7 @@ def log_scores(report: ScoreReport, summary: str) -> str:
     """Log one scoring run from its report: summary metrics, the score histogram as the
     step-indexed metric ``score_hist`` (step = bin), and tables; returns the MLflow run id."""
     use_analytics_experiment(report.tenant_id)
-    with mlflow.start_run(
+    with start_stage_run(
         run_name="baseline scoring",
         tags={
             "tenant_id": report.tenant_id,
@@ -625,7 +639,7 @@ def log_link_relevance(report: LinkRelevanceReport, summary: str) -> str:
     score's histogram as the step-indexed metric ``<score>_hist`` (step = bin) and as a table;
     returns the MLflow run id."""
     use_analytics_experiment(report.tenant_id)
-    with mlflow.start_run(
+    with start_stage_run(
         run_name="link relevance",
         tags={
             "tenant_id": report.tenant_id,
@@ -758,7 +772,7 @@ def log_link_audit(report: LinkAuditReport, summary: str) -> str:
     cut-offs as metrics, each score's histogram as the step-indexed metric ``<score>_hist``
     (step = bin), reasons, cut-offs and histograms as tables; returns the MLflow run id."""
     use_analytics_experiment(report.tenant_id)
-    with mlflow.start_run(
+    with start_stage_run(
         run_name="link audit",
         tags={
             "tenant_id": report.tenant_id,
@@ -854,7 +868,7 @@ def log_bridges(report: BridgeReport, pairs: Sequence[HubPair], summary: str) ->
     """Log one hub-bridge run: its counts, the hub pair table and its description; no page urls
     reach the run. Returns the MLflow run id."""
     use_analytics_experiment(report.tenant_id)
-    with mlflow.start_run(
+    with start_stage_run(
         run_name="hub bridges",
         tags={
             "tenant_id": report.tenant_id,
@@ -948,7 +962,7 @@ def log_anchors(report: AnchorReport, summary: str) -> str:
     sentence position histograms as step-indexed metrics (step = bin), and tables; never urls,
     phrases or sentences. Returns the MLflow run id."""
     use_analytics_experiment(report.tenant_id)
-    with mlflow.start_run(
+    with start_stage_run(
         run_name="anchor extraction",
         tags={
             "tenant_id": report.tenant_id,
@@ -1118,7 +1132,7 @@ def log_anchor_selection(report: AnchorSelectionReport, summary: str) -> str:
     anchors' totals and the semantic matches' similarities as step-indexed histograms (step =
     bin), and tables; never urls, phrases, sentences or keywords. Returns the MLflow run id."""
     use_analytics_experiment(report.tenant_id)
-    with mlflow.start_run(
+    with start_stage_run(
         run_name="anchor selection",
         tags={
             "tenant_id": report.tenant_id,
@@ -1281,7 +1295,7 @@ def log_quality(report: QualityReport, summary: str) -> str:
     applicable checks and alerts as comma-joined tags. Returns the MLflow run id."""
     versions = report.versions
     use_analytics_experiment(report.tenant_id)
-    with mlflow.start_run(
+    with start_stage_run(
         run_name="quality eval",
         tags={
             "tenant_id": report.tenant_id,
@@ -1437,7 +1451,7 @@ def log_recommendations(report: RecommendationReport, summary: str) -> str:
     """Log one recommendations run in the tenant's analytics experiment: its counts as
     metrics, the report, the metrics and the description; returns the MLflow run id."""
     use_analytics_experiment(report.tenant_id)
-    with mlflow.start_run(
+    with start_stage_run(
         run_name="recommendations",
         tags={
             "tenant_id": report.tenant_id,
@@ -1468,3 +1482,53 @@ def log_recommendations(report: RecommendationReport, summary: str) -> str:
         mlflow.log_dict(metrics, "metrics.json")
         mlflow.log_text(summary, "summary.md")
         return run_id
+
+
+def pipeline_metrics(report: PipelineReport) -> dict[str, float]:
+    """Wall seconds and peak memory of every stage that started, the run's total seconds and
+    its peak memory."""
+    metrics = {"seconds": report.seconds}
+    for result in report.stages:
+        if result.seconds is None or result.peak_mb is None:
+            continue
+        name = result.stage.replace("-", "_")
+        metrics[f"{name}_seconds"] = result.seconds
+        metrics[f"{name}_peak_mb"] = result.peak_mb
+        metrics["peak_mb"] = max(metrics.get("peak_mb", 0.0), result.peak_mb)
+    return metrics
+
+
+def log_pipeline(report: PipelineReport, summary: str) -> str:
+    """Log one tenant pipeline run in the tenant's analytics experiment: every stage's status,
+    seconds, peak memory and MLflow run, and the description; no urls. Returns the run id."""
+    use_analytics_experiment(report.tenant_id)
+    tags = {
+        "tenant_id": report.tenant_id,
+        "kind": "pipeline",
+        "stage": "tenant-pipeline",
+        "status": "failed" if report.failed else "ok",
+        "mlflow.note.content": summary,
+    }
+    if report.pipeline_run_id is not None:
+        tags["pipeline_run_id"] = report.pipeline_run_id
+    with mlflow.start_run(run_name="tenant pipeline", tags=tags) as run:
+        mlflow.log_params(
+            {
+                "tenant": report.tenant_id,
+                "retrain": report.retrain,
+                "from_stage": report.from_stage or "none",
+                "reports": report.reports,
+            }
+        )
+        metrics = pipeline_metrics(report)
+        mlflow.log_metrics(metrics)
+        mlflow.log_dict(
+            {
+                result.stage: result.model_dump(mode="json", exclude={"stage"})
+                for result in report.stages
+            },
+            "stages.json",
+        )
+        mlflow.log_dict(metrics, "metrics.json")
+        mlflow.log_text(summary, "summary.md")
+        return str(run.info.run_id)

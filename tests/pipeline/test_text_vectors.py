@@ -4,7 +4,13 @@ another's vectors, even for identical text."""
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import re
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -12,7 +18,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from structlog.testing import capture_logs
-from voyage_fakes import DIMENSION, FakeVoyage, client, settings
+from voyage_fakes import DIMENSION, FakeResult, FakeVoyage, client, settings
 from voyageai.error import ServiceUnavailableError
 
 from linking_engine.embedding.voyage_client import VoyageClient
@@ -26,7 +32,7 @@ from linking_engine.pipeline.text_vectors import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
     from pathlib import Path
 
     from linking_engine.pipeline.text_vectors import Kind, TextVectors
@@ -60,6 +66,11 @@ def fake(dimension: int = DIMENSION) -> FakeVoyage:
 
 def entries(directory: Path) -> list[str]:
     return sorted(p.name for p in directory.iterdir())
+
+
+def cache_files(directory: Path) -> list[str]:
+    """The files beside a cache, less the tenant's lock file, which stays by design."""
+    return sorted(p.name for p in directory.iterdir() if p.is_file() and p.name != ".lock")
 
 
 def embedded_texts(voyage: FakeVoyage) -> list[str]:
@@ -196,7 +207,7 @@ async def test_an_unreadable_file_is_rebuilt(tmp_path: Path, kind: Kind) -> None
     [warning] = [e for e in logs if e["event"] == f"{kind}.vectors_cache_unreadable"]
     assert (warning["stage"], warning["tenant_id"]) == (STAGE, TENANT)
     assert pq.ParquetFile(path).metadata.num_rows == 3
-    assert entries(path.parent) == [path.name], "temp file left"
+    assert cache_files(path.parent) == [path.name], "temp file left"
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -237,7 +248,7 @@ async def test_an_outage_propagates_and_leaves_the_cache_as_it_was(
         await embed(client(down, settings(max_attempts=1)), TEXTS, tmp_path, kind=kind)
 
     assert path.read_bytes() == before
-    assert entries(path.parent) == [path.name]
+    assert cache_files(path.parent) == [path.name]
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -444,3 +455,117 @@ async def test_a_broken_row_is_embedded_again_and_the_others_stay(
     kept = stored(path)
     assert kept.num_rows == 10, "the other rows stay and the broken one is replaced"
     assert sorted(kept["text_sha256"].to_pylist()) == sorted(map(text_key, TEN))
+
+
+@pytest.mark.parametrize("kind", KINDS)
+async def test_a_file_failing_while_it_is_copied_names_itself_and_how_to_rebuild_it(
+    tmp_path: Path, kind: Kind
+) -> None:
+    await embed(fake(), TEN, tmp_path, kind=kind)
+    path = cache_path(tmp_path, TENANT, kind)
+    # The keys still read, so the new text is embedded; the vectors fail once they are copied.
+    vectors = pq.ParquetFile(path).metadata.row_group(0).column(2)
+    with path.open("r+b") as file:
+        file.seek(vectors.data_page_offset)
+        file.write(b"\xff" * vectors.total_compressed_size)
+    before = path.read_bytes()
+
+    with pytest.raises(ValueError, match=f"delete {re.escape(str(path))} to rebuild it"):
+        await embed(fake(), ["camp stoves"], tmp_path, kind=kind)
+
+    assert path.read_bytes() == before
+    assert cache_files(path.parent) == [path.name], "temp file left"
+
+
+# ── stages writing at once ──────────────────────────────────────────────────
+
+
+@dataclass
+class HeldVoyage(FakeVoyage):
+    """Holds every request until ``go`` is set; the first request sets ``asked``."""
+
+    asked: asyncio.Event = field(default_factory=asyncio.Event)
+    go: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        model: str,
+        input_type: str,
+        output_dimension: int,
+        truncation: bool,
+    ) -> FakeResult:
+        self.asked.set()
+        await self.go.wait()
+        return await super().embed(
+            texts,
+            model=model,
+            input_type=input_type,
+            output_dimension=output_dimension,
+            truncation=truncation,
+        )
+
+
+@pytest.mark.parametrize("kind", KINDS)
+async def test_a_write_keeps_the_rows_another_stage_added_after_this_one_read(
+    tmp_path: Path, kind: Kind
+) -> None:
+    """The lost update of the pipeline: a stage that found no cache wrote only its own rows."""
+    held = HeldVoyage(respond=fake().respond)
+    first = asyncio.create_task(embed(held, ["trail shoes"], tmp_path, kind=kind))
+    await held.asked.wait()
+
+    await embed(fake(), ["rain jackets"], tmp_path, kind=kind)
+    held.go.set()
+    await first
+
+    kept = stored(cache_path(tmp_path, TENANT, kind))["text_sha256"].to_pylist()
+    assert sorted(kept) == sorted(map(text_key, ["trail shoes", "rain jackets"])), "a row was lost"
+
+
+@pytest.mark.parametrize("kind", KINDS)
+async def test_a_text_two_stages_embedded_at_once_is_stored_once(
+    tmp_path: Path, kind: Kind
+) -> None:
+    held = HeldVoyage(respond=fake().respond)
+    first = asyncio.create_task(embed(held, TEXTS[:2], tmp_path, kind=kind))
+    await held.asked.wait()
+
+    await embed(fake(), TEXTS[1:], tmp_path, kind=kind)
+    held.go.set()
+    await first
+
+    kept = stored(cache_path(tmp_path, TENANT, kind))["text_sha256"].to_pylist()
+    assert sorted(kept) == sorted(map(text_key, TEXTS)), "a text was stored twice"
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_writers_in_other_processes_keep_every_row(
+    tmp_path: Path, kind: Kind, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two writers with their own thread and event loop, as two processes have, each rewriting
+    the cache when the other could: only the lock file keeps them from copying the same rows."""
+    asyncio.run(embed(fake(), ["trail shoes"], tmp_path, kind=kind))
+    both_copying = threading.Barrier(2, timeout=0.5)
+    batches = text_vectors_module._batches
+
+    def copying(file: pq.ParquetFile, columns: list[str] | None) -> Iterator[pa.RecordBatch]:
+        # A rewrite reads every column: it waits here for the other writer to copy too.
+        if columns is None:
+            with contextlib.suppress(threading.BrokenBarrierError):
+                both_copying.wait()
+        yield from batches(file, columns)
+
+    monkeypatch.setattr(text_vectors_module, "_batches", copying)
+    texts = ["rain jackets", "camp stoves"]
+
+    with ThreadPoolExecutor(len(texts)) as pool:
+        list(pool.map(lambda text: asyncio.run(embed(fake(), [text], tmp_path, kind=kind)), texts))
+
+    kept = stored(cache_path(tmp_path, TENANT, kind))["text_sha256"].to_pylist()
+    assert sorted(kept) == sorted(map(text_key, ["trail shoes", *texts])), "a row was lost"
+    assert (tmp_path / TENANT / "text_vectors" / ".lock").is_file()
+    assert cache_files(cache_path(tmp_path, TENANT, kind).parent) == [
+        cache_path(tmp_path, TENANT, kind).name
+    ]

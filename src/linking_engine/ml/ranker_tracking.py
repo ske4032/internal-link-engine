@@ -38,7 +38,7 @@ from linking_engine.ml.ranking import (
     Trained,
     placement_gain_share,
 )
-from linking_engine.ml.tracking import EXPERIMENT_KIND, EXPERIMENT_KIND_TAG
+from linking_engine.ml.tracking import EXPERIMENT_KIND, EXPERIMENT_KIND_TAG, start_stage_run
 from linking_engine.models.ranking import NDCG_HISTOGRAM_BINS
 
 if TYPE_CHECKING:
@@ -406,7 +406,7 @@ def _log_ranker(
 ) -> tuple[str, str | None]:
     tenant_id = report.tenant_id
     _use_ranker_experiment(tenant_id)
-    with mlflow.start_run(
+    with start_stage_run(
         run_name="ranker training",
         tags={
             "tenant_id": tenant_id,

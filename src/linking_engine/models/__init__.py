@@ -125,6 +125,7 @@ from linking_engine.models.page import (
     PassReport,
     TenantGraphCounts,
 )
+from linking_engine.models.pipeline import PipelineReport, StageResult, StageStatus
 from linking_engine.models.quality import (
     AnchorMatchCheck,
     CheckName,
@@ -295,6 +296,7 @@ __all__ = [
     "PassReport",
     "PillarFloor",
     "PillarFloorBasis",
+    "PipelineReport",
     "PrepareReport",
     "ProductMeasures",
     "PromotionDecision",
@@ -329,6 +331,8 @@ __all__ = [
     "SentenceTarget",
     "SignalReport",
     "SiteSummary",
+    "StageResult",
+    "StageStatus",
     "StrategicKeyword",
     "TargetCandidates",
     "TargetFix",

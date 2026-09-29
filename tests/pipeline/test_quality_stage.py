@@ -564,13 +564,14 @@ def entries(directory: Path) -> list[str]:
 
 
 def files(root: Path) -> dict[str, tuple[int, str]]:
+    # The tenant's text-vector lock file holds no data.
     return {
         str(path.relative_to(root)): (
             path.stat().st_mtime_ns,
             hashlib.sha256(path.read_bytes()).hexdigest(),
         )
         for path in sorted(root.rglob("*"))
-        if path.is_file()
+        if path.is_file() and path.name != ".lock"
     }
 
 
