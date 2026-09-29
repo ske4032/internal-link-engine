@@ -1,4 +1,5 @@
-"""Per-page structure and languages read for feature assembly and candidate retrieval."""
+"""Per-page structure, languages and hub members read for feature assembly and candidate
+retrieval."""
 
 from __future__ import annotations
 
@@ -9,7 +10,7 @@ from neo4j import AsyncGraphDatabase
 
 from linking_engine.errors import DatabaseReadError
 from linking_engine.graph.repo import GraphRepo
-from linking_engine.models import Link, Page, PageStructure
+from linking_engine.models import Link, Page, PageHub, PageStructure
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -111,9 +112,43 @@ async def test_languages_are_the_tenants_crawled_pages_only(graph: GraphRepo, te
 
 
 @pytest.mark.integration
+async def test_hub_members_are_the_tenants_crawled_pages_in_a_hub(
+    graph: GraphRepo, tenant: str
+) -> None:
+    other = f"{tenant}-other"
+    await graph.upsert_pages(tenant, [page("/b"), page("/a"), page("/noise"), page("/none")])
+    await graph.upsert_placeholders(tenant, [url("/ghost")])
+    await graph.upsert_pages(other, [page("/a"), page("/c")])
+    for owner, path, hub, pillar in (
+        (tenant, "/a", 3, True),
+        (tenant, "/b", 3, False),
+        (tenant, "/noise", -1, False),
+        (tenant, "/ghost", 3, False),
+        (other, "/a", 4, False),
+        (other, "/c", 3, True),
+    ):
+        await graph._auto(
+            "MATCH (p:Page {tenantId: $t, url: $u}) SET p.hubId = $hub, p.isHubPillar = $pillar",
+            t=owner,
+            u=url(path),
+            hub=hub,
+            pillar=pillar,
+        )
+    await graph._auto(
+        "MATCH (p:Page {tenantId: $t, url: $u}) REMOVE p.isHubPillar", t=tenant, u=url("/b")
+    )
+
+    assert await graph.hub_members(tenant) == [
+        PageHub(url=url("/a"), hub_id=3, is_hub_pillar=True),
+        PageHub(url=url("/b"), hub_id=3),
+    ]
+
+
+@pytest.mark.integration
 async def test_a_tenant_without_pages_reads_empty(graph: GraphRepo, tenant: str) -> None:
     assert await graph.page_structure(tenant) == []
     assert await graph.page_languages(tenant) == {}
+    assert await graph.hub_members(tenant) == []
 
 
 @pytest.mark.integration
@@ -127,6 +162,9 @@ async def test_stored_values_that_do_not_fit_fail_the_read(graph: GraphRepo, ten
         await graph.page_structure(tenant)
     with pytest.raises(DatabaseReadError, match="language 5"):
         await graph.page_languages(tenant)
+    await graph._auto("MATCH (p:Page {tenantId: $t}) SET p.hubId = 2.5", t=tenant)
+    with pytest.raises(DatabaseReadError, match="hub members"):
+        await graph.hub_members(tenant)
 
 
 @pytest.fixture
@@ -140,7 +178,7 @@ async def offline_graph() -> AsyncIterator[GraphRepo]:
     await repo.close()
 
 
-@pytest.mark.parametrize("read", ["page_structure", "page_languages"])
+@pytest.mark.parametrize("read", ["page_structure", "page_languages", "hub_members"])
 async def test_reads_reject_a_blank_tenant_before_any_query(
     offline_graph: GraphRepo, read: str
 ) -> None:

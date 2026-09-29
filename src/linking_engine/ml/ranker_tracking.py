@@ -213,6 +213,8 @@ def ranker_metrics(report: RankerReport) -> dict[str, float]:
             "orphan_slot_share": measured.orphan_slot_share,
             "orphan_page_share": measured.orphan_page_share,
             "orphans_reached": measured.orphans_reached,
+            "orphans_to_pillar": measured.orphans_to_pillar,
+            "inbound_gini": measured.inbound_gini,
         }
         metrics.update({f"{prefix}_{k}": v for k, v in found.items() if v is not None})
     if report.best_iteration is not None:
@@ -370,6 +372,8 @@ def ranker_tables(report: RankerReport) -> dict[str, dict[str, list[object]]]:
             "orphan_slot_share": [m.orphan_slot_share for m in measures],
             "orphan_page_share": [m.orphan_page_share for m in measures],
             "orphans_reached": [m.orphans_reached for m in measures],
+            "orphans_to_pillar": [m.orphans_to_pillar for m in measures],
+            "inbound_gini": [m.inbound_gini for m in measures],
         }
     return tables
 

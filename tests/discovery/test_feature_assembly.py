@@ -496,6 +496,30 @@ def test_pairs_come_in_chunks_in_candidate_order() -> None:
     ]
 
 
+def test_a_channel_pair_gets_a_feature_row_after_the_nearest_ones() -> None:
+    pages = contexts([page(f"p{i}") for i in range(4)])
+    (nearest,) = candidates({"p0": [("p1", 0.9), ("p2", 0.8)]})
+    pillar = TargetCandidates.model_validate(
+        {
+            **nearest.model_dump(),
+            "sources": (*nearest.sources, url("p3")),
+            "similarities": (*nearest.similarities, -0.5),
+            "eligible": nearest.eligible + 1,
+            "pillar_pairs": 1,
+        }
+    )
+    placements = {(url("p3"), url("p0")): (0.4, 0.7)}
+
+    rows = [f for c in feature_chunks([pillar], pages, placements=placements) for f in c]
+
+    assert [(f.source_url, f.target_url, f.content_cosine) for f in rows] == [
+        (url("p1"), url("p0"), 0.9),
+        (url("p2"), url("p0"), 0.8),
+        (url("p3"), url("p0"), -0.5),
+    ]
+    assert (rows[-1].context_relevance, rows[-1].anchor_target_fit) == (0.4, 0.7)
+
+
 def test_chunking_refuses_a_zero_size_and_unknown_urls() -> None:
     pages, targets = chain(3)
     with pytest.raises(ValueError, match="chunk_pairs"):

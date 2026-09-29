@@ -550,18 +550,36 @@ def seed_result(
 PRODUCT_COLUMNS: Final = ("content_cosine", "same_hub")
 
 
+def gini(counts: npt.ArrayLike) -> float | None:
+    """The Gini coefficient of non-negative counts: 0 when all are equal, (n - 1) / n when one
+    takes everything; None when there are none or they sum to 0."""
+    values = np.sort(np.asarray(counts, dtype=np.float64).reshape(-1))
+    if (values < 0).any():
+        raise ValueError("counts must be non-negative")
+    total = float(values.sum())
+    if not total:
+        return None
+    n = len(values)
+    ranks = np.arange(1, n + 1, dtype=np.float64)
+    return min(1.0, max(0.0, float(2 * (ranks @ values) / (n * total) - (n + 1) / n)))
+
+
 def product_measures(
     frame: DataFrame,
     score_column: str,
     scorer: ScorerName,
     orphans: Collection[str],
     *,
+    pillars: Mapping[str, str],
     k: int = PRODUCT_K,
 ) -> ProductMeasures:
     """``scorer`` on production candidate pairs, over the first ``k`` pairs of every source page
     by descending score (ties by target, NaN last): their mean content cosine, the share in the
     source's hub, the share of slots going to orphan targets against the orphans' share of the
-    candidate target pages, and the share of those orphans some source page shows."""
+    candidate target pages, the share of those orphans some source page shows, the share of the
+    orphan source pages in a hub that show their hub's pillar, and the Gini coefficient of the
+    pairs into each candidate target page. ``pillars`` is the hub pillar of every other page in
+    a hub."""
     if k < 1:
         raise ValueError("k must be at least 1")
     missing = sorted(
@@ -586,6 +604,20 @@ def product_measures(
     orphan_target = np.isin(target_values, np.asarray(list(orphans), dtype=object))
     orphan_pages = int(orphan_target.sum())
     reached = np.unique(target_codes[top])
+    orphan_set = set(orphans)
+    # In-hub orphan sources, each with its hub's pillar.
+    spokes = {
+        source: pillars[source]
+        for source in source_values.tolist()
+        if source in orphan_set and source in pillars
+    }
+    shown = set(
+        zip(
+            source_values[source_codes[top]].tolist(),
+            target_values[target_codes[top]].tolist(),
+            strict=True,
+        )
+    )
     return ProductMeasures(
         scorer=scorer,
         k=k,
@@ -596,6 +628,10 @@ def product_measures(
         orphans_reached=float(orphan_target[reached].sum()) / orphan_pages
         if orphan_pages
         else None,
+        orphans_to_pillar=sum(pair in shown for pair in spokes.items()) / len(spokes)
+        if spokes
+        else None,
+        inbound_gini=gini(np.bincount(target_codes[top], minlength=len(target_values))),
     )
 
 
@@ -674,7 +710,9 @@ def _product_lines(report: RankerReport) -> list[str]:
             + ("n/a" if m.top_relevance is None else f"{m.top_relevance:.3f}")
             + f", same hub {m.same_hub_share:.1%}, orphan targets {m.orphan_slot_share:.1%} of "
             f"the slots against {m.orphan_page_share:.1%} of the target pages, "
-            f"{_percent(m.orphans_reached)} of the orphans shown somewhere"
+            f"{_percent(m.orphans_reached)} of the orphans shown somewhere, "
+            f"{_percent(m.orphans_to_pillar)} of the orphans in a hub showing its main page, "
+            "inbound Gini " + ("n/a" if m.inbound_gini is None else f"{m.inbound_gini:.3f}")
             for m in report.product_measures
         )
         + "."

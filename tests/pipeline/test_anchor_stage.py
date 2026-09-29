@@ -22,7 +22,7 @@ from linking_engine.models import (
     Link,
     Page,
 )
-from linking_engine.pipeline.anchors import _SCHEMA, extract_anchors
+from linking_engine.pipeline.anchors import _SCHEMA, AnchorView, extract_anchors, lexical_run
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -204,6 +204,52 @@ async def test_anchors_come_from_candidates_and_bridges_and_skip_existing_anchor
     logged = " ".join(str(value) for value in line.values())
     leaked = [text for text in (*map(url, VECTORS), "trail shoes", GUIDE) if text in logged]
     assert leaked == []
+
+
+@pytest.mark.integration
+async def test_a_hidden_link_the_channel_returns_gets_its_anchor_matches_on_the_view(
+    graph: GraphRepo, mongo: MongoRepo, tenant: str, tmp_path: Path
+) -> None:
+    """/t is the pillar of the guide's hub, and the guide links to it. With that link hidden and
+    one nearest source per target, only the hub-main-page channel returns the pair; extraction
+    reads it like any candidate, the hidden link's anchor free again."""
+    await seed(graph, mongo, tenant)
+    into_pillar = Link(
+        source_url=url("/g"),
+        target_url=url("/t"),
+        position=2,
+        anchor_text="four season tents",
+        surrounding_text="Pack four season tents too.",
+    )
+    await graph.replace_links(tenant, [url("/g")], [EXISTING, UNLOCATED, into_pillar])
+    await graph._auto(
+        "UNWIND $rows AS row MATCH (p:Page {tenantId: $t, url: row.url}) "
+        "SET p.hubId = 1, p.isHubPillar = row.pillar",
+        t=tenant,
+        rows=[{"url": url("/g"), "pillar": False}, {"url": url("/t"), "pillar": True}],
+    )
+    hidden = frozenset({(url("/g"), url("/t"))})
+    stored = (await graph.link_graph(tenant)).links
+    held = await retrieve_candidates(
+        graph, tenant, per_target=1, links=[link for link in stored if link not in hidden]
+    )
+    [pillar] = [entry for entry in held.targets if entry.target_url == url("/t")]
+    assert (pillar.sources, pillar.pillar_pairs) == ((url("/s"), url("/g")), 1)
+
+    run = await lexical_run(graph, mongo, tenant, cache_dir=tmp_path, view=AnchorView(held, hidden))
+
+    pairs = {(pair.source_url, pair.target_url): pair for pair in run.pairs}
+    assert pairs.keys() == {
+        (s, entry.target_url) for entry in held.targets for s in entry.sources
+    }, "a channel pair is not extracted"
+    channel = pairs[(url("/g"), url("/t"))]
+    assert (channel.similarity, channel.bridge) == (pillar.similarities[1], False)
+    [match] = run.matches[(url("/g"), url("/t"))]
+    assert (match.rung, match.phrase, match.keyword_source) == (
+        "EXACT",
+        "four season tents",
+        "INFERRED",
+    )
 
 
 @pytest.mark.integration

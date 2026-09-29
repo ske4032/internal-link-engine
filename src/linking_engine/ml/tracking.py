@@ -100,10 +100,12 @@ from linking_engine.ml.quality import (
     quality_metrics,
 )
 from linking_engine.models import (
+    ANY_LANGUAGE,
     ActionType,
     ExclusionReason,
     IssueFlag,
     OrphanLabel,
+    OrphanSlotReason,
     QualityBaseline,
     QualitySnapshot,
     UnanchoredReason,
@@ -253,20 +255,50 @@ _CANDIDATE_PARAMS = ("index", "per_target", "chunk_size")
 _BASELINE_CANDIDATES = 10
 
 
+_PILLAR_FLOORS = ("pillar_floors", "pillar_floor_basis", "pillar_floor_links")
+
+
+def _floor_key(language: str) -> str:
+    return "tenant" if language == ANY_LANGUAGE else language
+
+
 def candidate_metrics(report: CandidateReport) -> dict[str, float]:
-    """Every numeric result of the run, flat; values that could not be computed are left out."""
-    return {
+    """Every numeric result of the run, flat, the pillar floors and their link counts per
+    language ("tenant" for the tenant-wide floor); values that could not be computed are left
+    out."""
+    metrics = {
         name: float(value)
         for name, value in report.model_dump(
-            exclude={"tenant_id", "finished_at", *_CANDIDATE_PARAMS}
+            exclude={"tenant_id", "finished_at", *_CANDIDATE_PARAMS, *_PILLAR_FLOORS}
         ).items()
         if value is not None
     }
+    for language, floor in report.pillar_floors.items():
+        metrics[f"pillar_floor_{_floor_key(language)}"] = floor
+        metrics[f"pillar_floor_links_{_floor_key(language)}"] = float(
+            report.pillar_floor_links[language]
+        )
+    return metrics
+
+
+def candidate_params(report: CandidateReport) -> dict[str, str]:
+    """The run's settings, and the basis of each pillar floor."""
+    params = {
+        name: str(value)
+        for name, value in report.model_dump(include=set(_CANDIDATE_PARAMS)).items()
+    }
+    params.update(
+        {
+            f"pillar_floor_basis_{_floor_key(language)}": basis
+            for language, basis in report.pillar_floor_basis.items()
+        }
+    )
+    return params
 
 
 def candidate_table(found: CandidateSet) -> str:
-    """One CSV row per target: its candidates, the eligible and linked pages, and the first
-    and last kept similarity (empty without candidates)."""
+    """One CSV row per target: its nearest candidates, the eligible and linked pages, the first
+    and last nearest similarity (empty without candidates), and the channel's pairs."""
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
     writer.writerow(
@@ -278,17 +310,19 @@ def candidate_table(found: CandidateSet) -> str:
             "linked_nearer",
             "best_similarity",
             "last_similarity",
+            "pillar_pairs",
         )
     )
     writer.writerows(
         (
             target.target_url,
-            len(target.sources),
+            target.nearest,
             target.eligible,
             target.linked,
             target.linked_nearer,
-            target.similarities[0] if target.similarities else "",
-            target.similarities[-1] if target.similarities else "",
+            target.similarities[0] if target.nearest else "",
+            target.similarities[target.nearest - 1] if target.nearest else "",
+            target.pillar_pairs,
         )
         for target in found.targets
     )
@@ -308,7 +342,7 @@ def log_candidates(found: CandidateSet, summary: str) -> str:
             "mlflow.note.content": summary,
         },
     ) as run:
-        mlflow.log_params(report.model_dump(include=set(_CANDIDATE_PARAMS)))
+        mlflow.log_params(candidate_params(report))
         mlflow.log_metrics(candidate_metrics(report))
         mlflow.log_dict(report.model_dump(mode="json"), "report.json")
         mlflow.log_text(summary, "summary.md")
@@ -1340,7 +1374,8 @@ def latest_quality(tenant_id: str) -> QualitySnapshot | None:
 
 def recommendation_metrics(report: RecommendationReport) -> dict[str, float]:
     """Every count of the run, flat: per action type, tier, unanchored reason, orphan label,
-    exclusion reason and audit flag, and the totals; no urls."""
+    exclusion reason, audit flag and unmet guarantee, the totals, and the inbound Gini and top
+    ten share when there are suggested links; no urls."""
     summary = report.summary
     metrics = {
         name: float(getattr(summary, name))
@@ -1357,6 +1392,15 @@ def recommendation_metrics(report: RecommendationReport) -> dict[str, float]:
             "links_audited",
             "unverified_links",
             "target_fixes",
+            "suggested_links",
+            "reserve_links",
+            "guaranteed_pages",
+            "orphan_slots",
+            "orphans_reached",
+            "orphans_to_pillar",
+            "pages_at_cap",
+            "links_moved_by_cap",
+            "links_dropped_by_cap",
         )
     }
     metrics["orphan_pages"] = float(sum(summary.orphan_pages.values()))
@@ -1379,6 +1423,13 @@ def recommendation_metrics(report: RecommendationReport) -> dict[str, float]:
         )
     for flag in IssueFlag:
         metrics[f"flag_{flag.value.lower()}"] = float(summary.audit_flags.get(flag, 0))
+    metrics["guarantees_unmet"] = float(sum(summary.guarantees_unmet.values()))
+    for short in OrphanSlotReason:
+        metrics[f"unmet_{short.value.lower()}"] = float(summary.guarantees_unmet.get(short, 0))
+    if summary.inbound_gini is not None:
+        metrics["inbound_gini"] = summary.inbound_gini
+    if summary.top10_inbound_share is not None:
+        metrics["top10_inbound_share"] = summary.top10_inbound_share
     return metrics
 
 
@@ -1403,6 +1454,10 @@ def log_recommendations(report: RecommendationReport, summary: str) -> str:
             {
                 "limit_per_source": report.limit_per_source,
                 "content_gap_limit": report.content_gap_limit,
+                "words_per_link": report.words_per_link,
+                "guaranteed_inbound_links": report.guaranteed_inbound_links,
+                "guaranteed_inbound_below": report.guaranteed_inbound_below,
+                "max_suggested_inbound": report.max_suggested_inbound,
                 "scorer": report.scorer.value,
                 "model_version": report.model_version or "none",
             }

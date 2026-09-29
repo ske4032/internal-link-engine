@@ -197,6 +197,8 @@ def test_train_ranker_run_logs_tags_params_metrics_tables_and_registers(
     assert found["product_learned_top_relevance"] == pytest.approx(0.71)
     assert found["product_plain_orphan_slot_share"] == pytest.approx(0.03)
     assert found["product_baseline_same_hub_share"] == pytest.approx(0.7)
+    assert found["product_learned_orphans_to_pillar"] == pytest.approx(0.5)
+    assert found["product_plain_inbound_gini"] == pytest.approx(0.42)
     assert history(client, run_id, "round_positive_placement_share") == [(0, 0.9), (1, 0.9)]
     assert history(client, run_id, "round_negative_placement_share") == [(0, 0.05), (1, 0.05)]
     assert run.data.metrics["placement_gain_share"] == 0.0
@@ -235,6 +237,8 @@ def test_train_ranker_run_logs_tags_params_metrics_tables_and_registers(
     products = table(run_id, "product_measures.json")
     assert products["scorer"] == ["learned", "plain", "baseline"]
     assert products["orphans_reached"] == [0.95, 0.95, 0.95]
+    assert products["orphans_to_pillar"] == [0.5, 0.5, 0.5]
+    assert products["inbound_gini"] == [0.42, 0.42, 0.42]
     assert table(run_id, "ranking_metrics.json")["scorer"] == [
         "learned",
         "learned_excl_link_counts",

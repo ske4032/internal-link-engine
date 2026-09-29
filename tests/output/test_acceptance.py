@@ -14,6 +14,8 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, cast
 
+import numpy as np
+import pandas
 import pyarrow.parquet as pq
 import pytest
 from fixture import (
@@ -22,19 +24,24 @@ from fixture import (
     BETA,
     BRIDGED,
     DATABASE,
+    DIMENSION,
+    EMBEDDING_MODEL,
     FULL,
     GAP_LIMIT,
     KEYWORDLESS,
     KIT_CANONICAL,
-    KIT_COPY,
+    KIT_COPIES,
     KIT_DEAD_END,
     KIT_ORPHAN,
+    KIT_ORPHANS,
     KIT_URLS,
     LIMIT,
     LISTINGS,
     MIXED,
     NO_KEYWORD,
     NOT_FOUND,
+    ORPHAN_COPY,
+    POPULAR,
     PREFIX,
     ROUTES,
     UNAUTHORISED,
@@ -46,7 +53,9 @@ from fixture import (
     expected_state,
     fetch,
     finish_run,
+    gini,
     kit_hub,
+    kit_page_hub,
     open_api,
     pillars,
     plan_inputs,
@@ -62,8 +71,9 @@ from mlflow import MlflowClient
 from mlflow.artifacts import load_text
 from pydantic import BaseModel
 
+from linking_engine.discovery.candidates import retrieve_candidates
 from linking_engine.discovery.features import code_digest
-from linking_engine.discovery.scoring import TOP_CONTRIBUTIONS
+from linking_engine.discovery.scoring import TOP_CONTRIBUTIONS, default_weights, rank_tiers
 from linking_engine.ml.tracking import log_recommendations
 from linking_engine.models import (
     AUDIT_ACTIONS,
@@ -78,12 +88,17 @@ from linking_engine.models import (
     ExclusionReason,
     HubSummary,
     KeywordRung,
+    Link,
     OrphanLabel,
+    OrphanRescue,
+    OrphanSlotReason,
+    Page,
     PageDetail,
     PageProfile,
     PageType,
     Recommendation,
     RecommendationReport,
+    RescueSource,
     RunInfo,
     ScorerName,
     SiteSummary,
@@ -92,6 +107,7 @@ from linking_engine.models import (
     UnanchoredReason,
 )
 from linking_engine.models.anchors import UNANCHORED_ADVICE
+from linking_engine.models.tenant import TenantConfig
 from linking_engine.output.collections import (
     EXCLUDED_PAGES,
     RECOMMENDATIONS,
@@ -111,10 +127,11 @@ from linking_engine.pipeline.recommendations import (
 from linking_engine.urls import normalise_url
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Iterable, Iterator, Sequence
     from pathlib import Path
 
-    import pandas
+    import httpx
+    import numpy.typing as npt
 
     from linking_engine.graph.repo import GraphRepo
     from linking_engine.ingest.mongo_repo import MongoRepo
@@ -135,19 +152,25 @@ def other_tenant() -> str:
     return new_tenant()
 
 
-def probe(route: str, output: ServedOutput) -> tuple[str, dict[str, str]]:
-    """A request for the tenant's own data on the route, url filters included."""
+def probes(route: str, output: ServedOutput) -> list[tuple[str, Params]]:
+    """Requests for the tenant's own data on the route, url filters and the #90 parameters
+    included."""
     path = (PREFIX + route).format(
         tenant=output.tenant_id, recommendation_id=output.recommendations[0].id
     )
-    params = {
-        "/recommendations": {"source": URLS[0], "target": URLS[1]},
-        "/page": {"url": URLS[0]},
-        "/unanchored": {"target": KEYWORDLESS},
-        "/pages": {"hub": str(output.pages[0].hub_id)},
-        "/bridges": {"hub": str(output.bridges[0].hub_a)},
-    }.get(route, {})
-    return path, params
+    params: dict[str, list[Params]] = {
+        "/recommendations": [
+            {"source": URLS[0], "target": URLS[1]},
+            {"order": "best", "suggested": "true"},
+            {"orphan_slot": "true"},
+        ],
+        "/page": [{"url": URLS[0]}],
+        "/unanchored": [{"target": KEYWORDLESS}],
+        "/pages": [{"hub": str(output.pages[0].hub_id)}],
+        "/bridges": [{"hub": str(output.bridges[0].hub_a)}],
+        "/orphans": [{}, {"unmet": "true", "orphan_label": str(output.pages[-1].orphan_label)}],
+    }
+    return [(path, query) for query in params.get(route, [{}])]
 
 
 async def tenant_documents(mongo: MongoRepo, tenant: str) -> dict[str, list[dict[str, object]]]:
@@ -192,16 +215,17 @@ async def test_a_key_never_reaches_another_tenant(
             assert (response.status_code, response.json()) == (404, NOT_FOUND), path
 
         for route in ROUTES:
-            path, params = probe(route, b)
-            response = await client.get(path, params=params, headers={"X-API-Key": key_a})
-            assert (response.status_code, response.json()) == (404, NOT_FOUND), (
-                f"A's key on B's {route} must look like a missing resource"
-            )
-            response = await client.get(path, params=params, headers={"X-API-Key": key_b})
-            assert response.status_code == 200, (route, response.text)
-            for headers in ({}, {"X-API-Key": "lek_" + "f" * 43}, {"X-API-Key": revoked}):
-                response = await client.get(path, params=params, headers=headers)
-                assert (response.status_code, response.json()) == (401, UNAUTHORISED), route
+            for path, query in probes(route, b):
+                response = await client.get(path, params=query, headers={"X-API-Key": key_a})
+                assert (response.status_code, response.json()) == (404, NOT_FOUND), (
+                    f"A's key on B's {route} {query} must look like a missing resource"
+                )
+                response = await client.get(path, params=query, headers={"X-API-Key": key_b})
+                assert response.status_code == 200, (route, query, response.text)
+                assert response.json().get("total", 1) > 0, f"B's {route} {query} probes nothing"
+                for headers in ({}, {"X-API-Key": "lek_" + "f" * 43}, {"X-API-Key": revoked}):
+                    response = await client.get(path, params=query, headers=headers)
+                    assert (response.status_code, response.json()) == (401, UNAUTHORISED), route
 
         health = await client.get("/health")
         assert (health.status_code, health.json()) == (200, {"status": "ok"})
@@ -263,6 +287,158 @@ async def test_a_rerun_replaces_the_output_atomically(
         await writer.close()
 
 
+async def served_pair(
+    mongo: MongoRepo, tenant: str, other_tenant: str
+) -> tuple[ServedOutput, ServedOutput, str]:
+    """Both tenants' output stored over the same urls, and a key for the first."""
+    a = served_output(tenant, run_id(), ALPHA)
+    b = served_output(other_tenant, run_id(), BETA)
+    for output in (a, b):
+        await write_served(mongo, output)
+    key, _ = await KeyStore(mongo._db).issue(tenant, "acceptance")
+    return a, b, key
+
+
+async def listed(
+    client: httpx.AsyncClient, path: str, key: str, params: Params, *, limit: int = 3
+) -> list[Recommendation]:
+    items, total = await walk(client, path, key, params, limit=limit)
+    assert total == len(items), (params, total, len(items))
+    return [Recommendation.model_validate(item) for item in items]
+
+
+async def test_best_first_order_and_the_suggested_filter(
+    mongo: MongoRepo, mongo_uri: str, tenant: str, other_tenant: str
+) -> None:
+    a, _, key = await served_pair(mongo, tenant, other_tenant)
+    records = a.recommendations
+    best = sorted(
+        (r for r in records if r.action_type in NEW_LINK_ACTIONS), key=lambda r: r.best_rank or 0
+    )
+    assert [r.best_rank for r in best] == list(range(1, len(best) + 1))
+    assert [r.source_url for r in best] != sorted(r.source_url for r in best), (
+        "the fixture's best-first order must cross pages, or it is the page order"
+    )
+    suggested = [r for r in records if r.suggested]
+    assert {r.action_type for r in suggested} == {ActionType.ADD_LINK}
+    assert 0 < len(suggested) < sum(1 for r in records if r.action_type is ActionType.ADD_LINK)
+    assert sum(1 for r in records if r.orphan_slot) == 1, "the fixture places one orphan slot"
+    path = f"{PREFIX.format(tenant=tenant)}/recommendations"
+
+    async with open_api(mongo_uri) as (_, client):
+        walked = await listed(client, path, key, {"order": "best"})
+        whole = await fetch(client, path, key, order="best", limit="500")
+        again = await fetch(client, path, key, order="best", limit="500")
+        by_page = await listed(client, path, key, {"order": "page"}, limit=5)
+        default = await listed(client, path, key, {}, limit=5)
+        cases: list[tuple[Params, list[Recommendation]]] = [
+            ({"suggested": "true"}, suggested),
+            ({"suggested": "false"}, [r for r in records if not r.suggested]),
+            ({"orphan_slot": "true"}, [r for r in records if r.orphan_slot]),
+            ({"suggested": "true", "order": "best"}, [r for r in best if r.suggested]),
+            ({"order": "best", "source": URLS[1]}, [r for r in best if r.source_url == URLS[1]]),
+            ({"order": "best", "tier": 2}, [r for r in best if r.tier == 2]),
+            ({"order": "best", "action_type": ActionType.FIX.value}, []),
+        ]
+        found = [(params, await listed(client, path, key, params)) for params, _ in cases]
+        invalid = await client.get(path, params={"order": "worst"}, headers={"X-API-Key": key})
+
+    assert walked == best, "order=best must list every new-link record by best_rank"
+    assert whole == again, "two calls disagree"
+    assert isinstance(whole, dict)
+    assert whole["next_cursor"] is None
+    assert [Recommendation.model_validate(item) for item in whole["items"]] == walked, (
+        "walking best-first page by page differs from one big page"
+    )
+    assert by_page == default == list(records), "order=page is the stored order, the default"
+    for (params, served), (_, expected) in zip(found, cases, strict=True):
+        assert served == expected, params
+    assert invalid.status_code == 422, invalid.text
+
+
+async def test_orphans_endpoint_serves_rescue_with_reasons(
+    mongo: MongoRepo, mongo_uri: str, tenant: str, other_tenant: str
+) -> None:
+    a, _, key = await served_pair(mongo, tenant, other_tenant)
+    base = PREFIX.format(tenant=tenant)
+    stored = a.orphans
+    orphan = next(page for page in a.pages if page.is_orphan)
+    assert orphan.orphan_label is not None
+    label = orphan.orphan_label.value
+    cases: list[tuple[Params, list[OrphanRescue]]] = [
+        ({"unmet": "true"}, [r for r in stored if r.unmet_reason is not None]),
+        ({"unmet": "false"}, [r for r in stored if r.unmet_reason is None]),
+        ({"orphan_label": label}, [r for r in stored if r.profile.url == orphan.url]),
+        ({"orphan_label": OrphanLabel.FOOTER_ONLY.value}, []),
+        ({"orphan_label": label, "unmet": "false"}, []),
+    ]
+    async with open_api(mongo_uri) as (_, client):
+        items, total = await walk(client, f"{base}/orphans", key, limit=2)
+        rescues = [OrphanRescue.model_validate(item) for item in items]
+        filtered = []
+        for params, _ in cases:
+            found, _ = await walk(client, f"{base}/orphans", key, params, limit=1)
+            filtered.append([OrphanRescue.model_validate(item) for item in found])
+        suggested_into = {
+            rescue.profile.url: await listed(
+                client,
+                f"{base}/recommendations",
+                key,
+                {"target": rescue.profile.url, "suggested": "true"},
+            )
+            for rescue in rescues
+        }
+        linked = {
+            source.recommendation_id: Recommendation.model_validate(
+                await fetch(client, f"{base}/recommendations/{source.recommendation_id}", key)
+            )
+            for rescue in rescues
+            for source in rescue.sources
+            if source.recommendation_id is not None
+        }
+        summary = SiteSummary.model_validate(await fetch(client, f"{base}/summary", key))
+
+    assert rescues == list(stored), "the rescue view as stored, in url order"
+    below = a.run.guaranteed_inbound_below
+    assert [r.profile.url for r in rescues] == sorted(
+        page.url for page in a.pages if page.inbound < below
+    ), f"every page with fewer than {below} body links in, and no other"
+    assert total == summary.guaranteed_pages == len(rescues)
+    assert summary.guarantees_unmet == dict(
+        Counter(r.unmet_reason for r in rescues if r.unmet_reason is not None)
+    )
+    reasons = {r.unmet_reason for r in rescues}
+    assert reasons == {None, OrphanSlotReason.SOURCES_FULL, OrphanSlotReason.NO_ANCHOR}, (
+        f"the fixture exercises a met guarantee and two reasons, not {reasons}"
+    )
+    assert max(len(r.sources) for r in rescues) > 1, "no rescue has sources to order"
+    assert linked, "no rescue source is a suggested link"
+
+    for rescue in rescues:
+        url = rescue.profile.url
+        assert rescue.guaranteed == a.run.guaranteed_inbound_links
+        assert rescue.suggested_in == len(suggested_into[url]), url
+        assert (rescue.unmet_reason is None) == (rescue.suggested_in >= rescue.guaranteed), url
+        assert list(rescue.sources) == sorted(
+            rescue.sources,
+            key=lambda s: (
+                s.anchor is None,
+                -s.score,
+                -(s.source_page_rank_percentile or 0.0),
+                s.source_url,
+            ),
+        ), f"{url}: sources out of order"
+        for source in rescue.sources:
+            if source.recommendation_id is None:
+                continue
+            record = linked[source.recommendation_id]
+            assert (record.source_url, record.target_url) == (source.source_url, url)
+            assert record.suggested, "a rescue source's id names a suggested link"
+
+    for (params, expected), served in zip(cases, filtered, strict=True):
+        assert served == expected, params
+
+
 # ── The assembled output: the real stage over the planted stage inputs ──────────────────────
 
 LABELS: Final = {
@@ -286,6 +462,21 @@ AUDIT_DIMENSIONS: Final = (
 STAGE_FILES: Final = frozenset(
     {RANKED_PAIRS_FILE, ANCHOR_CHOICES_FILE, UNANCHORED_FILE, HUB_PAIRS_FILE, BRIDGES_FILE}
 )
+# The summary's page budget and guarantee counts, checked by the #90 tests.
+BUDGET_FIELDS: Final = {
+    "suggested_links",
+    "reserve_links",
+    "guaranteed_pages",
+    "orphan_slots",
+    "guarantees_unmet",
+    "orphans_reached",
+    "orphans_to_pillar",
+    "inbound_gini",
+    "pages_at_cap",
+    "links_moved_by_cap",
+    "links_dropped_by_cap",
+    "top10_inbound_share",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -475,45 +666,6 @@ async def test_ten_new_links_per_source_and_every_audit_verdict(
         assert max(len(found) for found in links.values()) == LIMIT
         assert max(len(found) for found in gaps.values()) == GAP_LIMIT
 
-        # Links first: a page's best-ranked anchored pairs up to the limit, then up to three
-        # content gaps from those ranked above its last link.
-        ranked = pub.ranked_pairs()
-        rank = {
-            (s, t): int(n)
-            for s, t, n in zip(
-                ranked["source_url"], ranked["target_url"], ranked["rank_in_source"], strict=True
-            )
-        }
-        assert {*links, *gaps} <= set(ranked["source_url"])
-        exercised: set[str] = set()
-        for source, group in ranked.groupby("source_url"):
-            order = list(group.sort_values("rank_in_source")["target_url"])
-            anchored = [t for t in order if (source, t) in planted.anchored]
-            emitted = anchored[:LIMIT]
-            last = rank[(source, emitted[-1])] if emitted else None
-            candidates = [t for t in order if planted.unanchored.get((source, t)) in FINDINGS]
-            eligible = [t for t in candidates if last is None or rank[(source, t)] < last]
-            assert [r.target_url for r in links[source]] == emitted, source
-            assert [r.target_url for r in gaps[source]] == eligible[:GAP_LIMIT], source
-            for kind in (links[source], gaps[source]):
-                assert [r.rank_in_source for r in kind] == list(range(1, len(kind) + 1)), source
-            if last is not None:
-                assert all(rank[(source, r.target_url)] < last for r in gaps[source]), (
-                    f"{source}: a content gap ranked below the page's last link"
-                )
-            exercised |= {
-                name
-                for name, seen in (
-                    ("links capped", len(anchored) > LIMIT),
-                    ("gaps capped", len(eligible) > GAP_LIMIT),
-                    ("gap below the last link", len(candidates) > len(eligible)),
-                    ("gaps without links", last is None and bool(gaps[source])),
-                    ("gaps above a link", last is not None and bool(gaps[source])),
-                )
-                if seen
-            }
-        assert len(exercised) == 5, f"the fixture only exercises {sorted(exercised)}"
-
         excluded = planted.excluded_urls
         expected = {
             (result.source_url, result.position): result
@@ -605,13 +757,13 @@ async def test_every_section_is_served(
         per_source = Counter(r.source_url for r in new)
         link_count = Counter(r.source_url for r in new if r.action_type is ActionType.ADD_LINK)
         sources = set(ranked["source_url"])
-        assert summary == SiteSummary(
+        assert summary.model_dump(exclude=BUDGET_FIELDS) == SiteSummary(
             pages=len(KIT_URLS),
             excluded_pages={variant.excluded_reason: 1, ExclusionReason.SITEMAP: 1},
-            orphan_pages={variant.orphan_label: 1},
+            orphan_pages={variant.orphan_label: len(KIT_ORPHANS)},
             dead_end_pages=1,
             duplicate_groups=1,
-            duplicate_copies=1,
+            duplicate_copies=len(KIT_COPIES),
             hubs=2,
             bridge_pairs=1,
             # One per slot: alternatives are not counted.
@@ -625,7 +777,7 @@ async def test_every_section_is_served(
             audit_flags=dict(Counter(flag for r in audits for flag in r.issue_flags)),
             unanchored=dict(Counter(u.reason for u in unanchored)),
             target_fixes=1,
-        )
+        ).model_dump(exclude=BUDGET_FIELDS)
 
         linked = {(link.source, link.target) for link in planted.links}
         inbound = Counter(target for _, target in linked)
@@ -635,7 +787,7 @@ async def test_every_section_is_served(
         assert [page.url for page in pages] == sorted(KIT_URLS)
         for page in pages:
             url = page.url
-            grouped = url in {KIT_CANONICAL, KIT_COPY}
+            grouped = url in {KIT_CANONICAL, *KIT_COPIES}
             assert page.model_dump(
                 exclude={
                     "anchor_mix",
@@ -643,6 +795,7 @@ async def test_every_section_is_served(
                     "crawl_depth",
                     "page_rank_percentile",
                     "page_type",
+                    "link_budget",
                 }
             ) == PageProfile(
                 url=url,
@@ -651,10 +804,10 @@ async def test_every_section_is_served(
                 word_count=0,
                 inbound=inbound[url],
                 outbound=outbound[url],
-                hub_id=kit_hub(variant, url),
+                hub_id=kit_page_hub(variant, url),
                 is_hub_pillar=url in main,
-                is_orphan=url == KIT_ORPHAN,
-                orphan_label=variant.orphan_label if url == KIT_ORPHAN else None,
+                is_orphan=url in KIT_ORPHANS,
+                orphan_label=variant.orphan_label if url in KIT_ORPHANS else None,
                 is_dead_end=url == KIT_DEAD_END,
                 duplicate_group=0 if grouped else None,
                 is_canonical=url == KIT_CANONICAL if grouped else None,
@@ -670,11 +823,11 @@ async def test_every_section_is_served(
                     "crawl_depth",
                     "page_rank_percentile",
                     "page_type",
+                    "link_budget",
                 }
             ), url
             assert page.word_count == len(planted.body(url).split())
             assert page.page_type is (PageType.PILLAR if url in main else PageType.ARTICLE)
-        assert state["/orphans"] == tuple(page for page in pages if page.url == KIT_ORPHAN)
         # Body links into the dead end: its keyword exactly from MIXED, "best" + it from AUDITED.
         dead_end = next(page for page in pages if page.url == KIT_DEAD_END)
         assert dead_end.anchor_mix == AnchorMix(exact=1, partial=1)
@@ -728,7 +881,7 @@ async def test_every_section_is_served(
         assert [r for r in new if r.bridge is not None] == [marked]
 
         assert state["/duplicates"] == (
-            DuplicateGroup(group_id=0, canonical=KIT_CANONICAL, copies=(KIT_COPY,)),
+            DuplicateGroup(group_id=0, canonical=KIT_CANONICAL, copies=tuple(sorted(KIT_COPIES))),
         )
 
         rank = {
@@ -831,6 +984,692 @@ async def test_every_section_is_served(
                 headers={"X-API-Key": pub.key},
             )
             assert invalid.status_code == 422, invalid.text
+
+
+# ── #90: the page budget and the guaranteed inbound links, over the planted stage inputs ────
+
+
+def link_budget(planted: Planted, url: str, rules: TenantConfig) -> int:
+    """A link per ``words_per_link`` body words, at least one, at most the limit, less the
+    distinct pages the body already links to."""
+    words = len(planted.body(url).split())
+    outbound = len({link.target for link in planted.links if link.source == url})
+    return max(0, min(LIMIT, max(1, words // rules.words_per_link)) - outbound)
+
+
+def guaranteed_pages(pages: Iterable[PageProfile], rules: TenantConfig) -> list[str]:
+    """The pages guaranteed inbound links, by url: fewer body links in than the cut-off, and a
+    retrieval target. Every planted page is indexable with a vector, so that is every page but a
+    duplicate copy."""
+    return sorted(
+        page.url
+        for page in pages
+        if page.inbound < rules.guaranteed_inbound_below and page.is_canonical is not False
+    )
+
+
+def scored(pub: Published) -> pandas.DataFrame:
+    """The ranked pairs of the pages in the pipeline, each with the score and tier served for
+    it: the score's percentile over every pair the run read, unrounded as the stage orders by
+    it and rounded as served, and its tier by rank."""
+    frame = pub.ranked.copy()
+    values = frame["score"].to_numpy(dtype=np.float64)
+    ranks = pandas.Series(values).rank(method="average").to_numpy(dtype=np.float64)
+    frame["percentile"] = (ranks - 1) / (len(values) - 1)
+    frame["served"] = [round(100 * float(p), 1) for p in frame["percentile"]]
+    frame["tier"] = rank_tiers(
+        values, frame["source_url"], frame["target_url"], default_weights().tier_shares
+    )
+    excluded = sorted(pub.planted.excluded_urls)
+    keep = ~(frame["source_url"].isin(excluded) | frame["target_url"].isin(excluded))
+    return frame.loc[keep]
+
+
+@dataclass(frozen=True, slots=True)
+class Expected:
+    """Each source page's links as the walk should leave them, in ranker order, and the
+    suggestions the inbound cap moved to a reserve or left unfilled."""
+
+    order: dict[str, list[str]]
+    anchored: dict[str, list[str]]
+    links: dict[str, list[str]]
+    suggested: dict[str, list[str]]
+    moved: dict[str, list[tuple[str, str]]]
+    dropped: dict[str, list[str]]
+    # Suggested links into each page before the cap.
+    wanted: Counter[str]
+
+
+def expected_walk(
+    pub: Published, records: Sequence[Recommendation], pages: Sequence[PageProfile]
+) -> Expected:
+    """The walk from the planted inputs: each page's first `limit` anchored pairs, the first
+    budget of them suggested; then the cap, visiting the suggestions best first, moves one into a
+    full page to its source's first reserve into a page not full, or leaves it unfilled; then the
+    orphan slots the run placed each take the place of their source's weakest suggested link into
+    a page without a guarantee."""
+    planted = pub.planted
+    rules = TenantConfig(tenant_id=pub.tenant_id)
+    cap = rules.max_suggested_inbound
+    exempt = {page.url for page in pages if page.is_hub_pillar}
+    guaranteed = set(guaranteed_pages(pages, rules))
+    frame = scored(pub)
+    order = {
+        str(source): list(group.sort_values("rank_in_source")["target_url"])
+        for source, group in frame.groupby("source_url")
+    }
+    raw = {
+        (s, t): float(x)
+        for s, t, x in zip(frame["source_url"], frame["target_url"], frame["score"], strict=True)
+    }
+    anchored = {s: [t for t in found if (s, t) in planted.anchored] for s, found in order.items()}
+    first = {s: found[:LIMIT] for s, found in anchored.items()}
+    chosen = {s: set(found[: link_budget(planted, s, rules)]) for s, found in first.items()}
+    wanted = Counter(t for found in chosen.values() for t in found)
+
+    into: Counter[str] = Counter()
+    moved: defaultdict[str, list[tuple[str, str]]] = defaultdict(list)
+    dropped: defaultdict[str, list[str]] = defaultdict(list)
+
+    def full(target: str) -> bool:
+        return bool(cap) and target not in exempt and into[target] >= cap
+
+    visits = sorted(
+        ((s, t) for s, found in chosen.items() for t in found),
+        key=lambda pair: (-raw[pair], pair[0], order[pair[0]].index(pair[1]), pair[1]),
+    )
+    for source, target in visits:
+        if not full(target):
+            into[target] += 1
+            continue
+        chosen[source].discard(target)
+        spare = next((t for t in first[source] if t not in chosen[source] and not full(t)), None)
+        if spare is None:
+            dropped[source].append(target)
+            continue
+        chosen[source].add(spare)
+        into[spare] += 1
+        moved[source].append((target, spare))
+
+    slots = {r.source_url: r.target_url for r in records if r.orphan_slot}
+    links: dict[str, list[str]] = {}
+    suggested: dict[str, list[str]] = {}
+    for source, found in order.items():
+        kept = [t for t in found if t in first[source] or t == slots.get(source)]
+        picked = chosen[source]
+        if source in slots:
+            given = [t for t in kept if t in picked and t not in guaranteed]
+            assert given, f"{source} gave a slot with no link to give up"
+            picked = (picked - {given[-1]}) | {slots[source]}
+        if len(kept) > LIMIT:
+            kept.remove([t for t in kept if t not in picked][-1])
+        links[source] = kept
+        suggested[source] = [t for t in kept if t in picked]
+    return Expected(order, anchored, links, suggested, dict(moved), dict(dropped), wanted)
+
+
+def by_source(
+    records: Iterable[Recommendation],
+) -> tuple[defaultdict[str, list[Recommendation]], defaultdict[str, list[Recommendation]]]:
+    """Each source page's ADD_LINKs and CONTENT_GAPs, in served order."""
+    links: defaultdict[str, list[Recommendation]] = defaultdict(list)
+    gaps: defaultdict[str, list[Recommendation]] = defaultdict(list)
+    for record in records:
+        if record.action_type is ActionType.ADD_LINK:
+            links[record.source_url].append(record)
+        elif record.action_type is ActionType.CONTENT_GAP:
+            gaps[record.source_url].append(record)
+    return links, gaps
+
+
+async def test_suggested_links_follow_the_page_budget(
+    published: tuple[Published, Published], mongo_uri: str
+) -> None:
+    exercised: set[str] = set()
+    for pub in published:
+        planted = pub.planted
+        rules = TenantConfig(tenant_id=pub.tenant_id)
+        async with open_api(mongo_uri) as (_, client):
+            state = await served_state(client, pub.tenant_id, pub.key)
+        records = cast("tuple[Recommendation, ...]", state["/recommendations"])
+        pages = cast("tuple[PageProfile, ...]", state["/pages"])
+        run = cast("RunInfo", state["/runs/latest"])
+        settings = (
+            rules.words_per_link,
+            rules.guaranteed_inbound_links,
+            rules.guaranteed_inbound_below,
+            rules.max_suggested_inbound,
+        )
+        assert (
+            run.words_per_link,
+            run.guaranteed_inbound_links,
+            run.guaranteed_inbound_below,
+            run.max_suggested_inbound,
+        ) == settings, "the run stamps other settings than the tenant's"
+        assert (
+            pub.report.words_per_link,
+            pub.report.guaranteed_inbound_links,
+            pub.report.guaranteed_inbound_below,
+            pub.report.max_suggested_inbound,
+        ) == settings, "the stage reports other settings than the tenant's"
+        budgets = {url: link_budget(planted, url, rules) for url in KIT_URLS}
+        assert {page.url: page.link_budget for page in pages} == budgets
+        links, gaps = by_source(records)
+        expected = expected_walk(pub, records, pages)
+        frame = scored(pub)
+        rank = {
+            (s, t): int(n)
+            for s, t, n in zip(
+                frame["source_url"], frame["target_url"], frame["rank_in_source"], strict=True
+            )
+        }
+
+        for source, order in expected.order.items():
+            anchored = expected.anchored[source]
+            budget = budgets[source]
+            slots = [r.target_url for r in links[source] if r.orphan_slot]
+            assert len(slots) <= 1, f"{source} gave {len(slots)} orphan slots"
+            kept, suggested = expected.links[source], expected.suggested[source]
+            served = links[source]
+            assert [r.target_url for r in served] == kept, f"{source}: its links"
+            assert [r.target_url for r in served if r.suggested] == suggested, (
+                f"{source}: suggested must be its first {budget} links, reserves after them, "
+                "but for the cap and its orphan slot"
+            )
+            assert [r.rank_in_source for r in served] == list(range(1, len(served) + 1))
+            assert len(served) <= LIMIT
+
+            # Content gaps only on a page with a budget, above its last suggested link.
+            candidates = [t for t in order if planted.unanchored.get((source, t)) in FINDINGS]
+            last = rank[(source, suggested[-1])] if suggested else None
+            eligible = (
+                [t for t in candidates if last is None or rank[(source, t)] < last]
+                if budget
+                else []
+            )
+            assert [r.target_url for r in gaps[source]] == eligible[:GAP_LIMIT], (
+                f"{source}: its content gaps"
+            )
+            assert [r.rank_in_source for r in gaps[source]] == list(range(1, len(gaps[source]) + 1))
+            words = len(planted.body(source).split())
+            exercised |= {
+                name
+                for name, seen in (
+                    ("budget capped at the limit", words // rules.words_per_link > LIMIT),
+                    ("links capped", len(anchored) > LIMIT),
+                    ("reserves after suggested links", 0 < len(suggested) < len(kept)),
+                    ("links without a budget", budget == 0 and bool(kept)),
+                    ("gaps held back without a budget", budget == 0 and bool(candidates)),
+                    ("gaps capped", len(eligible) > GAP_LIMIT),
+                    (
+                        "a gap below the last suggested link",
+                        bool(budget) and eligible != candidates,
+                    ),
+                    ("gaps without suggested links", last is None and bool(gaps[source])),
+                    ("gaps above a suggested link", last is not None and bool(gaps[source])),
+                    ("a link given up for a slot", bool(slots)),
+                )
+                if seen
+            }
+
+        added = [r for r in records if r.action_type is ActionType.ADD_LINK]
+        summary = cast("SiteSummary", state["/summary"])
+        assert (summary.suggested_links, summary.reserve_links) == (
+            sum(1 for r in added if r.suggested),
+            sum(1 for r in added if not r.suggested),
+        )
+        # Best first across pages: the unrounded score, then source, rank in source, action and
+        # target. No two new links here share a served score, so the unit tests prove the order
+        # of rounded ties.
+        percentile = {
+            (s, t): float(p)
+            for s, t, p in zip(
+                frame["source_url"], frame["target_url"], frame["percentile"], strict=True
+            )
+        }
+        new = [r for r in records if r.action_type in NEW_LINK_ACTIONS]
+        assert [r.score for r in new] == [
+            round(100 * percentile[(r.source_url, r.target_url)], 1) for r in new
+        ], "a served score is not the rounded percentile the best-first order is keyed on"
+        best = sorted(
+            new,
+            key=lambda r: (
+                -percentile[(r.source_url, r.target_url)],
+                r.source_url,
+                r.rank_in_source,
+                r.action_type,
+                r.target_url,
+            ),
+        )
+        assert [r.best_rank for r in best] == list(range(1, len(best) + 1))
+        assert all(r.best_rank is None for r in records if r.action_type in AUDIT_ACTIONS)
+        assert state["/recommendations?order=best"] == tuple(best)
+
+    assert exercised == {
+        "budget capped at the limit",
+        "links capped",
+        "reserves after suggested links",
+        "links without a budget",
+        "gaps held back without a budget",
+        "gaps capped",
+        "a gap below the last suggested link",
+        "gaps without suggested links",
+        "gaps above a suggested link",
+        "a link given up for a slot",
+    }, f"the fixture only exercises {sorted(exercised)}"
+
+
+async def guarantee_checks(pub: Published, mongo_uri: str) -> set[str]:
+    """Check one tenant's orphan slots, rescue view and summary against its planted inputs;
+    returns the cases its output exercises."""
+    exercised: set[str] = set()
+    planted = pub.planted
+    rules = TenantConfig(tenant_id=pub.tenant_id)
+    need = rules.guaranteed_inbound_links
+    async with open_api(mongo_uri) as (_, client):
+        state = await served_state(client, pub.tenant_id, pub.key)
+    records = cast("tuple[Recommendation, ...]", state["/recommendations"])
+    pages = cast("tuple[PageProfile, ...]", state["/pages"])
+    rescues = cast("tuple[OrphanRescue, ...]", state["/orphans"])
+    summary = cast("SiteSummary", state["/summary"])
+    hubs = cast("tuple[HubSummary, ...]", state["/hubs"])
+    budgets = {url: link_budget(planted, url, rules) for url in KIT_URLS}
+    hub = {page.url: page.hub_id for page in pages}
+    strength = {page.url: page.page_rank_percentile for page in pages}
+    guaranteed = guaranteed_pages(pages, rules)
+    assert set(guaranteed) == KIT_ORPHANS - {ORPHAN_COPY}
+    # The orphan copy is no retrieval target: an orphan in its profile, guaranteed nothing.
+    copy = next(page for page in pages if page.url == ORPHAN_COPY)
+    assert copy.inbound < rules.guaranteed_inbound_below
+    assert (copy.is_orphan, copy.orphan_label) == (True, planted.variant.orphan_label)
+    assert ORPHAN_COPY not in {rescue.profile.url for rescue in rescues}
+    assert not any(r.target_url == ORPHAN_COPY for r in records), "a recommendation into a copy"
+
+    def may_link(source: str, target: str) -> bool:
+        """The hub rule: a source in the target's hub, or any page for a hubless target."""
+        return hub[target] is None or hub[source] == hub[target]
+
+    added = [r for r in records if r.action_type is ActionType.ADD_LINK]
+    suggested = {(r.source_url, r.target_url): r for r in added if r.suggested}
+    slots = [r for r in added if r.orphan_slot]
+    givers = [r.source_url for r in slots]
+    assert len(set(givers)) == len(givers), "a source gave more than one orphan slot"
+    for record in slots:
+        source, target = record.source_url, record.target_url
+        assert target in guaranteed, f"a slot into {target}, which has no guarantee"
+        assert (source, target) in planted.anchored, f"an unanchored slot {source} -> {target}"
+        assert record.tier is not None
+        assert record.tier <= 2, f"a tier {record.tier} slot {source} -> {target}"
+        assert may_link(source, target), f"{source} is outside the hub of {target}"
+        assert sum(1 for s, _ in suggested if s == source) <= budgets[source], (
+            f"{source} is over its budget of {budgets[source]}"
+        )
+
+    def can_give(source: str) -> bool:
+        """A source with a budget, no slot given yet and a link it may give up."""
+        return (
+            budgets[source] >= 1
+            and source not in givers
+            and any(
+                s == source and t not in guaranteed and not r.orphan_slot
+                for (s, t), r in suggested.items()
+            )
+        )
+
+    frame = scored(pub)
+    reasons = []
+    for target, rescue in zip(guaranteed, rescues, strict=True):
+        assert rescue.profile == next(page for page in pages if page.url == target)
+        regular = sum(1 for (_, t), r in suggested.items() if t == target and not r.orphan_slot)
+        placed = sum(1 for r in slots if r.target_url == target)
+        assert placed <= max(0, need - regular), f"{target}: more slots than it needed"
+        rows = frame.loc[frame["target_url"] == target]
+        # Each source with its unrounded score, which orders the sources, and the served one.
+        universe = [
+            (str(s), float(p), float(score), int(tier))
+            for s, p, score, tier in zip(
+                rows["source_url"], rows["percentile"], rows["served"], rows["tier"], strict=True
+            )
+            if may_link(str(s), target)
+        ]
+        relevant = [s for s, _, _, tier in universe if tier <= 2]
+        anchored = [s for s in relevant if (s, target) in planted.anchored]
+        if regular + placed >= need:
+            reason = None
+        elif not relevant:
+            reason = OrphanSlotReason.NO_RELEVANT_SOURCE
+        elif not anchored:
+            reason = OrphanSlotReason.NO_ANCHOR
+        else:
+            reason = OrphanSlotReason.SOURCES_FULL
+            spare = [s for s in anchored if (s, target) not in suggested and can_give(s)]
+            assert not spare, f"{target} is short while {spare} could still give a slot"
+        reasons.append(reason)
+        assert (rescue.guaranteed, rescue.suggested_in, rescue.unmet_reason) == (
+            need,
+            regular + placed,
+            reason,
+        ), target
+        sources = sorted(
+            universe,
+            key=lambda row: (
+                (row[0], target) not in planted.anchored,
+                -row[1],
+                -(strength[row[0]] or 0.0),
+                row[0],
+            ),
+        )[:5]
+        assert rescue.sources == tuple(
+            RescueSource(
+                source_url=s,
+                score=score,
+                tier=tier,
+                anchor=planted.anchored.get((s, target)),
+                source_page_rank_percentile=strength[s],
+                recommendation_id=suggested[(s, target)].id if (s, target) in suggested else None,
+            )
+            for s, _, score, tier in sources
+        ), f"{target}: its rescue sources"
+        exercised |= {
+            name
+            for name, seen in (
+                ("an orphan slot", placed > 0),
+                ("a guarantee met", reason is None),
+                ("a guarantee unmet", reason is not None),
+                (
+                    "a hubless page reached from a hub",
+                    hub[target] is None
+                    and any(t == target and hub[s] is not None for s, t in suggested),
+                ),
+            )
+            if seen
+        }
+
+    into = Counter(t for _, t in suggested)
+    pillar = {h.hub_id: h.pillar_url for h in hubs}
+    to_pillar = sum(
+        1
+        for page in pages
+        if page.is_orphan
+        and page.hub_id is not None
+        and (page.url, pillar[page.hub_id]) in suggested
+    )
+    counts = {
+        "guaranteed_pages": len(guaranteed),
+        "orphan_slots": len(slots),
+        "guarantees_unmet": dict(Counter(r for r in reasons if r is not None)),
+        "orphans_reached": sum(1 for page in pages if page.is_orphan and into[page.url]),
+        "orphans_to_pillar": to_pillar,
+    }
+    assert summary.model_dump(include=set(counts)) == counts
+    targets = sorted(set(frame["target_url"]))
+    assert summary.inbound_gini == pytest.approx(gini([into[t] for t in targets]))
+    exercised |= {"an orphan linked to its main page"} if to_pillar else set()
+
+    return exercised
+
+
+async def test_orphans_get_their_guaranteed_links_within_the_budget(
+    published: tuple[Published, Published], mongo_uri: str
+) -> None:
+    exercised: set[str] = set()
+    for pub in published:
+        exercised |= await guarantee_checks(pub, mongo_uri)
+    assert exercised == {
+        "an orphan slot",
+        "a guarantee met",
+        "a guarantee unmet",
+        "a hubless page reached from a hub",
+        "an orphan linked to its main page",
+    }, f"the fixture only exercises {sorted(exercised)}"
+
+
+async def test_no_page_takes_more_than_the_cap_but_hub_main_pages(
+    published: tuple[Published, Published], mongo_uri: str
+) -> None:
+    exercised: set[str] = set()
+    for pub in published:
+        rules = TenantConfig(tenant_id=pub.tenant_id)
+        cap = rules.max_suggested_inbound
+        async with open_api(mongo_uri) as (_, client):
+            state = await served_state(client, pub.tenant_id, pub.key)
+        records = cast("tuple[Recommendation, ...]", state["/recommendations"])
+        pages = cast("tuple[PageProfile, ...]", state["/pages"])
+        summary = cast("SiteSummary", state["/summary"])
+        assert cast("RunInfo", state["/runs/latest"]).max_suggested_inbound == cap
+        main = {page.url for page in pages if page.is_hub_pillar}
+        into = Counter(
+            r.target_url for r in records if r.action_type is ActionType.ADD_LINK and r.suggested
+        )
+        over = {url: n for url, n in into.items() if url not in main and n > cap}
+        assert not over, f"pages that are not a hub main page over the cap of {cap}: {over}"
+
+        expected = expected_walk(pub, records, pages)
+        links, _ = by_source(records)
+        for source, found in links.items():
+            suggested = {r.target_url for r in found if r.suggested}
+            reserves = {r.target_url for r in found if not r.suggested}
+            for capped, spare in expected.moved.get(source, []):
+                assert capped in reserves, f"{source}: its link into full {capped} is suggested"
+                assert spare in suggested, f"{source}: its slot did not move to {spare}"
+            for capped in expected.dropped.get(source, []):
+                assert capped in reserves, f"{source}: its link into full {capped} is suggested"
+            assert [r.target_url for r in found if r.suggested] == expected.suggested[source], (
+                f"{source}: its suggested links after the cap"
+            )
+
+        assert expected.wanted[POPULAR] > cap, "the fixture's popular page is not over the cap"
+        if POPULAR in main:
+            assert into[POPULAR] == expected.wanted[POPULAR], "a hub main page was capped"
+            exercised.add("a hub main page over the cap")
+        else:
+            assert into[POPULAR] == cap, f"the popular page takes {into[POPULAR]}, not {cap}"
+            exercised.add("a page held at the cap")
+        moved = sum(len(found) for found in expected.moved.values())
+        dropped = sum(len(found) for found in expected.dropped.values())
+        exercised |= {"a suggestion moved to a reserve"} if moved else set()
+        exercised |= {"a suggestion left unfilled"} if dropped else set()
+
+        counts = {
+            "pages_at_cap": sum(1 for url, n in into.items() if url not in main and n >= cap),
+            "links_moved_by_cap": moved,
+            "links_dropped_by_cap": dropped,
+        }
+        assert summary.model_dump(include=set(counts)) == counts
+        top = sorted(into.values(), reverse=True)[:10]
+        assert summary.top10_inbound_share == pytest.approx(sum(top) / sum(into.values()))
+
+    assert exercised == {
+        "a hub main page over the cap",
+        "a page held at the cap",
+        "a suggestion moved to a reserve",
+        "a suggestion left unfilled",
+    }, f"the fixture only exercises {sorted(exercised)}"
+
+
+# ── #90: the hub-main-page channel, over three tenants of the same pages ───────────────────
+
+# Cosine of each hub page to its pillar: ten close pages, then five on the fringe.
+CLOSE: Final = tuple(round(0.99 - 0.01 * k, 2) for k in range(10))
+FRINGE: Final = (0.7, 0.6, 0.5, 0.4, 0.3)
+# Cosine between the two hubs' pillars.
+BETWEEN_HUBS: Final = 0.2
+PER_TARGET: Final = 3
+
+
+@dataclass(frozen=True, slots=True)
+class Site:
+    """Two hubs, each a pillar, fifteen pages graded by their cosine to it and a page in
+    another language as close to it as the closest."""
+
+    vectors: dict[str, npt.NDArray[np.float64]]
+    hubs: dict[str, int]
+    pillars: tuple[str, str]
+    languages: dict[str, str]
+
+    def pages(self, hub: int) -> list[str]:
+        return [url for url, found in self.hubs.items() if found == hub and url not in self.pillars]
+
+    def close(self, hub: int) -> list[str]:
+        return [f"example.com/topic-{hub}/page-{k:02d}" for k in range(1, len(CLOSE) + 1)]
+
+    def cosine(self, a: str, b: str) -> float:
+        u, v = self.vectors[a], self.vectors[b]
+        return float(u @ v / (np.linalg.norm(u) * np.linalg.norm(v)))
+
+
+def channel_site() -> Site:
+    axes = iter(np.eye(64, DIMENSION))
+    first = next(axes)
+    centres = (first, BETWEEN_HUBS * first + np.sqrt(1 - BETWEEN_HUBS**2) * next(axes))
+    vectors: dict[str, npt.NDArray[np.float64]] = {}
+    hubs: dict[str, int] = {}
+    languages: dict[str, str] = {}
+    pillars = []
+    for hub, centre in enumerate(centres):
+        pillar = f"example.com/topic-{hub}/main"
+        pillars.append(pillar)
+        pages = {pillar: (1.0, "en")}
+        for k, cosine in enumerate((*CLOSE, *FRINGE), 1):
+            pages[f"example.com/topic-{hub}/page-{k:02d}"] = (cosine, "en")
+        pages[f"example.com/de/topic-{hub}/seite"] = (CLOSE[0], "de")
+        for url, (cosine, language) in pages.items():
+            vectors[url] = cosine * centre + np.sqrt(1 - cosine**2) * next(axes)
+            hubs[url] = hub
+            languages[url] = language
+    return Site(vectors, hubs, (pillars[0], pillars[1]), languages)
+
+
+async def plant_site(
+    graph: GraphRepo, tenant: str, site: Site, links: list[tuple[str, str]]
+) -> None:
+    await graph.upsert_pages(
+        tenant,
+        [
+            Page(
+                url=url,
+                status_code=200,
+                is_indexable=True,
+                word_count=400,
+                language=site.languages[url],
+                crawl_depth=1,
+                page_type=PageType.PILLAR if url in site.pillars else PageType.ARTICLE,
+            )
+            for url in site.vectors
+        ],
+    )
+    positions: Counter[str] = Counter()
+    edges = []
+    for source, target in links:
+        edges.append(
+            Link(
+                source_url=source,
+                target_url=target,
+                position=positions[source],
+                anchor_text="read on",
+                surrounding_text="Read on here.",
+            )
+        )
+        positions[source] += 1
+    await graph.replace_links(tenant, sorted(positions), edges)
+    await graph._auto(
+        "UNWIND $rows AS row MATCH (p:Page {tenantId: $t, url: row.url}) "
+        "SET p.content_embedding = row.vec, p.embeddingModel = $model, p.hubId = row.hub, "
+        "p.isHubPillar = row.pillar",
+        t=tenant,
+        model=EMBEDDING_MODEL,
+        rows=[
+            {
+                "url": url,
+                "vec": vector.tolist(),
+                "hub": site.hubs[url],
+                "pillar": url in site.pillars,
+            }
+            for url, vector in site.vectors.items()
+        ],
+    )
+
+
+async def test_the_pillar_channel_adds_relevant_page_to_main_page_pairs(
+    graph: GraphRepo, tenant: str, other_tenant: str
+) -> None:
+    site = channel_site()
+    rules = TenantConfig(tenant_id=tenant)
+    # Each hub's fifth page already links to its pillar.
+    linked = [(site.close(hub)[4], site.pillars[hub]) for hub in (0, 1)]
+    close_links = [
+        (a, b)
+        for hub in (0, 1)
+        for i, a in enumerate(site.close(hub))
+        for b in site.close(hub)[i + 1 : i + 4]
+    ]
+    loose_links = [(a, b) for a in site.close(0) for b in site.close(1)[:5]]
+    plans = {
+        # Links between close pages of a hub, and links across the hubs.
+        tenant: [*close_links, *linked],
+        other_tenant: [*loose_links, *linked],
+        # Fewer links than the floor needs.
+        new_tenant(): [*linked, (site.close(0)[0], site.close(0)[1])],
+    }
+    assert min(len(plans[tenant]), len(plans[other_tenant])) >= rules.pillar_floor_min_links
+
+    channels: dict[str, set[str]] = {}
+    floors: dict[str, float] = {}
+    for name, links in plans.items():
+        await plant_site(graph, name, site, links)
+        found = await retrieve_candidates(graph, name, per_target=PER_TARGET)
+        report = found.report
+        cosines = [site.cosine(a, b) for a, b in links]
+        if len(links) >= rules.pillar_floor_min_links:
+            key, basis, over = "en", "existing_links", cosines
+        else:
+            pairs = [x for t in found.targets for x in t.similarities[: t.nearest]]
+            key, basis, over = "*", "candidate_pairs", pairs
+        assert report.pillar_floor_basis == {key: basis}, f"{name}: the floor's basis"
+        assert report.pillar_floor_links == {key: len(links)}
+        floor = report.pillar_floors[key]
+        assert floor == pytest.approx(
+            float(np.quantile(over, rules.pillar_floor_quantile)), abs=1e-5
+        ), f"{name}: the floor is the {rules.pillar_floor_quantile} quantile of its own {basis}"
+        floors[name] = floor
+
+        added: set[str] = set()
+        for target in found.targets:
+            assert target.nearest <= PER_TARGET, "the cap holds for the nearest sources"
+            if target.target_url not in site.pillars:
+                assert target.pillar_pairs == 0, f"{name}: pillar pairs into a page not a pillar"
+                continue
+            hub = site.hubs[target.target_url]
+            nearest = set(target.sources[: target.nearest])
+            assert nearest == set(site.close(hub)[:PER_TARGET]), "the nearest sources"
+            channel = target.sources[target.nearest :]
+            expected = [
+                url
+                for url in site.pages(hub)
+                if site.languages[url] == "en"
+                and (url, target.target_url) not in links
+                and url not in nearest
+                and site.cosine(url, target.target_url) >= floor
+            ]
+            assert set(channel) == set(expected), f"{name}: the channel into hub {hub}'s pillar"
+            assert list(target.similarities[target.nearest :]) == pytest.approx(
+                [site.cosine(url, target.target_url) for url in channel], abs=1e-5
+            )
+            assert site.close(hub)[4] not in target.sources, "a page already linking in"
+            assert f"example.com/de/topic-{hub}/seite" not in target.sources, "another language"
+            added |= set(channel)
+        assert report.pillar_pairs == len(added)
+        channels[name] = added
+
+    tight, loose, sparse = (channels[name] for name in plans)
+    fringe = {
+        site.pages(hub)[k] for hub in (0, 1) for k in range(len(CLOSE), len(CLOSE) + len(FRINGE))
+    }
+    assert tight, "the close links' floor adds no pair"
+    assert not tight & fringe, "the close links' floor keeps the close pages only"
+    assert fringe <= loose, "the loose links' floor admits the fringe"
+    assert floors[tenant] > floors[other_tenant], "the tenants' floors come from their own links"
+    assert sparse, "the candidate-pair floor adds no pair"
 
 
 async def test_the_run_log_has_no_urls(

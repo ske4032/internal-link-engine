@@ -51,6 +51,7 @@ from linking_engine.models import (
     LinkGraphSnapshot,
     LinkRelevance,
     PageStructure,
+    PillarFloor,
     QualityBaseline,
     ResolvedKeyword,
     ScorerWeights,
@@ -269,7 +270,9 @@ def test_a_page_that_is_not_a_crawled_page_of_the_snapshot_is_refused(stray: str
 # ── retrieval check ─────────────────────────────────────────────────────────
 
 
-def candidates(targets: list[TargetCandidates]) -> CandidateSet:
+def candidates(
+    targets: list[TargetCandidates], floors: dict[str, PillarFloor] | None = None
+) -> CandidateSet:
     selection = TargetSelection(
         crawled_pages=len(targets),
         not_indexable=0,
@@ -284,6 +287,7 @@ def candidates(targets: list[TargetCandidates]) -> CandidateSet:
         selection,
         10,
         targets,
+        floors=floors,
         load_seconds=0.0,
         search_seconds=0.0,
         seconds=0.0,
@@ -328,6 +332,33 @@ def test_recall_counts_only_hidden_links_a_retrieval_could_return() -> None:
     assert [(r.k, r.recall) for r in check.recall] == [(10, 0.5), (20, 0.5), (50, 0.5)]
     # Mean over the two recoverable links of min(1, k / eligible), eligible 40 and 80.
     assert [r.random for r in check.recall] == pytest.approx([0.1875, 0.375, 0.8125])
+
+
+def test_a_hidden_link_the_channel_adds_past_a_full_nearest_is_never_inside_k() -> None:
+    nearest = tuple(f"n{i:02d}" for i in range(50))
+    pillar = TargetCandidates(
+        target_url=toy("pillar"),
+        sources=(*map(toy, nearest), toy("hub")),
+        similarities=(*(0.95 - i / 100 for i in range(50)), 0.45),
+        eligible=80,
+        linked=0,
+        linked_nearer=0,
+        pillar_pairs=1,
+    )
+    floor = PillarFloor(floor=0.4, basis="existing_links", links=60)
+    found = candidates([pillar], {"en": floor})
+    pool = {*pillar.sources, pillar.target_url}
+
+    check = retrieval_check(
+        60, {(toy("hub"), toy("pillar"))}, found, pool, dict.fromkeys(pool, "en")
+    )
+
+    assert check is not None
+    assert (check.recoverable, check.candidates) == (1, 51)
+    assert [(r.k, r.recall) for r in check.recall] == [(10, 0.0), (20, 0.0), (50, 0.0)], (
+        "a channel pair ranks inside k although the target's nearest sources fill it"
+    )
+    assert [r.random for r in check.recall] == pytest.approx([10 / 80, 20 / 80, 50 / 80])
 
 
 def test_retrieval_is_not_applicable_when_no_hidden_link_is_recoverable() -> None:

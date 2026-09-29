@@ -1,5 +1,5 @@
-"""The output reader: the latest complete run, keyset paging on ordinals, exact filters, and
-every read scoped to one tenant and run."""
+"""The output reader: the latest complete run, keyset paging on ordinals and best ranks, exact
+filters, and every read scoped to one tenant and run."""
 
 from __future__ import annotations
 
@@ -29,9 +29,12 @@ from linking_engine.models import (
     HubSummary,
     IssueFlag,
     OrphanLabel,
+    OrphanRescue,
+    OrphanSlotReason,
     PageProfile,
     Recommendation,
     RecommendationStatus,
+    RescueSource,
     RunInfo,
     ScorerName,
     SiteSummary,
@@ -44,6 +47,7 @@ from linking_engine.output.collections import (
     DUPLICATES,
     EXCLUDED_PAGES,
     HUBS,
+    ORPHANS,
     PAGES,
     RECOMMENDATIONS,
     RUNS,
@@ -56,6 +60,7 @@ from linking_engine.output.reader import (
     BridgeFilter,
     ExcludedFilter,
     InvalidCursorError,
+    OrphanFilter,
     OutputReader,
     PageFilter,
     RecommendationFilter,
@@ -124,6 +129,10 @@ def run_info(tenant: str, run_id: str, *, completed: datetime | None) -> RunInfo
         package_version="0.1.0",
         limit_per_source=10,
         content_gap_limit=3,
+        words_per_link=200,
+        guaranteed_inbound_links=2,
+        guaranteed_inbound_below=1,
+        max_suggested_inbound=5,
         summary=None if completed is None else summary(),
     )
 
@@ -137,6 +146,9 @@ def new_link(
     *,
     action: ActionType = ActionType.ADD_LINK,
     tier: int = 1,
+    best: int = 1,
+    suggested: bool = False,
+    orphan_slot: bool = False,
 ) -> Recommendation:
     gap = action is ActionType.CONTENT_GAP
     return Recommendation(
@@ -151,6 +163,9 @@ def new_link(
         score=90.0 - rank,
         tier=tier,
         rank_in_source=rank,
+        best_rank=best,
+        suggested=suggested,
+        orphan_slot=orphan_slot,
         status=RecommendationStatus.PENDING,
         proposed_anchors=None
         if gap
@@ -227,7 +242,8 @@ async def test_recommendations_page_on_ordinals_within_one_tenant_and_run(
     db: AsyncDatabase[Document], reader: OutputReader, tenant: str, other_tenant: str
 ) -> None:
     served = [
-        new_link(tenant, "run-1", A, target, rank) for rank, target in enumerate((B, C, D), 1)
+        new_link(tenant, "run-1", A, target, rank, best=rank)
+        for rank, target in enumerate((B, C, D), 1)
     ]
     served += [verdict(tenant, "run-1", A, B, position) for position in range(4)]
     await store(db, RECOMMENDATIONS, tenant, "run-1", served)
@@ -259,9 +275,9 @@ async def test_recommendation_filters_are_exact_matches(
     db: AsyncDatabase[Document], reader: OutputReader, tenant: str
 ) -> None:
     served = [
-        new_link(tenant, "run-1", A, B, 1),
-        new_link(tenant, "run-1", A, C, 2, action=ActionType.CONTENT_GAP, tier=2),
-        new_link(tenant, "run-1", B, C, 1, tier=2),
+        new_link(tenant, "run-1", A, B, 1, best=1, suggested=True, orphan_slot=True),
+        new_link(tenant, "run-1", A, C, 2, action=ActionType.CONTENT_GAP, tier=2, best=3),
+        new_link(tenant, "run-1", B, C, 1, tier=2, best=2, suggested=True),
         verdict(tenant, "run-1", C, A, 0),
     ]
     await store(db, RECOMMENDATIONS, tenant, "run-1", served)
@@ -282,6 +298,62 @@ async def test_recommendation_filters_are_exact_matches(
     assert await matching(tier=2) == (served[1], served[2])
     assert await matching(source=A, tier=2, target=C) == (served[1],)
     assert await matching(source=D) == ()
+    assert await matching(suggested=True) == (served[0], served[2])
+    assert await matching(suggested=False) == (served[1], served[3])
+    assert await matching(orphan_slot=True) == (served[0],)
+    assert await matching(orphan_slot=False, suggested=True) == (served[2],)
+
+
+@pytest.mark.integration
+async def test_best_first_order_pages_new_link_actions_on_their_best_rank(
+    db: AsyncDatabase[Document], reader: OutputReader, tenant: str, other_tenant: str
+) -> None:
+    served = [
+        new_link(tenant, "run-1", A, B, 1, best=3, suggested=True),
+        new_link(tenant, "run-1", A, C, 1, action=ActionType.CONTENT_GAP, best=5),
+        verdict(tenant, "run-1", A, D, 0),
+        new_link(tenant, "run-1", B, C, 1, best=1, suggested=True),
+        new_link(tenant, "run-1", B, D, 2, best=4),
+        verdict(tenant, "run-1", C, A, 1),
+        new_link(tenant, "run-1", D, A, 1, best=2, suggested=True, orphan_slot=True),
+    ]
+    await store(db, RECOMMENDATIONS, tenant, "run-1", served)
+    await store(db, RECOMMENDATIONS, tenant, "run-0", served[3:4])
+    # Another tenant's records rank first in their own order, and are never read.
+    await store(db, RECOMMENDATIONS, other_tenant, "run-1", [served[1], served[0]])
+    best_first = (served[3], served[6], served[0], served[4], served[1])
+
+    everything = await reader.recommendations(
+        tenant, "run-1", RecommendationFilter(), limit=500, order="best"
+    )
+    pages = []
+    after = None
+    while True:
+        page = await reader.recommendations(
+            tenant, "run-1", RecommendationFilter(), after, 2, order="best"
+        )
+        pages.append(page)
+        if page.next_cursor is None:
+            break
+        after = page.next_cursor
+    suggested = await reader.recommendations(
+        tenant, "run-1", RecommendationFilter(suggested=True), limit=500, order="best"
+    )
+    from_a = await reader.recommendations(
+        tenant, "run-1", RecommendationFilter(source=A), limit=500, order="best"
+    )
+
+    assert everything.items == best_first
+    assert (everything.total, everything.next_cursor) == (5, None)
+    assert [page.items for page in pages] == [best_first[:2], best_first[2:4], best_first[4:]]
+    assert [page.next_cursor for page in pages] == ["2", "4", None]
+    assert {page.total for page in pages} == {5}
+    assert suggested.items == (served[3], served[6], served[0])
+    assert suggested.total == 3
+    assert from_a.items == (served[0], served[1])
+    assert (await reader.recommendations(tenant, "run-1", RecommendationFilter())).items == tuple(
+        served
+    )
 
 
 @pytest.mark.integration
@@ -324,6 +396,69 @@ async def test_page_filters_are_exact_matches(
     assert await urls(dead_end=True) == [C]
     assert await urls(duplicate=True) == [A, D]
     assert await urls(duplicate=False) == [B, C]
+
+
+@pytest.mark.integration
+async def test_orphans_list_rescues_by_url_filtered_by_label_and_unmet(
+    db: AsyncDatabase[Document], reader: OutputReader, tenant: str, other_tenant: str
+) -> None:
+    link = new_link(tenant, "run-1", A, B, 1, suggested=True, orphan_slot=True)
+    rescues = [
+        OrphanRescue(
+            profile=profile(
+                B, inbound=0, is_orphan=True, orphan_label=OrphanLabel.MENUS_ONLY, link_budget=1
+            ),
+            guaranteed=1,
+            suggested_in=1,
+            sources=(
+                RescueSource(
+                    source_url=A,
+                    score=89.0,
+                    tier=1,
+                    anchor="trail shoes",
+                    source_page_rank_percentile=0.5,
+                    recommendation_id=link.id,
+                ),
+                RescueSource(source_url=D, score=40.0, tier=2),
+            ),
+        ),
+        OrphanRescue(
+            profile=profile(C, inbound=0, is_orphan=True, orphan_label=OrphanLabel.NOT_LINKED),
+            guaranteed=1,
+            suggested_in=0,
+            sources=(RescueSource(source_url=A, score=60.0, tier=2),),
+            unmet_reason=OrphanSlotReason.NO_ANCHOR,
+        ),
+        OrphanRescue(
+            profile=profile(D, inbound=0, is_orphan=True, orphan_label=OrphanLabel.NOT_LINKED),
+            guaranteed=1,
+            suggested_in=0,
+            sources=(),
+            unmet_reason=OrphanSlotReason.NO_RELEVANT_SOURCE,
+        ),
+    ]
+    await store(db, ORPHANS, tenant, "run-1", rescues)
+    await store(db, ORPHANS, other_tenant, "run-1", rescues[:1])
+
+    async def urls(after: str | None = None, limit: int = 500, **filters: object) -> list[str]:
+        listing = await reader.orphans(
+            tenant, "run-1", OrphanFilter.model_validate(filters), after, limit
+        )
+        if after is None and limit == 500:
+            assert listing.total == len(listing.items)
+        return [rescue.profile.url for rescue in listing.items]
+
+    everything = await reader.orphans(tenant, "run-1", OrphanFilter(), limit=2)
+    assert everything.items == tuple(rescues[:2])
+    assert (everything.next_cursor, everything.total) == ("1", 3)
+    assert await urls(after="1") == [D]
+    assert await urls(orphan_label=OrphanLabel.NOT_LINKED) == [C, D]
+    assert await urls(unmet=True) == [C, D]
+    assert await urls(unmet=False) == [B]
+    assert await urls(unmet=False, orphan_label=OrphanLabel.NOT_LINKED) == []
+    assert await urls(orphan_label=OrphanLabel.FOOTER_ONLY) == []
+    assert (await reader.orphans(other_tenant, "run-1", OrphanFilter())).total == 1
+    assert (await reader.orphans(tenant, "run-2", OrphanFilter())).total == 0
 
 
 @pytest.mark.integration
@@ -482,6 +617,10 @@ async def test_bad_cursors_limits_and_tenants_are_rejected_before_any_read() -> 
         for cursor in ("", "-1", "01", "1.5", "abc", " 1", "1" * 19, "٣", "1\n"):
             with pytest.raises(InvalidCursorError):
                 await reader.hubs("test-t", "run-1", cursor)
+            with pytest.raises(InvalidCursorError):
+                await reader.recommendations(
+                    "test-t", "run-1", RecommendationFilter(), cursor, order="best"
+                )
         assert issubclass(InvalidCursorError, ValueError)
         with pytest.raises(ValueError, match="limit"):
             await reader.hubs("test-t", "run-1", limit=0)

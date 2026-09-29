@@ -19,6 +19,7 @@ from linking_engine.ml.tracking import (
     anchor_rank_table,
     bridge_metrics,
     candidate_metrics,
+    candidate_params,
     candidate_table,
     duplicate_metrics,
     feature_metrics,
@@ -273,6 +274,7 @@ def test_candidate_metrics_are_the_runs_results_without_settings_or_missing_valu
         "without_vector": 1,
         **COUNTS,
         "non_canonical_excluded": 0,
+        "pillar_pairs": 0,
         "load_seconds": 0.5,
         "search_seconds": 0.125,
         "seconds": 0.75,
@@ -316,11 +318,62 @@ def test_the_target_table_leaves_similarities_blank_without_candidates() -> None
             "linked_nearer",
             "best_similarity",
             "last_similarity",
+            "pillar_pairs",
         ],
-        ["example.com/a", "2", "5", "3", "1", "0.875", "0.5"],
-        ["example.com/new", "1", "1", "1", "0", "0.625", "0.625"],
-        ["example.com/lonely", "0", "0", "2", "0", "", ""],
+        ["example.com/a", "2", "5", "3", "1", "0.875", "0.5", "0"],
+        ["example.com/new", "1", "1", "1", "0", "0.625", "0.625", "0"],
+        ["example.com/lonely", "0", "0", "2", "0", "", "", "0"],
     ]
+
+
+def with_pillar_pair() -> CandidateSet:
+    """The first target as a hub pillar with one channel source, under per-language and
+    tenant-wide floors."""
+    found = candidate_set()
+    pillar = TargetCandidates.model_validate(
+        {
+            **found.targets[0].model_dump(),
+            "sources": ("example.com/b", "example.com/c", "example.com/d"),
+            "similarities": (0.875, 0.5, 0.625),
+            "pillar_pairs": 1,
+        }
+    )
+    report = CandidateReport.model_validate(
+        {
+            **found.report.model_dump(),
+            "candidates": 4,
+            "pillar_pairs": 1,
+            "pillar_floors": {"en": 0.5, "*": 0.25},
+            "pillar_floor_basis": {"en": "existing_links", "*": "candidate_pairs"},
+            "pillar_floor_links": {"en": 64, "*": 12},
+        }
+    )
+    return CandidateSet(report=report, targets=(pillar, found.targets[1]))
+
+
+def test_the_channels_floors_are_metrics_and_their_bases_params() -> None:
+    found = with_pillar_pair()
+
+    metrics = candidate_metrics(found.report)
+    rows = list(csv.reader(io.StringIO(candidate_table(found))))
+
+    assert {name: value for name, value in metrics.items() if "pillar" in name} == {
+        "pillar_pairs": 1,
+        "pillar_floor_en": 0.5,
+        "pillar_floor_links_en": 64,
+        "pillar_floor_tenant": 0.25,
+        "pillar_floor_links_tenant": 12,
+    }
+    assert metrics["candidates"] == 4
+    assert candidate_params(found.report) == {
+        "index": "page_content",
+        "per_target": "2",
+        "chunk_size": "512",
+        "pillar_floor_basis_en": "existing_links",
+        "pillar_floor_basis_tenant": "candidate_pairs",
+    }
+    # The nearest sources' count and last similarity; the channel's pair counted apart.
+    assert rows[1] == ["example.com/a", "2", "5", "3", "1", "0.875", "0.5", "1"]
 
 
 def test_a_candidate_run_is_logged_with_its_settings_report_and_target_table(
@@ -342,6 +395,9 @@ def test_a_candidate_run_is_logged_with_its_settings_report_and_target_table(
     assert run.data.tags["mlflow.note.content"] == "Candidate retrieval for tenant acme."
     assert run.data.params == {"index": "page_content", "per_target": "2", "chunk_size": "512"}
     assert run.data.metrics == candidate_metrics(found.report)
+    channel = client.get_run(log_candidates(with_pillar_pair(), "With the channel."))
+    assert channel.data.params == candidate_params(with_pillar_pair().report)
+    assert channel.data.metrics == candidate_metrics(with_pillar_pair().report)
     assert {a.path for a in client.list_artifacts(run_id)} == {
         "report.json",
         "summary.md",

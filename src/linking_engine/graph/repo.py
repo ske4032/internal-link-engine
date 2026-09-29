@@ -44,6 +44,7 @@ from linking_engine.models import (
     LinkRelevance,
     LinkText,
     Page,
+    PageHub,
     PageStructure,
     TargetSelection,
     TenantGraphCounts,
@@ -67,7 +68,6 @@ if TYPE_CHECKING:
         LinkAuditResult,
         PageCentrality,
         PageCommunities,
-        PageHub,
         SentenceTarget,
         VectorIndex,
     )
@@ -456,6 +456,12 @@ _PAGE_LANGUAGES: Final = """
 MATCH (p:Page {tenantId: $tenant})
 WHERE NOT coalesce(p.isPlaceholder, false)
 RETURN p.url AS url, p.language AS language
+"""
+_HUB_MEMBERS: Final = """
+MATCH (p:Page {tenantId: $tenant})
+WHERE NOT coalesce(p.isPlaceholder, false) AND p.hubId >= 0
+RETURN p.url AS url, p.hubId AS hub_id, coalesce(p.isHubPillar, false) AS is_hub_pillar
+ORDER BY url
 """
 # Crawled 2xx pages with a body, grouped by (body, language) in the query so inbound links are
 # counted for pages sharing a body only. Null languages group together. Indexable follows the
@@ -1555,6 +1561,16 @@ class GraphRepo:
                 )
             languages[url] = language
         return languages
+
+    async def hub_members(self, tenant_id: str) -> list[PageHub]:
+        """The tenant's crawled pages in a hub, noise left out, and whether each is its hub's
+        pillar; ordered by url."""
+        _require_tenant(tenant_id)
+        rows = await self._read(_HUB_MEMBERS, tenant=tenant_id)
+        try:
+            return [PageHub.model_validate(row) for row in rows]
+        except ValidationError as error:
+            raise DatabaseReadError("neo4j", f"hub members of {tenant_id!r}: {error}") from error
 
     async def duplicate_inputs(self, tenant_id: str) -> list[DuplicateInput]:
         """The crawled 2xx pages with a non-empty body that share their body hash with another

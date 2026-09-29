@@ -6,7 +6,7 @@ for another tenant, and the round cache is keyed on what a round depends on."""
 from __future__ import annotations
 
 from collections import Counter
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pyarrow.parquet as pq
 import pytest
@@ -41,6 +41,7 @@ from linking_engine.discovery.candidates import retrieve_candidates
 from linking_engine.discovery.features import FEATURE_COLUMNS, KEY_COLUMNS
 from linking_engine.ml.quality import hide_links
 from linking_engine.models import FeatureWeight, HeldOutSettings, ScorerWeights
+from linking_engine.pipeline import ranking_data
 from linking_engine.pipeline.anchor_selection import _inbound_anchors, compute_anchor_choices
 from linking_engine.pipeline.anchors import AnchorView, lexical_run
 from linking_engine.pipeline.ranking_data import ROUND_SCHEMA, held_out_rounds, load_rounds
@@ -51,6 +52,7 @@ if TYPE_CHECKING:
 
     from linking_engine.graph.repo import GraphRepo
     from linking_engine.ingest.mongo_repo import MongoRepo
+    from linking_engine.models import CandidateSet
 
 TWO_ROUNDS = HeldOutSettings(rounds=2)
 ONE_ROUND = HeldOutSettings(rounds=1)
@@ -254,6 +256,46 @@ async def test_a_view_frees_the_hidden_links_spans_and_inbound_anchors(
 
 
 @pytest.mark.integration
+async def test_a_hidden_link_the_channel_returns_is_a_labelled_row_of_its_round(
+    graph: GraphRepo, mongo: MongoRepo, tenant: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With one nearest source per target, round 0's hidden links into a hub pillar come back
+    past the cap from the hub-main-page channel: every channel pair is a row of the round,
+    labelled by whether it is hidden, and the hidden ones keep their placement features."""
+    await seed_ranking(graph, mongo, tenant)
+    views: list[CandidateSet] = []
+
+    async def one_nearest(graph: GraphRepo, tenant_id: str, **options: Any) -> CandidateSet:
+        found = await retrieve_candidates(graph, tenant_id, **{**options, "per_target": 1})
+        views.append(found)
+        return found
+
+    monkeypatch.setattr(ranking_data, "retrieve_candidates", one_nearest)
+
+    rounds = await held_out_rounds(
+        graph, mongo, tenant, settings=ONE_ROUND, cache_dir=tmp_path, voyage=client(voyage())
+    )
+
+    [held] = views
+    hidden = hidden_in(0)
+    channel = {(s, e.target_url) for e in held.targets for s in e.sources[e.nearest :]}
+    returned = channel & hidden
+    assert returned, "no hidden link came back through the channel"
+    frame = load_rounds(rounds.paths)
+    pairs = list(zip(frame["source_url"], frame["target_url"], strict=True))
+    labels = {pair: int(label) for pair, label in zip(pairs, frame["label"], strict=True)}
+    assert {pair: labels.get(pair) for pair in channel} == {
+        pair: int(pair in hidden) for pair in channel
+    }, "a channel pair is missing from the round or mislabelled"
+    assert rounds.summaries[0].pairs == len(labels) == held.report.candidates, (
+        "the round does not count the channel's pairs"
+    )
+    rows = frame[[pair in returned for pair in pairs]]
+    assert len(rows) == len(returned)
+    assert rows[PLACEMENT].notna().all().all(), "a hidden channel pair has no placement features"
+
+
+@pytest.mark.integration
 async def test_rounds_write_nothing_to_stores_and_other_tenant_untouched(
     graph: GraphRepo, mongo: MongoRepo, tenant: str, tmp_path: Path
 ) -> None:
@@ -408,10 +450,10 @@ async def test_a_round_after_a_voyage_outage_is_partial_and_never_a_cache_hit(
 
 @pytest.mark.integration
 async def test_the_round_key_covers_every_stored_input_a_round_reads(
-    graph: GraphRepo, mongo: MongoRepo, tenant: str, tmp_path: Path
+    graph: GraphRepo, mongo: MongoRepo, tenant: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Each stored value a round's rows depend on, beyond the links, changes the key; writing a
-    page again unchanged does not."""
+    """Each stored value a round's rows depend on, beyond the links, and the tenant's pillar floor
+    settings change the key; writing a page again unchanged does not."""
     await seed_ranking(graph, mongo, tenant)
     source, noise = URLS[0], sorted(NOISE_URLS)[0]
     topic, index = source.split("/")[1], 0
@@ -435,6 +477,13 @@ async def test_the_round_key_covers_every_stored_input_a_round_reads(
             f"MATCH (p:Page {{tenantId: $t, url: $u}}) SET {assignment}", t=tenant, u=noise
         )
 
+    async def pillar_floor() -> None:
+        monkeypatch.setenv("TENANT_PILLAR_FLOOR_QUANTILE", "0.3")
+
+    async def pillar_floor_links() -> None:
+        # The seed's links clear either minimum, so only the key can tell the two apart.
+        monkeypatch.setenv("TENANT_PILLAR_FLOOR_MIN_LINKS", "2")
+
     async def record(title: str, text: str) -> None:
         await mongo.write_pages(
             tenant,
@@ -452,6 +501,8 @@ async def test_the_round_key_covers_every_stored_input_a_round_reads(
         ),
         "indexable": lambda: page("p.isIndexable = false"),
         "canonical copy": lambda: page("p.isCanonical = false"),
+        "pillar floor quantile": pillar_floor,
+        "pillar floor min links": pillar_floor_links,
     }
     last, hit = await key()
     assert hit == (False,)

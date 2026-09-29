@@ -37,6 +37,8 @@ from linking_engine.models import (
     KeywordRung,
     LinkAuditResult,
     OrphanLabel,
+    OrphanRescue,
+    OrphanSlotReason,
     PageProfile,
     Recommendation,
     RecommendationReport,
@@ -48,6 +50,7 @@ from linking_engine.models.anchors import UNANCHORED_ADVICE
 from linking_engine.models.page import HubNode, InboundAnchorText, PageFacts
 from linking_engine.output.collections import (
     HUBS,
+    ORPHANS,
     PAGES,
     RECOMMENDATIONS,
     RUN_SCOPED,
@@ -71,6 +74,7 @@ from linking_engine.pipeline.recommendations import (
     assemble,
     baseline_signals,
     learned_signals,
+    link_budget,
     percentiles,
     publish_recommendations,
     read_ranked,
@@ -189,6 +193,10 @@ def make_inputs(
         started_at=AT,
         limit=10,
         gap_limit=3,
+        words_per_link=200,
+        guaranteed_inbound_links=2,
+        guaranteed_inbound_below=1,
+        max_suggested_inbound=5,
         tier_shares=(0.1, 0.3),
         scorer=ScorerName.BASELINE,
         ranked=ranked(scores or {}),
@@ -201,13 +209,17 @@ def make_inputs(
         excluded=(),
         pages=(),
         hubs=(),
+        linkable=frozenset(),
         titles={},
         keywords={},
         ranked_keywords={},
         inbound=(),
         brand=BRAND,
     )
-    return dataclasses.replace(base, **fields)
+    inputs = dataclasses.replace(base, **fields)
+    if "linkable" in fields:
+        return inputs
+    return dataclasses.replace(inputs, linkable=frozenset(page.url for page in inputs.pages))
 
 
 def run(
@@ -406,9 +418,634 @@ def test_a_phrase_too_long_to_serve_is_left_out_and_never_counted_unassessed() -
 def test_a_tenant_without_pairs_or_verdicts_gets_an_empty_run() -> None:
     walked, out = run(make_inputs())
 
-    assert (out.recommendations, out.unanchored, out.target_fixes) == ((), (), ())
+    assert (out.recommendations, out.unanchored, out.target_fixes, out.orphans) == ((),) * 4
     assert walked.not_assessed == 0
     assert out.summary.sources_below_limit == 0
+    assert (out.summary.suggested_links, out.summary.inbound_gini) == (0, None)
+
+
+# ── the page budget and guaranteed inbound links ─────────────────────────────
+
+
+def slots(records: Sequence[Recommendation]) -> list[tuple[str, str, int | None, bool, bool]]:
+    return [
+        (r.source_url, r.target_url, r.rank_in_source, r.suggested, r.orphan_slot)
+        for r in records
+        if r.action_type is ActionType.ADD_LINK
+    ]
+
+
+def test_the_link_budget_is_one_per_words_per_link_capped_less_the_existing_links() -> None:
+    # A short page still takes one; existing links past the words budget leave none.
+    assert link_budget(50, 0, limit=10, words_per_link=200) == 1
+    assert link_budget(1000, 7, limit=10, words_per_link=200) == 0
+    assert link_budget(10_000, 0, limit=10, words_per_link=200) == 10
+    assert link_budget(10_000, 2, limit=10, words_per_link=200) == 8
+    assert link_budget(1000, 1, limit=10, words_per_link=100) == 9
+
+
+def test_a_pages_first_links_up_to_its_budget_are_suggested_the_rest_reserves() -> None:
+    a, b = url("a"), url("b")
+    t = [url(f"t{i}") for i in range(4)]
+    scores = {(a, x): 4.0 - i for i, x in enumerate(t)} | {(b, t[0]): 1.0, (b, t[1]): 0.5}
+    inputs = make_inputs(
+        scores,
+        choices=[choice(s, x, "dome tent") for s, x in scores],
+        pages=(page("a", word_count=650, outbound=1), page("b", word_count=900, outbound=6)),
+        guaranteed_inbound_links=0,
+    )
+    out = run(inputs)[1]
+
+    # a: 650 words is 3 links, less its one existing link; b already links past its 4.
+    assert slots(out.recommendations) == [
+        (a, t[0], 1, True, False),
+        (a, t[1], 2, True, False),
+        (a, t[2], 3, False, False),
+        (a, t[3], 4, False, False),
+        (b, t[0], 1, False, False),
+        (b, t[1], 2, False, False),
+    ]
+    profiles = {p.url: p for p in out.pages}
+    assert (profiles[a].link_budget, profiles[b].link_budget) == (2, 0)
+    assert (out.summary.suggested_links, out.summary.reserve_links) == (2, 4)
+    assert out.summary.sources_below_limit == 2
+
+
+def test_an_orphan_slot_displaces_the_weakest_suggested_link_one_slot_per_source() -> None:
+    s1, s2 = url("s1"), url("s2")
+    x1, x2, x3, o1, o2 = url("x1"), url("x2"), url("x3"), url("o1"), url("o2")
+    scores = {(s1, x1): 9.0, (s1, x2): 8.0, (s1, x3): 7.0, (s1, o1): 6.0, (s1, o2): 5.0}
+    scores |= {(s2, x1): 4.0, (s2, o1): 3.0}
+    inputs = make_inputs(
+        scores,
+        choices=[choice(s, t, "dome tent") for s, t in scores],
+        pages=(
+            page("s1", word_count=400, outbound=0),
+            page("s2", outbound=0),
+            *(page(x) for x in ("x1", "x2", "x3")),
+            page("o1", inbound=0),
+            page("o2", inbound=0),
+        ),
+        tier_shares=(0.5, 0.5),
+    )
+    out = run(inputs)[1]
+
+    # o2 has one eligible source, so it goes first and takes s1, the better source of o1 too;
+    # s1 gives one slot only, so o1 takes s2. Each source gives up its weakest suggested link.
+    assert slots(out.recommendations) == [
+        (s1, x1, 1, True, False),
+        (s1, x2, 2, False, False),
+        (s1, x3, 3, False, False),
+        (s1, o1, 4, False, False),
+        (s1, o2, 5, True, True),
+        (s2, x1, 1, False, False),
+        (s2, o1, 2, True, True),
+    ]
+    summary = out.summary
+    assert (summary.suggested_links, summary.reserve_links, summary.orphan_slots) == (3, 4, 2)
+    assert (summary.guaranteed_pages, summary.guarantees_unmet) == (
+        2,
+        {OrphanSlotReason.SOURCES_FULL: 2},
+    )
+    rescue = {r.profile.url: r for r in out.orphans}
+    assert list(rescue) == [o1, o2]
+    assert (rescue[o1].guaranteed, rescue[o1].suggested_in, rescue[o1].unmet_reason) == (
+        2,
+        1,
+        OrphanSlotReason.SOURCES_FULL,
+    )
+    assert [(x.source_url, x.recommendation_id) for x in rescue[o1].sources] == [
+        (s1, None),
+        (s2, recommendation_id(TENANT, ActionType.ADD_LINK, s2, o1, None)),
+    ]
+
+
+def test_a_slot_never_displaces_a_link_into_another_guaranteed_page() -> None:
+    s1, s2 = url("s1"), url("s2")
+    x, o1, o2, o3 = url("x"), url("o1"), url("o2"), url("o3")
+    scores = {(s1, x): 9.0, (s1, o1): 8.0, (s1, o2): 7.0, (s2, o3): 6.0, (s2, o2): 5.0}
+    inputs = make_inputs(
+        scores,
+        choices=[choice(s, t, "dome tent") for s, t in scores],
+        pages=(
+            page("s1", word_count=400, outbound=0),
+            page("s2", outbound=0),
+            page("x"),
+            *(page(p, inbound=0) for p in ("o1", "o2", "o3")),
+        ),
+        tier_shares=(0.5, 0.5),
+        guaranteed_inbound_links=1,
+    )
+    out = run(inputs)[1]
+
+    # s1 gives up x rather than its link into o1; s2's one suggested link goes into o3, so it
+    # has nothing to give up and is no source for o2.
+    assert slots(out.recommendations) == [
+        (s1, x, 1, False, False),
+        (s1, o1, 2, True, False),
+        (s1, o2, 3, True, True),
+        (s2, o3, 1, True, False),
+        (s2, o2, 2, False, False),
+    ]
+    assert {r.profile.url: r.unmet_reason for r in out.orphans} == dict.fromkeys((o1, o2, o3))
+
+
+def test_a_source_already_suggesting_a_guaranteed_page_gives_no_slot_for_it() -> None:
+    s1, s2, s3 = url("s1"), url("s2"), url("s3")
+    x, y, z, o, n = url("x"), url("y"), url("z"), url("o"), url("n")
+    scores = {(s1, x): 9.0, (s1, o): 8.0, (s2, y): 7.0, (s2, o): 6.0}
+    pages = (
+        page("s1", word_count=400, outbound=0),
+        page("s2", outbound=0),
+        *(page(p) for p in ("x", "y", "z")),
+        page("o", inbound=0),
+    )
+    inputs = make_inputs(
+        scores,
+        choices=[choice(s, t, "dome tent") for s, t in scores],
+        pages=pages,
+        tier_shares=(0.5, 0.5),
+    )
+    out = run(inputs)[1]
+
+    # s1's own suggestion into o counts once and stays a natural link; s2 gives the second.
+    assert slots(out.recommendations) == [
+        (s1, x, 1, True, False),
+        (s1, o, 2, True, False),
+        (s2, y, 1, False, False),
+        (s2, o, 2, True, True),
+    ]
+    [rescue] = out.orphans
+    assert (rescue.guaranteed, rescue.suggested_in, rescue.unmet_reason) == (2, 2, None)
+    assert out.summary.orphan_slots == 1
+
+    # n sorts first but has two sources that don't suggest it yet, o only one: o goes first.
+    wider = scores | {(s2, n): 5.0, (s3, z): 4.0, (s3, n): 3.0}
+    out = run(
+        dataclasses.replace(
+            inputs,
+            ranked=ranked(wider),
+            choices=pandas.DataFrame(
+                [choice(s, t, "dome tent") for s, t in wider], columns=list(CHOICE_COLUMNS)
+            ),
+            pages=(*pages, page("s3", outbound=0), page("n", inbound=0)),
+            linkable=frozenset({o, n}),
+        )
+    )[1]
+    assert {(r.source_url, r.target_url) for r in out.recommendations if r.orphan_slot} == {
+        (s2, o),
+        (s3, n),
+    }
+    assert {r.profile.url: (r.suggested_in, r.unmet_reason) for r in out.orphans} == {
+        n: (1, OrphanSlotReason.SOURCES_FULL),
+        o: (2, None),
+    }
+
+
+def test_only_pages_retrieval_can_target_are_guaranteed() -> None:
+    s, target = url("s"), url("o")
+    orphan: dict[str, Any] = {
+        "inbound": 0,
+        "is_orphan": True,
+        "orphan_label": OrphanLabel.NOT_LINKED,
+    }
+    inputs = make_inputs(
+        {(s, target): 1.0},
+        choices=[choice(s, target, "dome tent")],
+        pages=(
+            page("s", outbound=0),
+            page("o", **orphan),
+            page("canon", duplicate_group=1, is_canonical=True),
+            page("copy", duplicate_group=1, is_canonical=False, **orphan),
+            page("no-index", **orphan),
+        ),
+        # Neither the copy nor the page that is not indexable is a retrieval target.
+        linkable=frozenset({s, target, url("canon")}),
+    )
+    out = run(inputs)[1]
+
+    assert [r.profile.url for r in out.orphans] == [target]
+    assert out.summary.guaranteed_pages == 1
+    profiles = {p.url: p for p in out.pages}
+    assert {profiles[url(p)].orphan_label for p in ("copy", "no-index")} == {OrphanLabel.NOT_LINKED}
+    assert out.summary.orphan_pages == {OrphanLabel.NOT_LINKED: 3}
+    assert out.summary.orphans_reached == 1
+
+
+def test_a_full_page_moves_the_suggestion_to_the_next_free_reserve_or_drops_it() -> None:
+    s1, s2, s3, s4 = url("s1"), url("s2"), url("s3"), url("s4")
+    t, u, r = url("t"), url("u"), url("r")
+    scores = {(s1, t): 9.0, (s1, u): 8.5, (s2, t): 8.0, (s2, u): 7.5, (s3, t): 7.0}
+    scores |= {(s4, t): 6.8, (s3, u): 6.0, (s3, r): 1.0}
+    inputs = make_inputs(
+        scores,
+        choices=[choice(s, x, "dome tent") for s, x in scores],
+        pages=(
+            page("s1", word_count=400, outbound=0),
+            page("s2", word_count=400, outbound=0),
+            page("s3", outbound=0),
+            page("s4", outbound=0),
+        ),
+        max_suggested_inbound=2,
+    )
+    out = run(inputs)[1]
+
+    # t and u fill up with s1 and s2, the better suggestions. s3's reserve into u is full too,
+    # so its slot moves to r; s4 has no reserve, so its slot stays empty.
+    assert slots(out.recommendations) == [
+        (s1, t, 1, True, False),
+        (s1, u, 2, True, False),
+        (s2, t, 1, True, False),
+        (s2, u, 2, True, False),
+        (s3, t, 1, False, False),
+        (s3, u, 2, False, False),
+        (s3, r, 3, True, False),
+        (s4, t, 1, False, False),
+    ]
+    summary = out.summary
+    assert (summary.links_moved_by_cap, summary.links_dropped_by_cap) == (1, 1)
+    assert (summary.pages_at_cap, summary.suggested_links, summary.reserve_links) == (2, 5, 3)
+    assert summary.top10_inbound_share == 1.0
+
+
+def test_cap_moves_take_the_first_free_reserves_fill_them_to_the_cap_and_gaps_follow() -> None:
+    a, b, c, d, e, s = (url(name) for name in ("a", "b", "c", "d", "e", "s"))
+    t1, t2, r, g = (url(name) for name in ("t1", "t2", "r", "g"))
+    f1, f2, f3, f4 = (url(name) for name in ("f1", "f2", "f3", "f4"))
+    scores = {(a, t1): 10.0, (b, t1): 9.9, (a, r): 9.8, (b, r): 9.7, (c, f1): 9.6}
+    scores |= {(s, t1): 9.0, (c, t2): 8.0, (d, t2): 7.0, (s, t2): 5.0, (s, g): 4.8}
+    scores |= {(s, r): 4.6, (s, f1): 4.4, (s, f2): 4.2, (e, t1): 4.0, (e, f1): 3.0}
+    scores |= {(e, f3): 2.0, (e, f4): 1.0}
+    inputs = make_inputs(
+        scores,
+        choices=[choice(src, x, "dome tent") for src, x in scores if x != g],
+        missing=[unanchored(s, g, UnanchoredReason.SOURCE_DOES_NOT_MENTION_TOPIC)],
+        pages=tuple(page(name, word_count=400, outbound=0) for name in ("a", "b", "c", "s")),
+        max_suggested_inbound=2,
+    )
+    out = run(inputs)[1]
+
+    # t1 and r are full and f1 one short when s's link into t1 is visited; t2 fills only
+    # after it, while s still suggests it. s moves to f1, then to f2, the next free reserve;
+    # f1 is then full, so e's move passes it for f3, its first free reserve, not f4.
+    assert {(r.source_url, r.target_url) for r in out.recommendations if r.suggested} == {
+        (a, t1),
+        (a, r),
+        (b, t1),
+        (b, r),
+        (c, f1),
+        (c, t2),
+        (d, t2),
+        (s, f1),
+        (s, f2),
+        (e, f3),
+    }
+    # The gap ranks below s's suggestions before the cap, above them after it.
+    assert [x for x in new_links(out.recommendations) if x[0] == s] == [
+        (s, t1, ActionType.ADD_LINK, 1),
+        (s, t2, ActionType.ADD_LINK, 2),
+        (s, r, ActionType.ADD_LINK, 3),
+        (s, f1, ActionType.ADD_LINK, 4),
+        (s, f2, ActionType.ADD_LINK, 5),
+        (s, g, ActionType.CONTENT_GAP, 1),
+    ]
+    summary = out.summary
+    assert (summary.pages_at_cap, summary.links_moved_by_cap, summary.links_dropped_by_cap) == (
+        4,
+        3,
+        0,
+    )
+
+
+def test_hub_main_pages_take_any_number_of_suggestions_and_zero_sets_no_cap() -> None:
+    main = url("main")
+    sources = [url(f"s{i}") for i in range(7)]
+    others = [url(f"y{i}") for i in range(11)]
+    scores = {(s, main): 2.0 for s in sources}
+    scores |= {(url(f"z{i}"), y): 1.0 for i, y in enumerate(others)}
+    pages = tuple(page(f"s{i}", outbound=0) for i in range(7))
+    pages += tuple(page(f"z{i}", outbound=0) for i in range(11))
+    inputs = make_inputs(
+        scores,
+        choices=[choice(s, x, "dome tent") for s, x in scores],
+        pages=(*pages, page("main", hub_id=0, is_hub_pillar=True)),
+    )
+
+    exempt = run(inputs)[1].summary
+    assert (exempt.suggested_links, exempt.pages_at_cap, exempt.links_dropped_by_cap) == (18, 0, 0)
+    capped = run(dataclasses.replace(inputs, pages=pages))[1].summary
+    assert (capped.suggested_links, capped.pages_at_cap, capped.links_dropped_by_cap) == (16, 1, 2)
+    # Ten pages: main page with five and nine others with one each, of 16.
+    assert capped.top10_inbound_share == pytest.approx(14 / 16)
+    uncapped = run(dataclasses.replace(inputs, pages=pages, max_suggested_inbound=0))[1].summary
+    assert (uncapped.suggested_links, uncapped.pages_at_cap) == (18, 0)
+    assert uncapped.top10_inbound_share == pytest.approx(16 / 18)
+
+
+def test_orphan_slots_count_toward_the_cap() -> None:
+    o = url("o")
+    sources = [url(f"s{i}") for i in range(4)]
+    scores = {(s, url(f"x{i}")): 9.0 - i for i, s in enumerate(sources)}
+    scores |= {(s, o): 5.0 - i for i, s in enumerate(sources)}
+    inputs = make_inputs(
+        scores,
+        choices=[choice(s, x, "dome tent") for s, x in scores],
+        pages=(*(page(f"s{i}", outbound=0) for i in range(4)), page("o", inbound=0)),
+        tier_shares=(0.5, 0.5),
+        guaranteed_inbound_links=3,
+        max_suggested_inbound=2,
+    )
+    out = run(inputs)[1]
+
+    # Three guaranteed, but the cap lets two in: the best two sources give a slot each.
+    placed = [r.source_url for r in out.recommendations if r.orphan_slot]
+    assert placed == sources[:2]
+    [rescue] = out.orphans
+    assert (rescue.guaranteed, rescue.suggested_in, rescue.unmet_reason) == (2, 2, None)
+    assert out.summary.pages_at_cap == 1
+
+
+def test_no_cap_keeps_the_full_guarantee() -> None:
+    o = url("o")
+    sources = [url(f"s{i}") for i in range(4)]
+    scores = {(s, url(f"x{i}")): 9.0 - i for i, s in enumerate(sources)}
+    scores |= {(s, o): 5.0 - i for i, s in enumerate(sources)}
+    inputs = make_inputs(
+        scores,
+        choices=[choice(s, x, "dome tent") for s, x in scores],
+        pages=(*(page(f"s{i}", outbound=0) for i in range(4)), page("o", inbound=0)),
+        tier_shares=(0.5, 0.5),
+        guaranteed_inbound_links=3,
+        max_suggested_inbound=0,
+    )
+    out = run(inputs)[1]
+
+    assert [r.source_url for r in out.recommendations if r.orphan_slot] == sources[:3]
+    [rescue] = out.orphans
+    assert (rescue.guaranteed, rescue.suggested_in, rescue.unmet_reason) == (3, 3, None)
+    assert (out.summary.orphan_slots, out.summary.pages_at_cap) == (3, 0)
+
+
+def test_a_slot_can_come_from_beyond_the_sources_first_links() -> None:
+    s, o = url("s"), url("o")
+    x = [url(f"x{i}") for i in range(3)]
+    scores = {(s, x[0]): 4.0, (s, x[1]): 3.0, (s, x[2]): 2.0, (s, o): 1.0}
+    signals = {(s, o): (("content_cosine", 0.4),)}
+    inputs = make_inputs(
+        scores,
+        choices=[
+            *(choice(s, t, "dome tent") for _, t in scores),
+            choice(s, o, "tent", rank=2, total=0.4),
+        ],
+        pages=(page("s", outbound=0), page("o", inbound=0)),
+        limit=2,
+        tier_shares=(0.5, 0.5),
+    )
+    out = run(inputs, signals)[1]
+
+    # s's weakest suggested link becomes a reserve and its lowest reserve drops, so it keeps
+    # two links; the slot is a full link, served in rank order.
+    assert slots(out.recommendations) == [(s, x[0], 1, False, False), (s, o, 2, True, True)]
+    slot = out.recommendations[1]
+    assert [a.text for a in slot.proposed_anchors or ()] == ["dome tent", "tent"]
+    assert slot.signals == signals[(s, o)]
+    assert slot.rationale.startswith("Ranked 4 of the 4 candidate targets")
+    assert out.summary.guarantees_unmet == {OrphanSlotReason.SOURCES_FULL: 1}
+
+
+def test_slots_come_from_the_targets_hub_or_any_hub_and_tiers_one_and_two_only() -> None:
+    other, same, noise, low = url("s-other"), url("s-same"), url("s-noise"), url("s-low")
+    x, in_hub, free = url("x"), url("o-hub"), url("o-free")
+    scores = {(other, x): 10.0, (same, x): 9.0, (noise, x): 8.0, (other, in_hub): 7.0}
+    scores |= {(same, in_hub): 6.0, (other, free): 5.0, (noise, free): 4.0, (low, x): 3.0}
+    scores |= {(low, in_hub): 2.0}
+    inputs = make_inputs(
+        scores,
+        choices=[choice(s, t, "dome tent") for s, t in scores],
+        pages=(
+            page("s-other", hub_id=1, outbound=0),
+            page("s-same", hub_id=0, outbound=0),
+            page("s-noise", hub_id=-1, outbound=0),
+            page("s-low", hub_id=0, outbound=0),
+            page("x"),
+            page("o-hub", hub_id=0, inbound=0),
+            page("o-free", inbound=0),
+        ),
+        # Nine pairs: four in tier 1, three in tier 2, the last two in tier 3.
+        tier_shares=(0.4, 0.4),
+    )
+    out = run(inputs)[1]
+
+    placed = {(r.source_url, r.target_url) for r in out.recommendations if r.orphan_slot}
+    # o-hub: s-other is in another hub and s-low's pair is tier 3. o-free has no hub, so a
+    # source in any hub, or in none, gives.
+    assert placed == {(same, in_hub), (other, free), (noise, free)}
+    rescue = {r.profile.url: r for r in out.orphans}
+    assert [x.source_url for x in rescue[in_hub].sources] == [same, low]
+    assert [x.tier for x in rescue[in_hub].sources] == [2, 3]
+    assert (rescue[in_hub].suggested_in, rescue[in_hub].unmet_reason) == (
+        1,
+        OrphanSlotReason.SOURCES_FULL,
+    )
+    assert [x.source_url for x in rescue[free].sources] == [other, noise]
+    assert (rescue[free].suggested_in, rescue[free].unmet_reason) == (2, None)
+
+
+def test_a_page_left_short_carries_the_reason() -> None:
+    s, s2, full = url("s"), url("s2"), url("s-full")
+    met, bare, busy, none = url("o-met"), url("o-bare"), url("o-full"), url("o-none")
+    scores = {(s, met): 10.0, (s2, bare): 9.0, (full, busy): 8.0, (s, none): 1.0}
+    inputs = make_inputs(
+        scores,
+        choices=[choice(s, met, "dome tent"), choice(full, busy, "tent"), choice(s, none, "x")],
+        missing=[unanchored(s2, bare, UnanchoredReason.TARGET_PAGE_HAS_NO_KEYWORD)],
+        pages=(
+            page("s", outbound=0),
+            page("s2", outbound=0),
+            page("s-full"),
+            *(page(p, inbound=0) for p in ("o-met", "o-bare", "o-full", "o-none")),
+            page("u"),
+        ),
+        # One pair in tier 1, two in tier 2: (s, o-none) is tier 3.
+        tier_shares=(0.25, 0.5),
+        guaranteed_inbound_links=1,
+    )
+    out = run(inputs)[1]
+
+    assert {r.profile.url: r.unmet_reason for r in out.orphans} == {
+        met: None,
+        bare: OrphanSlotReason.NO_ANCHOR,
+        busy: OrphanSlotReason.SOURCES_FULL,
+        none: OrphanSlotReason.NO_RELEVANT_SOURCE,
+    }
+    assert out.summary.guarantees_unmet == {
+        OrphanSlotReason.NO_ANCHOR: 1,
+        OrphanSlotReason.SOURCES_FULL: 1,
+        OrphanSlotReason.NO_RELEVANT_SOURCE: 1,
+    }
+    assert (out.summary.guaranteed_pages, out.summary.orphan_slots) == (4, 0)
+    [bare_view] = [r for r in out.orphans if r.profile.url == bare]
+    assert [(x.source_url, x.anchor) for x in bare_view.sources] == [(s2, None)]
+
+    # Pages with one inbound link are guaranteed too below 2; nothing is when N or B is 0.
+    wider = run(dataclasses.replace(inputs, guaranteed_inbound_below=2))[1]
+    assert url("u") in {r.profile.url for r in wider.orphans}
+    for off in ({"guaranteed_inbound_links": 0}, {"guaranteed_inbound_below": 0}):
+        quiet = run(dataclasses.replace(inputs, **off))[1]
+        assert (quiet.orphans, quiet.summary.guaranteed_pages) == ((), 0)
+        assert quiet.summary.guarantees_unmet == {}
+
+
+def test_the_rescue_view_lists_anchored_sources_first_by_score_then_strength() -> None:
+    o = url("o")
+    names = ("a4", "a2", "a5", "a3", "u1", "u2", "e", "a1")
+    s = {name: url(name) for name in names}
+    scores = {(s["a4"], o): 6.0, (s["u1"], o): 10.0, (s["u2"], o): 0.5, (s["e"], o): 9.0}
+    scores |= {(s[name], o): 5.0 for name in ("a2", "a5", "a3", "a1")}
+    inputs = make_inputs(
+        scores,
+        choices=[choice(s[name], o, "dome tent") for name in ("a4", "a2", "a5", "a3", "a1", "e")],
+        missing=[
+            unanchored(s[name], o, UnanchoredReason.TOPIC_MENTIONED_BUT_NO_GOOD_PHRASE)
+            for name in ("u1", "u2")
+        ],
+        pages=(
+            page("a4", outbound=0),
+            page("a2", page_rank_percentile=0.8),
+            page("a5", page_rank_percentile=0.8),
+            page("a3"),
+            page("a1", page_rank_percentile=0.2),
+            page("o", inbound=0),
+        ),
+        excluded=excluded(s["e"]),
+        tier_shares=(0.5, 0.5),
+    )
+    [rescue] = run(inputs)[1].orphans
+
+    # Only a4 has a budget: its natural link is suggested; the others give nothing.
+    assert [x.source_url for x in rescue.sources] == [s[n] for n in ("a4", "a2", "a5", "a1", "a3")]
+    assert [x.recommendation_id for x in rescue.sources] == [
+        recommendation_id(TENANT, ActionType.ADD_LINK, s["a4"], o, None),
+        *(None,) * 4,
+    ]
+    assert rescue.sources[1].source_page_rank_percentile == 0.8
+    assert {x.anchor for x in rescue.sources} == {"dome tent"}
+    assert (rescue.suggested_in, rescue.unmet_reason) == (1, OrphanSlotReason.SOURCES_FULL)
+
+    fewer = run(dataclasses.replace(inputs, excluded=excluded(s["e"], s["a2"], s["a5"])))[1]
+    [short] = fewer.orphans
+    assert [x.source_url for x in short.sources] == [s["a4"], s["a1"], s["a3"], s["u1"], s["u2"]]
+
+
+def test_gaps_are_listed_against_the_last_suggested_link_on_pages_with_a_budget() -> None:
+    a, b, c = url("a"), url("b"), url("c")
+    t = [url(f"t{i}") for i in range(5)]
+    gap = UnanchoredReason.SOURCE_DOES_NOT_MENTION_TOPIC
+    scores = {(a, t[i]): 5.0 - i for i in range(1, 5)}
+    scores |= {(b, t[1]): 1.0, (c, t[1]): 2.0, (c, t[2]): 1.0}
+    choices = [choice(a, t[1], "dome tent"), choice(a, t[3], "camp stove")]
+    missing = [unanchored(a, t[2], gap), unanchored(a, t[4], gap)]
+    missing += [unanchored(b, t[1], gap), unanchored(c, t[1], gap), unanchored(c, t[2], gap)]
+    pages = (page("b", word_count=400, outbound=3), page("c", outbound=0))
+    one = run(make_inputs(scores, choices, missing, pages=(page("a", outbound=0), *pages)))[1]
+    two = run(
+        make_inputs(scores, choices, missing, pages=(page("a", word_count=400, outbound=0), *pages))
+    )[1]
+
+    # a suggests t1 only, so its gap t2 ranks below; b has no budget, so no gap at all; c has
+    # no link, so every gap up to the limit.
+    assert new_links(one.recommendations) == [
+        (a, t[1], ActionType.ADD_LINK, 1),
+        (a, t[3], ActionType.ADD_LINK, 2),
+        (c, t[1], ActionType.CONTENT_GAP, 1),
+        (c, t[2], ActionType.CONTENT_GAP, 2),
+    ]
+    # With two suggested links, the gap above a's second one is listed.
+    assert [(s, x, action) for s, x, action, _ in new_links(two.recommendations) if s == a] == [
+        (a, t[1], ActionType.ADD_LINK),
+        (a, t[3], ActionType.ADD_LINK),
+        (a, t[2], ActionType.CONTENT_GAP),
+    ]
+
+
+def test_best_rank_orders_every_new_link_site_wide_and_skips_verdicts() -> None:
+    a, b = url("a"), url("b")
+    t1, t2, t3 = url("t1"), url("t2"), url("t3")
+    scores = {(a, t1): 3.0, (a, t3): 3.0, (a, t2): 1.0, (b, t1): 3.0, (b, t2): 5.0}
+    inputs = make_inputs(
+        scores,
+        choices=[choice(s, x, "dome tent") for s, x in scores if (s, x) != (a, t3)],
+        missing=[unanchored(a, t3, UnanchoredReason.SOURCE_DOES_NOT_MENTION_TOPIC)],
+        audit=(verdict(a, 0, t2, ActionType.REMOVE, reasons=("off topic",)),),
+        pages=(page("a", word_count=400, outbound=0), page("b", outbound=0)),
+    )
+    records = run(inputs)[1].recommendations
+
+    ranked = sorted((r for r in records if r.best_rank is not None), key=lambda r: r.best_rank or 0)
+    # By score, then source, then rank within the source, then the action: a's link and its
+    # gap tie on all but the action.
+    assert [(r.source_url, r.target_url, r.action_type, r.score) for r in ranked] == [
+        (b, t2, ActionType.ADD_LINK, 100.0),
+        (a, t1, ActionType.ADD_LINK, 50.0),
+        (a, t3, ActionType.CONTENT_GAP, 50.0),
+        (b, t1, ActionType.ADD_LINK, 50.0),
+        (a, t2, ActionType.ADD_LINK, 0.0),
+    ]
+    assert [r.best_rank for r in ranked] == [1, 2, 3, 4, 5]
+    assert [r.suggested for r in ranked] == [True, True, False, False, True]
+    assert [r.best_rank for r in records if r.position is not None] == [None]
+
+
+def test_the_summary_counts_orphans_reached_links_to_the_pillar_and_the_gini() -> None:
+    pillar, o1, o2, o3, x = url("pillar"), url("o1"), url("o2"), url("o3"), url("x")
+    scores = {(o1, pillar): 1.0, (o2, x): 2.0, (o2, pillar): 1.0, (pillar, o3): 1.0}
+    scores |= {(o3, x): 1.0}
+    orphan: dict[str, Any] = {"is_orphan": True, "inbound": 0, "outbound": 0}
+    inputs = make_inputs(
+        scores,
+        choices=[choice(s, t, "dome tent") for s, t in scores],
+        pages=(
+            page("pillar", hub_id=0, is_hub_pillar=True, outbound=0),
+            page("o1", hub_id=0, **orphan),
+            page("o2", hub_id=0, **orphan),
+            page("o3", **orphan),
+            page("x"),
+        ),
+        hubs=(HubNode(hub_id=0, size=3, pillar_url=pillar, active=True),),
+        guaranteed_inbound_links=0,
+    )
+    summary = run(inputs)[1].summary
+
+    # o1 links up to its pillar; o2's link to it is a reserve. Only o3 gets an inbound link.
+    assert (summary.orphans_to_pillar, summary.orphans_reached) == (1, 1)
+    # Suggested inbound links per ranked target: pillar 1, x 2, o3 1.
+    assert summary.inbound_gini == pytest.approx(1 / 6)
+
+
+def test_orders_follow_the_unrounded_score_where_the_served_one_ties() -> None:
+    z, b, o, w = url("z"), url("b"), url("o"), url("w")
+    # Three thousand pairs put neighbouring ranks within one 0.1 step of the served score.
+    scores = {(url("f"), url(f"t{i}")): float(i) for i in range(3000)}
+    scores |= {(z, w): 3000.5, (b, w): 3000.7, (z, o): 1500.6, (b, o): 1500.4}
+    inputs = make_inputs(
+        scores,
+        choices=[choice(s, t, "dome tent") for s, t in ((z, w), (b, w), (z, o), (b, o))],
+        pages=(page("o", inbound=0),),
+        tier_shares=(0.5, 0.5),
+        guaranteed_inbound_links=1,
+    )
+    out = run(inputs)[1]
+
+    by_pair = {(r.source_url, r.target_url): r for r in out.recommendations}
+    assert by_pair[(z, o)].score == by_pair[(b, o)].score
+    # The better pair wins each order, though b comes first by url.
+    assert (by_pair[(z, o)].best_rank, by_pair[(b, o)].best_rank) == (3, 4)
+    assert {k for k, r in by_pair.items() if r.orphan_slot} == {(z, o)}
+    [rescue] = out.orphans
+    assert [(x.source_url, x.recommendation_id) for x in rescue.sources] == [
+        (z, by_pair[(z, o)].id),
+        (b, None),
+    ]
 
 
 # ── score and tier ───────────────────────────────────────────────────────────
@@ -790,7 +1427,8 @@ def test_every_listing_is_in_its_stable_order() -> None:
             hub_pair(1, 2, BridgeReason.NEAREST_HUB),
             hub_pair(0, 3, BridgeReason.NEAREST_HUB),
         ),
-        pages=(page("t1"), page("a"), page("b")),
+        # b takes one suggested link, so its gap ranked above it is listed.
+        pages=(page("t1"), page("a"), page("b", outbound=0)),
         hubs=(HubNode(hub_id=2, size=1, active=True), HubNode(hub_id=0, size=1, active=True)),
     )
     out = run(inputs)[1]
@@ -1046,6 +1684,10 @@ def test_the_logged_summary_and_metrics_hold_no_url() -> None:
         scorer=ScorerName.BASELINE,
         limit_per_source=10,
         content_gap_limit=3,
+        words_per_link=200,
+        guaranteed_inbound_links=2,
+        guaranteed_inbound_below=1,
+        max_suggested_inbound=5,
         summary=out.summary,
         pairs_not_assessed=3,
         seconds=1.5,
@@ -1067,12 +1709,14 @@ def test_the_logged_summary_and_metrics_hold_no_url() -> None:
 # ── one run through the stores ───────────────────────────────────────────────
 
 A, T, U, S = url("guide"), url("dome-tents"), url("camp-stoves"), url("sitemap")
+# A and U are retrieval targets, so the pages guaranteed inbound links; T has no vector.
+TARGET: dict[str, object] = {"isIndexable": True, "content_embedding": [0.5] * 2048}
 STORED_PAGES: tuple[dict[str, object], ...] = (
     {"url": A, "language": "en", "pageType": "ARTICLE", "wordCount": 900, "crawlDepth": 1,
-     "pageRankPercentile": 0.9, "hubId": 0, "isHubPillar": True},
+     "pageRankPercentile": 0.9, "hubId": 0, "isHubPillar": True, **TARGET},
     {"url": T, "language": "en", "pageType": "CATEGORY", "wordCount": 400, "crawlDepth": 2,
      "hubId": 0, "isOrphan": True, "orphanLabel": "MENUS_ONLY"},
-    {"url": U, "language": "en", "wordCount": 300, "hubId": -1, "isDeadEnd": True},
+    {"url": U, "language": "en", "wordCount": 300, "hubId": -1, "isDeadEnd": True, **TARGET},
 )  # fmt: skip
 
 
@@ -1228,6 +1872,20 @@ async def test_a_run_is_published_through_the_stores_and_replaces_the_previous(
         assert by_pair[(A, T, ActionType.ADD_LINK)].bridge is not None
         assert by_pair[(U, T, ActionType.ADD_LINK)].bridge is None
         assert by_pair[(A, T, ActionType.REMOVE)].current_anchor == "Dome tent"
+        # U already links to as many pages as its words allow, so its link is a reserve.
+        assert [
+            (r.source_url, r.suggested) for r in records if r.action_type is ActionType.ADD_LINK
+        ] == [
+            (U, False),
+            (A, True),
+        ]
+        assert sorted(r.best_rank or 0 for r in records if r.position is None) == [1, 2, 3]
+        rescue = [from_document(OrphanRescue, d) for d in stored[ORPHANS]]
+        # A's only source is outside its hub; U's is a content gap.
+        assert [(r.profile.url, r.unmet_reason) for r in rescue] == [
+            (U, OrphanSlotReason.NO_ANCHOR),
+            (A, OrphanSlotReason.NO_RELEVANT_SOURCE),
+        ]
         profiles = {p.url: p for p in (from_document(PageProfile, d) for d in stored[PAGES])}
         assert set(profiles) == {A, T, U}
         assert profiles[T].anchor_mix == AnchorMix(exact=1)
@@ -1259,6 +1917,11 @@ async def test_a_run_is_published_through_the_stores_and_replaces_the_previous(
         }
         assert info.summary == second.summary
         assert second.summary.excluded_pages == {ExclusionReason.SITEMAP: 1}
+        assert (info.words_per_link, info.guaranteed_inbound_links) == (
+            second.words_per_link,
+            second.guaranteed_inbound_links,
+        )
+        assert (second.summary.suggested_links, second.summary.guaranteed_pages) == (1, 2)
         # The other tenant's identical urls were neither read nor rewritten.
         assert await output_of(writer, other) == before
 
@@ -1267,6 +1930,88 @@ async def test_a_run_is_published_through_the_stores_and_replaces_the_previous(
         with pytest.raises(ValueError, match="run link-audit first"):
             await publish_recommendations(graph, mongo, writer, unaudited, cache_dir=tmp_path)
         assert await output_of(writer, unaudited) == {name: [] for name in (*RUN_SCOPED, RUNS)}
+
+
+@pytest.mark.integration
+async def test_a_run_guarantees_only_pages_retrieval_can_target_under_the_tenants_settings(
+    graph: GraphRepo,
+    mongo: MongoRepo,
+    mongo_uri: str,
+    tenant: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await seed_tenant(graph, mongo, tenant, tmp_path / tenant)
+    hidden, bare, gone = url("tent-archive"), url("tent-care"), url("old-tents")
+    copy, near = url("tent-pegs-copy"), url("tent-pegs")
+    orphan: dict[str, object] = {"isOrphan": True, "orphanLabel": "NOT_LINKED"}
+    await graph._auto(
+        "UNWIND $pages AS page CREATE (p:Page) SET p = page, p.tenantId = $tenant",
+        pages=[
+            {"url": hidden, **TARGET, "isIndexable": False, **orphan},
+            {"url": bare, "isIndexable": True, **orphan},
+            {"url": gone, **TARGET, **orphan},
+            {"url": copy, **TARGET, "duplicateGroup": 1, "isCanonical": False, **orphan},
+            {"url": near, **TARGET, "duplicateGroup": 1, "isCanonical": True},
+        ],
+        tenant=tenant,
+    )
+    await graph._auto(
+        "MATCH (s:Page {tenantId: $tenant, url: $s}), (t:Page {tenantId: $tenant, url: $t}) "
+        "CREATE (s)-[:LINKS_TO {position: 0, anchorText: 'Tent pegs'}]->(t)",
+        tenant=tenant,
+        s=hidden,
+        t=near,
+    )
+    await mongo.replace_excluded_pages(tenant, excluded(S, gone))
+    settings = {
+        "WORDS_PER_LINK": 150,
+        "GUARANTEED_INBOUND_LINKS": 1,
+        "GUARANTEED_INBOUND_BELOW": 2,
+        "MAX_SUGGESTED_INBOUND": 3,
+    }
+    for name, value in settings.items():
+        monkeypatch.setenv(f"TENANT_{name}", str(value))
+
+    async def features(_: object, __: object, name: str, **___: object) -> tuple[None, Path]:
+        return None, tmp_path / name / "matrix.parquet"
+
+    monkeypatch.setattr(recommendations, "assemble_features", features)
+    async with await OutputWriter.connect(mongo_uri, "linking_engine_test") as writer:
+        report = await publish_recommendations(graph, mongo, writer, tenant, cache_dir=tmp_path)
+        stored = await output_of(writer, tenant)
+
+    # Guaranteed below 2 inbound links: A and U, and near with its one link. Not the page that
+    # is not indexable, the one without a vector, the excluded one or the copy.
+    rescue = [from_document(OrphanRescue, d) for d in stored[ORPHANS]]
+    assert [(r.profile.url, r.guaranteed, r.unmet_reason) for r in rescue] == [
+        (U, 1, OrphanSlotReason.NO_ANCHOR),
+        (A, 1, OrphanSlotReason.NO_RELEVANT_SOURCE),
+        (near, 1, OrphanSlotReason.NO_RELEVANT_SOURCE),
+    ]
+    assert report.summary.guaranteed_pages == 3
+    profiles = {p.url: p for p in (from_document(PageProfile, d) for d in stored[PAGES])}
+    assert gone not in profiles
+    assert {profiles[p].orphan_label for p in (hidden, bare, copy)} == {OrphanLabel.NOT_LINKED}
+    # One link per 150 words: A's 900 less its one link is 5, U's 300 less one is 1.
+    assert (profiles[A].link_budget, profiles[U].link_budget) == (5, 1)
+    assert report.summary.suggested_links == 2
+
+    [run_doc] = stored[RUNS]
+    info = from_document(RunInfo, run_doc)
+    stamps = tuple(settings.values())
+    assert (
+        info.words_per_link,
+        info.guaranteed_inbound_links,
+        info.guaranteed_inbound_below,
+        info.max_suggested_inbound,
+    ) == stamps
+    assert (
+        report.words_per_link,
+        report.guaranteed_inbound_links,
+        report.guaranteed_inbound_below,
+        report.max_suggested_inbound,
+    ) == stamps
 
 
 async def test_signals_need_a_new_link_and_a_scorer_that_ranks(tmp_path: Path) -> None:

@@ -1,5 +1,5 @@
-"""Two tenants for the #89 output acceptance tests: the same urls, different content, verdicts
-and hubs, so a response that mixes the tenants shows it.
+"""Two tenants for the #89 and #90 output acceptance tests: the same urls, different content,
+verdicts and hubs, so a response that mixes the tenants shows it.
 
 `served_output` builds one tenant's complete served output from the output models alone, and
 `write_served` stores it the way the output stage leaves it; `open_api` serves the stored
@@ -11,7 +11,7 @@ recovering them proves the plumbing, not the method.
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -54,6 +54,8 @@ from linking_engine.models import (
     LinkAuditResult,
     LinkRecord,
     OrphanLabel,
+    OrphanRescue,
+    OrphanSlotReason,
     Page,
     PageDetail,
     PageProfile,
@@ -61,6 +63,7 @@ from linking_engine.models import (
     PageType,
     Recommendation,
     RecommendationStatus,
+    RescueSource,
     RunInfo,
     ScorerName,
     SiteSummary,
@@ -73,6 +76,7 @@ from linking_engine.output.collections import (
     BRIDGES,
     DUPLICATES,
     HUBS,
+    ORPHANS,
     PAGES,
     RECOMMENDATIONS,
     TARGET_FIXES,
@@ -140,6 +144,17 @@ STARTED: Final = datetime(2026, 9, 1, 8, 0, tzinfo=UTC)
 # New links and content gaps listed per source page, the tenant defaults.
 LIMIT: Final = 10
 GAP_LIMIT: Final = 3
+# The served run's page budget and guarantee: a link per 200 words less the existing body links,
+# and two suggested links into every page with fewer than two body links in.
+WORDS_PER_LINK: Final = 200
+GUARANTEED: Final = 2
+GUARANTEED_BELOW: Final = 2
+INBOUND: Final = (2, 2, 1, 2, 2, 2, 1, 0)
+BUDGETS: Final = (2, 2, 0, 1, 1, 0, 1, 0)
+# The dead end's one same-hub source gives it an orphan slot, displacing its own first link.
+SLOT: Final = (URLS[4], DEAD_END)
+# The pages that would link to the keywordless page once it has a keyword, by score.
+WAITING: Final = {URLS[1]: 35.0, URLS[2]: 25.0, URLS[3]: 15.0}
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +229,7 @@ class ServedOutput:
     duplicates: tuple[DuplicateGroup, ...]
     unanchored: tuple[UnanchoredOut, ...]
     target_fixes: tuple[TargetFix, ...]
+    orphans: tuple[OrphanRescue, ...]
     excluded: tuple[ExcludedPage, ...]
 
     @property
@@ -230,6 +246,7 @@ class ServedOutput:
             DUPLICATES: self.duplicates,
             UNANCHORED: self.unanchored,
             TARGET_FIXES: self.target_fixes,
+            ORPHANS: self.orphans,
         }
 
 
@@ -253,47 +270,74 @@ def _anchor(target: str, rank: int, *, alternative: bool) -> AnchorCandidate:
     )
 
 
-def _new_links(tenant: str, run_id: str, variant: Variant, revision: int) -> list[Recommendation]:
+def _score(index: int, rank: int) -> float:
+    """Every page's first link outscores every page's second, so the best-first order crosses
+    pages."""
+    return round(90.0 - 10 * rank - index, 1)
+
+
+def _new_links(
+    tenant: str, run_id: str, variant: Variant, revision: int, sources: int
+) -> list[Recommendation]:
+    # (source index, source, rank: two links then a content gap, target)
+    planned = [
+        (index, source, rank, URLS[(index + rank) % LINKED])
+        for index, source in enumerate(SOURCES[:sources])
+        for rank in (1, 2, 3)
+    ]
+
+    def best_order(entry: tuple[int, str, int, str]) -> tuple[object, ...]:
+        index, source, rank, target = entry
+        gap = rank == 3
+        action = ActionType.CONTENT_GAP if gap else ActionType.ADD_LINK
+        return (-_score(index, rank), source, 1 if gap else rank, action, target)
+
+    best = {entry: place for place, entry in enumerate(sorted(planned, key=best_order), 1)}
     records = []
-    for index, source in enumerate(SOURCES):
-        for rank in (1, 2, 3):
-            target = URLS[(index + rank) % LINKED]
-            gap = rank == 3
-            action = ActionType.CONTENT_GAP if gap else ActionType.ADD_LINK
-            crossing = index == 0 and rank == 1
-            records.append(
-                Recommendation(
-                    id=recommendation_id(tenant, action, source, target, None),
-                    run_id=run_id,
-                    source_url=source,
-                    target_url=target,
-                    action_type=action,
-                    label="content gap: add copy first" if gap else "add a link",
-                    finding=variant.gap_finding if gap else None,
-                    advice=f"Write a sentence about {word(target)} first." if gap else None,
-                    score=round(90.0 - 10 * index - rank, 1),
-                    tier=1 if index < 3 else 2,
-                    rank_in_source=1 if gap else rank,
-                    status=RecommendationStatus.PENDING,
-                    proposed_anchors=None
-                    if gap
-                    else (
-                        _anchor(target, rank, alternative=False),
-                        _anchor(target, rank, alternative=True),
-                    ),
-                    bridge=BridgeMark(
-                        hub_from=hub_of(variant, source),
-                        hub_to=hub_of(variant, target),
-                        reasons=(BridgeReason.BRIDGE_GAP,),
-                    )
-                    if crossing
-                    else None,
-                    rationale=f"{variant.name} run {revision}: ranked {rank} by the baseline "
-                    "scorer; content cosine and same hub",
-                    signals=(("content_cosine", 0.4), ("same_hub", -0.1)),
-                    created_at=STARTED + timedelta(days=revision),
+    for entry in planned:
+        index, source, rank, target = entry
+        gap = rank == 3
+        action = ActionType.CONTENT_GAP if gap else ActionType.ADD_LINK
+        crossing = index == 0 and rank == 1
+        # The slot takes one of its source's suggested links; links past the budget are reserves.
+        slot = (source, target) == SLOT
+        budget = BUDGETS[index] - (source == SLOT[0])
+        records.append(
+            Recommendation(
+                id=recommendation_id(tenant, action, source, target, None),
+                run_id=run_id,
+                source_url=source,
+                target_url=target,
+                action_type=action,
+                label="content gap: add copy first" if gap else "add a link",
+                finding=variant.gap_finding if gap else None,
+                advice=f"Write a sentence about {word(target)} first." if gap else None,
+                score=_score(index, rank),
+                tier=1 if index < 3 else 2,
+                rank_in_source=1 if gap else rank,
+                best_rank=best[entry],
+                suggested=not gap and (slot or rank <= budget),
+                orphan_slot=slot,
+                status=RecommendationStatus.PENDING,
+                proposed_anchors=None
+                if gap
+                else (
+                    _anchor(target, rank, alternative=False),
+                    _anchor(target, rank, alternative=True),
+                ),
+                bridge=BridgeMark(
+                    hub_from=hub_of(variant, source),
+                    hub_to=hub_of(variant, target),
+                    reasons=(BridgeReason.BRIDGE_GAP,),
                 )
+                if crossing
+                else None,
+                rationale=f"{variant.name} run {revision}: ranked {rank} by the baseline "
+                "scorer; content cosine and same hub",
+                signals=(("content_cosine", 0.4), ("same_hub", -0.1)),
+                created_at=STARTED + timedelta(days=revision),
             )
+        )
     return records
 
 
@@ -353,14 +397,16 @@ def _pages(variant: Variant, records: Sequence[Recommendation]) -> list[PageProf
     for index, url in enumerate(URLS):
         grouped = url in {CANONICAL, COPY}
         keyword = None if url == KEYWORDLESS else word(url)
+        outbound = 0 if url == DEAD_END else 3
         pages.append(
             PageProfile(
                 url=url,
                 title=f"{word(url).title()} | Acme {variant.name}",
                 language="en",
-                word_count=300 + 10 * index,
-                inbound=0 if url == ORPHAN else 2,
-                outbound=0 if url == DEAD_END else 3,
+                # Words for the page's budget on top of its existing links.
+                word_count=WORDS_PER_LINK * (outbound + BUDGETS[index]) + 10 * index,
+                inbound=INBOUND[index],
+                outbound=outbound,
                 crawl_depth=None if url == ORPHAN else 1 + index % 3,
                 page_rank_percentile=index / len(URLS),
                 hub_id=hub_of(variant, url),
@@ -375,6 +421,7 @@ def _pages(variant: Variant, records: Sequence[Recommendation]) -> list[PageProf
                 recommendations_out=out[url],
                 recommendations_in=into[url],
                 audit_verdicts_out=audited[url],
+                link_budget=BUDGETS[index],
             )
         )
     return pages
@@ -460,9 +507,85 @@ def _unanchored(records: Sequence[Recommendation]) -> list[UnanchoredOut]:
             advice="Give the target page a keyword.",
             rank_in_source=4,
         )
-        for source in SOURCES[2:4]
+        for source in WAITING
     ]
     return sorted(gaps + waiting, key=lambda u: (u.source_url, u.rank_in_source, u.target_url))
+
+
+def _rescues(records: Sequence[Recommendation], pages: Sequence[PageProfile]) -> list[OrphanRescue]:
+    """Each page with fewer body links in than the threshold, in url order: its same-hub
+    sources, anchored first, and whether its suggested links in meet the guarantee."""
+    strength = {page.url: page.page_rank_percentile for page in pages}
+    hub = {page.url: page.hub_id for page in pages}
+    into: defaultdict[str, list[RescueSource]] = defaultdict(list)
+    for r in records:
+        if r.action_type in NEW_LINK_ACTIONS:
+            assert r.score is not None
+            assert r.tier is not None
+            into[r.target_url].append(
+                RescueSource(
+                    source_url=r.source_url,
+                    score=r.score,
+                    tier=r.tier,
+                    anchor=r.proposed_anchors[0].text if r.proposed_anchors else None,
+                    source_page_rank_percentile=strength[r.source_url],
+                    recommendation_id=r.id if r.suggested else None,
+                )
+            )
+    for source, score in WAITING.items():
+        into[KEYWORDLESS].append(
+            RescueSource(
+                source_url=source,
+                score=score,
+                tier=2,
+                source_page_rank_percentile=strength[source],
+            )
+        )
+    rescues = []
+    for page in pages:
+        if page.inbound >= GUARANTEED_BELOW:
+            continue
+        sources = sorted(
+            (found for found in into[page.url] if hub[found.source_url] == page.hub_id),
+            key=lambda found: (
+                found.anchor is None,
+                -found.score,
+                -(found.source_page_rank_percentile or 0.0),
+                found.source_url,
+            ),
+        )
+        suggested_in = sum(1 for r in records if r.target_url == page.url and r.suggested)
+        relevant = [found for found in sources if found.tier <= 2]
+        reason = (
+            None
+            if suggested_in >= GUARANTEED
+            else OrphanSlotReason.NO_RELEVANT_SOURCE
+            if not relevant
+            else OrphanSlotReason.NO_ANCHOR
+            if all(found.anchor is None for found in relevant)
+            else OrphanSlotReason.SOURCES_FULL
+        )
+        rescues.append(
+            OrphanRescue(
+                profile=page,
+                guaranteed=GUARANTEED,
+                suggested_in=suggested_in,
+                sources=tuple(sources[:5]),
+                unmet_reason=reason,
+            )
+        )
+    return rescues
+
+
+def gini(counts: Sequence[int]) -> float | None:
+    """The Gini coefficient of the counts: 0 when equal, towards 1 when one takes all; None
+    when all are 0."""
+    total = sum(counts)
+    if not total:
+        return None
+    ordered = sorted(counts)
+    n = len(ordered)
+    return sum((2 * i - n - 1) * x for i, x in enumerate(ordered, 1)) / (n * total)
 
 
 def _summary(output: ServedOutput) -> SiteSummary:
@@ -470,6 +593,12 @@ def _summary(output: ServedOutput) -> SiteSummary:
     per_source = Counter(r.source_url for r in new)
     links = Counter(r.source_url for r in new if r.action_type is ActionType.ADD_LINK)
     audits = [r for r in output.recommendations if r.action_type not in NEW_LINK_ACTIONS]
+    added = [r for r in new if r.action_type is ActionType.ADD_LINK]
+    suggested_in = Counter(r.target_url for r in added if r.suggested)
+    pillar = {page.hub_id: page.url for page in output.pages if page.is_hub_pillar}
+    to_pillar = {(r.source_url, r.target_url) for r in added if r.suggested}
+    # The waiting pairs into the keywordless page are ranked too.
+    targets = sorted({r.target_url for r in new} | {KEYWORDLESS})
     return SiteSummary(
         pages=len(output.pages),
         excluded_pages=dict(Counter(page.reason for page in output.excluded)),
@@ -489,6 +618,20 @@ def _summary(output: ServedOutput) -> SiteSummary:
         audit_flags=dict(Counter(flag for r in audits for flag in r.issue_flags)),
         unanchored=dict(Counter(u.reason for u in output.unanchored)),
         target_fixes=len(output.target_fixes),
+        suggested_links=sum(1 for r in added if r.suggested),
+        reserve_links=sum(1 for r in added if not r.suggested),
+        guaranteed_pages=len(output.orphans),
+        orphan_slots=sum(1 for r in added if r.orphan_slot),
+        guarantees_unmet=dict(Counter(o.unmet_reason for o in output.orphans if o.unmet_reason)),
+        orphans_reached=sum(1 for p in output.pages if p.is_orphan and suggested_in[p.url]),
+        orphans_to_pillar=sum(
+            1
+            for p in output.pages
+            if p.is_orphan and p.hub_id in pillar and (p.url, pillar[p.hub_id]) in to_pillar
+        ),
+        inbound_gini=gini([suggested_in[url] for url in targets]),
+        top10_inbound_share=sum(n for _, n in suggested_in.most_common(10))
+        / sum(suggested_in.values()),
     )
 
 
@@ -497,9 +640,7 @@ def served_output(
 ) -> ServedOutput:
     """The tenant's complete output of one run. A later ``revision`` words every record
     differently; fewer ``sources`` drop the last source pages' new links."""
-    new = [
-        r for r in _new_links(tenant, run_id, variant, revision) if r.source_url in URLS[:sources]
-    ]
+    new = _new_links(tenant, run_id, variant, revision, sources)
     records = sorted(
         [*new, *_verdicts(tenant, run_id, variant, revision)], key=_recommendation_order
     )
@@ -520,6 +661,10 @@ def served_output(
             inputs={"ranked_pairs.parquet": started - timedelta(hours=1)},
             limit_per_source=LIMIT,
             content_gap_limit=GAP_LIMIT,
+            words_per_link=WORDS_PER_LINK,
+            guaranteed_inbound_links=GUARANTEED,
+            guaranteed_inbound_below=GUARANTEED_BELOW,
+            max_suggested_inbound=5,
         ),
         recommendations=tuple(records),
         pages=tuple(pages),
@@ -532,10 +677,11 @@ def served_output(
                 target_url=KEYWORDLESS,
                 title=f"{word(KEYWORDLESS).title()} | Acme {variant.name}",
                 fix="Give the target page a keyword.",
-                waiting_sources=2,
-                best_sources=SOURCES[2:4],
+                waiting_sources=len(WAITING),
+                best_sources=tuple(WAITING),
             ),
         ),
+        orphans=tuple(_rescues(records, pages)),
         excluded=(
             ExcludedPage(
                 url=EXCLUDED[0],
@@ -652,13 +798,19 @@ async def walk(
 LISTINGS: Final[dict[str, type[BaseModel]]] = {
     "/recommendations": Recommendation,
     "/pages": PageProfile,
-    "/orphans": PageProfile,
+    "/orphans": OrphanRescue,
     "/hubs": HubSummary,
     "/bridges": BridgePair,
     "/duplicates": DuplicateGroup,
     "/unanchored": UnanchoredOut,
     "/target-fixes": TargetFix,
     "/excluded-pages": ExcludedPage,
+}
+# Listings under a parameter, keyed as `served_state` keys them.
+VIEWS: Final[dict[str, tuple[str, Params]]] = {
+    "/recommendations?order=best": ("/recommendations", {"order": "best"}),
+    "/recommendations?suggested=true": ("/recommendations", {"suggested": "true"}),
+    "/orphans?unmet=true": ("/orphans", {"unmet": "true"}),
 }
 State = dict[str, object]
 
@@ -670,14 +822,18 @@ async def fetch(client: httpx.AsyncClient, path: str, key: str, **params: str) -
 
 
 async def served_state(client: httpx.AsyncClient, tenant: str, key: str) -> State:
-    """What every route serves the tenant: each listing walked in small pages, the summary and
-    run, and every page's detail and recommendation by id."""
+    """What every route serves the tenant: each listing walked in small pages, unfiltered and in
+    its `VIEWS`, the summary and run, and every page's detail and recommendation by id."""
     base = PREFIX.format(tenant=tenant)
     state: State = {}
     for route, model in LISTINGS.items():
         items, total = await walk(client, base + route, key, limit=7)
         assert total == len(items), f"{route}: total {total} for {len(items)} items"
         state[route] = tuple(model.model_validate(item) for item in items)
+    for view, (route, params) in VIEWS.items():
+        items, total = await walk(client, base + route, key, params, limit=4)
+        assert total == len(items), f"{view}: total {total} for {len(items)} items"
+        state[view] = tuple(LISTINGS[route].model_validate(item) for item in items)
     state["/runs/latest"] = RunInfo.model_validate(await fetch(client, f"{base}/runs/latest", key))
     state["/summary"] = SiteSummary.model_validate(await fetch(client, f"{base}/summary", key))
     pages = state["/pages"]
@@ -707,7 +863,12 @@ def expected_state(output: ServedOutput) -> State:
     return {
         "/recommendations": records,
         "/pages": output.pages,
-        "/orphans": tuple(page for page in output.pages if page.is_orphan),
+        "/orphans": output.orphans,
+        "/recommendations?order=best": tuple(
+            sorted((r for r in records if r.best_rank is not None), key=lambda r: r.best_rank or 0)
+        ),
+        "/recommendations?suggested=true": tuple(r for r in records if r.suggested),
+        "/orphans?unmet=true": tuple(o for o in output.orphans if o.unmet_reason is not None),
         "/hubs": output.hubs,
         "/bridges": output.bridges,
         "/duplicates": output.duplicates,
@@ -734,30 +895,53 @@ def expected_state(output: ServedOutput) -> State:
 
 # ── Stage inputs: what the recommendations stage reads ──────────────────────────────────────
 #
-# Fourteen pages in two hubs, even and odd. FULL has an anchor for every ranked target, more
-# than the limit; GAPS_ONLY has only content gaps, more than the gap limit; SPLIT has two links
-# among gaps; AUDITED links to twelve pages and the audit has a verdict on eleven of those links;
-# MIXED has one pair of every unanchored reason and four pairs no stage assessed. Every pair
-# into NO_KEYWORD waits on a target fix. The two excluded pages come back
-# through files and an audit from before they were excluded: ranked pairs with an anchor or a
-# content gap, and a verdict each.
+# Fourteen pages in two hubs, even and odd, and two orphans in none, one a duplicate copy. FULL
+# has an anchor for every ranked target, more than the limit, and a budget for half of them;
+# GAPS_ONLY has only content gaps, more than the gap limit; SPLIT has two links among gaps;
+# AUDITED links to twelve pages and the audit has a verdict on eleven of those links; MIXED has
+# one pair of every unanchored reason and four pairs no stage assessed, and no budget. Every pair
+# into NO_KEYWORD waits on a target fix, and it has an anchor for every page it could link to,
+# but a budget for one. The two orphans are guaranteed inbound links: the hubless one, like no
+# other page, gets one from FULL and one as an orphan slot from NO_KEYWORD, which gives up its
+# one suggested link; the other gets one from FULL and could only get more from the audited page,
+# which has no budget. The orphan copy is no retrieval target, so it is guaranteed nothing.
+# MIXED's page is also POPULAR: the CROWD and FULL would suggest it, more than the inbound cap;
+# it is the second tenant's even main page, which the cap exempts. The two excluded pages come
+# back through files and an audit from before they were excluded: ranked pairs with an anchor or
+# a content gap, and a verdict each.
 
 KIT: Final = (
     "alder", "birch", "cedar", "dogwood", "elm", "fir", "ginkgo",
-    "hazel", "ivy", "juniper", "larch", "maple", "oak", "pine",
+    "hazel", "ivy", "juniper", "larch", "maple", "oak", "pine", "poplar", "rowan",
 )  # fmt: skip
 KIT_URLS: Final = tuple(f"example.com/kit/{name}" for name in KIT)
 FULL, AUDITED, MIXED = KIT_URLS[0], KIT_URLS[1], KIT_URLS[2]
 KIT_CANONICAL, KIT_COPY = KIT_URLS[10], KIT_URLS[11]
+# A second copy of the canonical page, which no body link reaches.
+ORPHAN_COPY: Final = KIT_URLS[15]
+KIT_COPIES: Final = frozenset({KIT_COPY, ORPHAN_COPY})
 NO_KEYWORD: Final = KIT_URLS[12]
 KIT_ORPHAN: Final = KIT_URLS[13]
+HUBLESS_ORPHAN: Final = KIT_URLS[14]
+KIT_ORPHANS: Final = frozenset({KIT_ORPHAN, HUBLESS_ORPHAN, ORPHAN_COPY})
 KIT_DEAD_END: Final = FULL
 # Content gaps only; and two same-hub links among gaps to pages of the other hub, which rank
 # lower.
 GAPS_ONLY, SPLIT = KIT_URLS[4], KIT_URLS[6]
 SPLIT_ANCHORED: Final = frozenset({KIT_URLS[8], KIT_URLS[10]})
-# The other two pages with a new link each.
-MORE_ANCHORED: Final = frozenset({(AUDITED, KIT_ORPHAN), (KIT_URLS[5], KIT_URLS[7])})
+# Pages with an anchor for every page they could link to.
+WIDE: Final = frozenset({FULL, NO_KEYWORD})
+# The audited page's new link. The orphan also links up to its hub's main page.
+MORE_ANCHORED: Final = frozenset({(AUDITED, KIT_ORPHAN)})
+# A page that more pages would suggest than the cap lets in, and those pages. The ones of the
+# other hub suggest it last; one of them holds a reserve ranked below it, the others none.
+POPULAR: Final = MIXED
+CROWD: Final = frozenset({KIT_URLS[i] for i in (3, 5, 7, 8, 9, 10, 14)})
+CROWD_RESERVES: Final = frozenset({(KIT_URLS[9], KIT_URLS[8])})
+# Body words of the long pages: FULL's budget is half its links, GAPS_ONLY's is capped at the
+# link limit less its one body link, and the crowd page with a body link has a budget of one.
+LONG: Final = {FULL: 1100, GAPS_ONLY: 2400, KIT_URLS[3]: 400}
+FILLER: Final = "More notes follow for the reader."
 UNCRAWLED: Final = "example.com/kit/retired"
 OFFCUTS, SITEMAP_PAGE = EXCLUDED
 DIMENSION: Final = 2048
@@ -806,6 +990,10 @@ def phrase(variant: Variant, url: str) -> str:
 
 def kit_hub(variant: Variant, url: str) -> int:
     return variant.hubs[KIT_URLS.index(url) % 2]
+
+
+def kit_page_hub(variant: Variant, url: str) -> int | None:
+    return None if url in {HUBLESS_ORPHAN, ORPHAN_COPY} else kit_hub(variant, url)
 
 
 def pillars(variant: Variant) -> tuple[str, str]:
@@ -864,10 +1052,10 @@ class Planted:
         return None if found is None else f"{found} | Acme"
 
     def candidates(self) -> frozenset[tuple[str, str]]:
-        """The pairs candidate retrieval finds: any two pages not linked yet, the duplicate copy
-        on neither side."""
+        """The pairs candidate retrieval finds: any two pages not linked yet, the duplicate
+        copies on neither side."""
         linked = {(link.source, link.target) for link in self.links}
-        pages = [url for url in KIT_URLS if url != KIT_COPY]
+        pages = [url for url in KIT_URLS if url not in KIT_COPIES]
         return frozenset((s, t) for s in pages for t in pages if s != t and (s, t) not in linked)
 
 
@@ -973,7 +1161,7 @@ def plan_inputs(tenant: str, variant: Variant) -> Planted:
     """The tenant's stage inputs, before anything is stored."""
     links = _links(variant)
     linked = {(link.source, link.target) for link in links}
-    pages = [url for url in KIT_URLS if url != KIT_COPY]
+    pages = [url for url in KIT_URLS if url not in KIT_COPIES]
     anchored: dict[tuple[str, str], str] = {}
     unanchored: dict[tuple[str, str], UnanchoredReason] = {}
     for source, target in ((s, t) for s in pages for t in pages if s != t):
@@ -983,8 +1171,11 @@ def plan_inputs(tenant: str, variant: Variant) -> Planted:
         if target == NO_KEYWORD:
             unanchored[pair] = UnanchoredReason.TARGET_PAGE_HAS_NO_KEYWORD
         elif (
-            source == FULL
+            source in WIDE
             or pair in MORE_ANCHORED
+            or pair in CROWD_RESERVES
+            or (source in CROWD and target == POPULAR)
+            or pair == (KIT_ORPHAN, pillars(variant)[1])
             or (source == SPLIT and target in SPLIT_ANCHORED)
         ):
             anchored[pair] = phrase(variant, target)
@@ -1016,6 +1207,8 @@ def plan_inputs(tenant: str, variant: Variant) -> Planted:
             if source == url:
                 sentences += anchor_sentences(text)
         sentences.append(f"Everything about {word(url)} for the {variant.name} season.")
+        while len(" ".join(sentences).split()) < LONG.get(url, 0):
+            sentences.append(FILLER)
         copy[url] = tuple(sentences)
 
     first, second = sorted(variant.hubs)
@@ -1173,7 +1366,7 @@ async def plant_inputs(
                 is_indexable=True,
                 word_count=len(planted.body(url).split()),
                 language="en",
-                crawl_depth=None if url == KIT_ORPHAN else 1 + index % 3,
+                crawl_depth=None if url in KIT_ORPHANS else 1 + index % 3,
                 page_type=PageType.PILLAR if url in main else PageType.ARTICLE,
             )
             for index, url in enumerate(KIT_URLS)
@@ -1194,7 +1387,8 @@ async def plant_inputs(
         ],
     )
     rng = np.random.default_rng(89 + variant.rotation)
-    centres = np.eye(2, DIMENSION)
+    # The hubless page is like no other.
+    centres = np.eye(3, DIMENSION)
     await graph._auto(
         "UNWIND $rows AS row MATCH (p:Page {tenantId: $t, url: row.url}) "
         "SET p.content_embedding = row.vec, p.embeddingModel = $model, p.hubId = row.hub, "
@@ -1206,15 +1400,20 @@ async def plant_inputs(
         rows=[
             {
                 "url": url,
-                "vec": (centres[index % 2] + 0.05 * rng.normal(size=DIMENSION)).tolist(),
-                "hub": kit_hub(variant, url),
+                "vec": (
+                    centres[2 if url == HUBLESS_ORPHAN else index % 2]
+                    + 0.05 * rng.normal(size=DIMENSION)
+                ).tolist(),
+                "hub": kit_page_hub(variant, url),
                 "pillar": url in main,
                 "pr": index / len(KIT_URLS),
-                "orphan": url == KIT_ORPHAN,
-                "label": variant.orphan_label.value if url == KIT_ORPHAN else None,
+                "orphan": url in KIT_ORPHANS,
+                "label": variant.orphan_label.value if url in KIT_ORPHANS else None,
                 "dead_end": url == KIT_DEAD_END,
-                "group": 0 if url in {KIT_CANONICAL, KIT_COPY} else None,
-                "canonical": (url == KIT_CANONICAL) if url in {KIT_CANONICAL, KIT_COPY} else None,
+                "group": 0 if url in {KIT_CANONICAL, *KIT_COPIES} else None,
+                "canonical": (url == KIT_CANONICAL)
+                if url in {KIT_CANONICAL, *KIT_COPIES}
+                else None,
             }
             for index, url in enumerate(KIT_URLS)
         ],

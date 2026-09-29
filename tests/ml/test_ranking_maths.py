@@ -38,6 +38,7 @@ from linking_engine.ml.ranking import (
     Trained,
     bootstrap_ci,
     dominant_feature,
+    gini,
     group_ndcg,
     importance,
     ndcg_at,
@@ -574,8 +575,8 @@ def product_frame() -> pandas.DataFrame:
 def test_product_measures_known_values() -> None:
     orphans = {"o1", "o2", "never-a-candidate"}
 
-    two = product_measures(product_frame(), "score", ScorerName.LEARNED, orphans, k=2)
-    one = product_measures(product_frame(), "score", ScorerName.PLAIN, orphans, k=1)
+    two = product_measures(product_frame(), "score", ScorerName.LEARNED, orphans, pillars={}, k=2)
+    one = product_measures(product_frame(), "score", ScorerName.PLAIN, orphans, pillars={}, k=1)
 
     # First two: s1 a, o1; s2 c, a; s3 o1, b.
     assert (two.scorer, two.k) == (ScorerName.LEARNED, 2)
@@ -588,7 +589,9 @@ def test_product_measures_known_values() -> None:
     assert one.top_relevance == pytest.approx((0.8 + 0.9) / 2)
     assert one.same_hub_share == pytest.approx(2 / 3)
     assert one.orphan_slot_share == pytest.approx(1 / 3)
-    assert product_measures(product_frame(), "score", ScorerName.LEARNED, orphans).k == 10
+    assert (
+        product_measures(product_frame(), "score", ScorerName.LEARNED, orphans, pillars={}).k == 10
+    )
     # A second frame, worked by hand independently: the tie at 2.0 goes to "o1", which sorts
     # before "t2"; a pair without a score comes last.
     nan = math.nan
@@ -602,26 +605,82 @@ def test_product_measures_known_values() -> None:
         ("s2", "o2", 4.0, 0.2, 0.0),
     ]
     frame = pandas.DataFrame(rows, columns=["source_url", "target_url", "s", *PRODUCT_COLUMNS])
-    found = product_measures(frame, "s", ScorerName.LEARNED, {"o1", "o2", "zz"}, k=2)
+    found = product_measures(frame, "s", ScorerName.LEARNED, {"o1", "o2", "zz"}, pillars={}, k=2)
     assert (found.top_relevance, found.same_hub_share, found.orphan_slot_share) == (
         pytest.approx(0.5),
         0.5,
         0.75,
     )
     assert (found.orphan_page_share, found.orphans_reached) == (pytest.approx(0.4), 1.0)
-    none = product_measures(product_frame(), "score", ScorerName.BASELINE, set(), k=2)
+    none = product_measures(product_frame(), "score", ScorerName.BASELINE, set(), pillars={}, k=2)
     assert (none.orphan_slot_share, none.orphan_page_share, none.orphans_reached) == (0, 0, None)
+
+
+def test_orphan_sources_in_a_hub_are_measured_against_their_pillar() -> None:
+    # First two: s1 a, o1; s2 c, a; s3 o1, b. s2 and s3 are orphans in a hub, s1 is not an
+    # orphan, and s4 is an orphan in a hub that is no source.
+    orphans = {"o1", "o2", "s2", "s3", "s4"}
+    pillars = {"s1": "a", "s2": "o2", "s3": "o1", "s4": "a"}
+
+    found = product_measures(
+        product_frame(), "score", ScorerName.LEARNED, orphans, pillars=pillars, k=2
+    )
+    wider = product_measures(
+        product_frame(), "score", ScorerName.LEARNED, orphans, pillars=pillars, k=3
+    )
+    hubless = product_measures(
+        product_frame(), "score", ScorerName.LEARNED, orphans, pillars={"s1": "a"}, k=2
+    )
+
+    assert found.orphans_to_pillar == pytest.approx(1 / 2), "s3 shows o1, s2 misses o2"
+    assert wider.orphans_to_pillar == 1.0, "o2 is s2's third pair"
+    assert hubless.orphans_to_pillar is None
+    assert (found.orphan_page_share, found.orphans_reached) == (pytest.approx(2 / 5), 0.5)
+
+
+def test_the_inbound_gini_is_over_every_candidate_target() -> None:
+    two = product_measures(product_frame(), "score", ScorerName.LEARNED, set(), pillars={}, k=2)
+    one = product_measures(product_frame(), "score", ScorerName.LEARNED, set(), pillars={}, k=1)
+
+    # First two into a, b, c, o1, o2: 2, 1, 1, 2, 0.
+    assert two.inbound_gini == pytest.approx(1 / 3)
+    # First one into a, b, c, o1, o2: 1, 0, 1, 1, 0.
+    assert one.inbound_gini == pytest.approx(2 / 5)
+
+
+@pytest.mark.parametrize(
+    ("counts", "expected"),
+    [
+        ([3, 3, 3], 0.0),
+        ([0, 0, 0, 4], 0.75),
+        ([5], 0.0),
+        ([2, 1, 1, 2, 0], 1 / 3),
+        ([], None),
+        ([0, 0], None),
+    ],
+)
+def test_gini_known_values(counts: list[int], expected: float | None) -> None:
+    assert gini(counts) == (None if expected is None else pytest.approx(expected))
+
+
+def test_gini_refuses_negative_counts() -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        gini([1, -1])
 
 
 def test_product_measures_refuse_what_they_cannot_measure() -> None:
     with pytest.raises(ValueError, match="same_hub"):
         product_measures(
-            product_frame().drop(columns="same_hub"), "score", ScorerName.LEARNED, set()
+            product_frame().drop(columns="same_hub"),
+            "score",
+            ScorerName.LEARNED,
+            set(),
+            pillars={},
         )
     with pytest.raises(ValueError, match="no candidate pairs"):
-        product_measures(product_frame().iloc[:0], "score", ScorerName.LEARNED, set())
+        product_measures(product_frame().iloc[:0], "score", ScorerName.LEARNED, set(), pillars={})
     with pytest.raises(ValueError, match="k must be at least 1"):
-        product_measures(product_frame(), "score", ScorerName.LEARNED, set(), k=0)
+        product_measures(product_frame(), "score", ScorerName.LEARNED, set(), pillars={}, k=0)
 
 
 # ── importance and promotion ────────────────────────────────────────────────
@@ -856,6 +915,7 @@ def test_the_summary_states_what_ran_what_it_achieved_and_the_limitations() -> N
     )
     assert "seed 11 skipped: 24 test groups with a hidden link, fewer than 30" in skipping
     assert "On the production candidates, the first 10 pairs of every source page" in text
+    assert "50.0% of the orphans in a hub showing its main page, inbound Gini 0.420" in text
     assert "held-out NDCG says nothing about how orphans are ranked" in text
     unconstrained = summarise_ranker(
         make.report(

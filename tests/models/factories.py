@@ -229,6 +229,8 @@ RECOMMENDATION_KWARGS: dict[str, object] = {
     "score": 64.0,
     "tier": 1,
     "rank_in_source": 2,
+    "best_rank": 5,
+    "suggested": True,
     "status": RecommendationStatus.PENDING,
     "proposed_anchors": (AnchorCandidate(**ANCHOR_KWARGS),),
     "rationale": "Target is orphaned and sits in the same hub as the source.",

@@ -29,9 +29,12 @@ from linking_engine.models.audit import (
 )
 from linking_engine.models.bridges import BridgeLink, BridgeReport, HubPair
 from linking_engine.models.candidates import (
+    ANY_LANGUAGE,
     CandidateReport,
     CandidateSet,
     CandidateTarget,
+    PillarFloor,
+    PillarFloorBasis,
     TargetCandidates,
     TargetSelection,
     VectorIndex,
@@ -80,6 +83,7 @@ from linking_engine.models.enums import (
     KeywordSource,
     LifecycleStage,
     OrphanLabel,
+    OrphanSlotReason,
     PageType,
     RecommendationStatus,
     ScorerName,
@@ -94,10 +98,12 @@ from linking_engine.models.output import (
     BridgePair,
     HubSummary,
     Listing,
+    OrphanRescue,
     PageDetail,
     PageProfile,
     QualitySnapshot,
     RecommendationReport,
+    RescueSource,
     RunInfo,
     SiteSummary,
     TargetFix,
@@ -175,6 +181,7 @@ from linking_engine.models.signals import (
 from linking_engine.models.tenant import AnchorRules, AnchorTypeProfile, LanguageRules, TenantConfig
 
 __all__ = [
+    "ANY_LANGUAGE",
     "AUDIT_ACTIONS",
     "EXCLUSION_LABELS",
     "NEW_LINK_ACTIONS",
@@ -268,6 +275,8 @@ __all__ = [
     "Listing",
     "NdcgInterval",
     "OrphanLabel",
+    "OrphanRescue",
+    "OrphanSlotReason",
     "Page",
     "PageCentrality",
     "PageCommunities",
@@ -284,6 +293,8 @@ __all__ = [
     "PairFeatures",
     "PairSignals",
     "PassReport",
+    "PillarFloor",
+    "PillarFloorBasis",
     "PrepareReport",
     "ProductMeasures",
     "PromotionDecision",
@@ -303,6 +314,7 @@ __all__ = [
     "RecommendationReport",
     "RecommendationStatus",
     "RelevanceGroup",
+    "RescueSource",
     "ResolvedKeyword",
     "RetrievalCheck",
     "RoundSummary",

@@ -19,6 +19,7 @@ from linking_engine.models import (
     HubSummary,
     Listing,
     OrphanLabel,
+    OrphanRescue,
     PageDetail,
     PageProfile,
     Recommendation,
@@ -31,8 +32,10 @@ from linking_engine.models import (
 from linking_engine.output.reader import (
     BridgeFilter,
     ExcludedFilter,
+    OrphanFilter,
     PageFilter,
     RecommendationFilter,
+    RecommendationOrder,
     UnanchoredFilter,
 )
 from linking_engine.urls import UrlKey
@@ -87,7 +90,7 @@ async def health() -> Health:
     return Health()
 
 
-@router.get("/recommendations", summary="The run's recommendations, by source page")
+@router.get("/recommendations", summary="The run's recommendations, by source page or best first")
 async def recommendations(
     run: LatestRun,
     reader: Reader,
@@ -97,13 +100,40 @@ async def recommendations(
         list[ActionType] | None, Query(description="Repeat to match any of several.")
     ] = None,
     tier: Annotated[int | None, Query(ge=1, le=_MAX_ID)] = None,
+    suggested: Annotated[
+        bool | None,
+        Query(
+            description="true: ADD_LINKs within their source page's link budget. false: every "
+            "other record: reserve ADD_LINKs, content gaps and audit verdicts. Add "
+            "action_type=ADD_LINK to list the reserves only."
+        ),
+    ] = None,
+    orphan_slot: Annotated[
+        bool | None,
+        Query(
+            description="true: ADD_LINKs placed to meet a page's guaranteed inbound links. "
+            "false: every other record."
+        ),
+    ] = None,
+    order: Annotated[
+        RecommendationOrder,
+        Query(
+            description="page: by source page, as stored. best: the new-link actions only, "
+            "best first across every page."
+        ),
+    ] = "page",
     after: After = None,
     limit: Limit = 50,
 ) -> Listing[Recommendation]:
     filters = RecommendationFilter(
-        source=source, target=target, action_types=tuple(action_type or ()), tier=tier
+        source=source,
+        target=target,
+        action_types=tuple(action_type or ()),
+        tier=tier,
+        suggested=suggested,
+        orphan_slot=orphan_slot,
     )
-    return await reader.recommendations(run.tenant_id, run.run_id, filters, after, limit)
+    return await reader.recommendations(run.tenant_id, run.run_id, filters, after, limit, order)
 
 
 @router.get("/recommendations/{recommendation_id}", summary="One recommendation by its id")
@@ -159,16 +189,23 @@ async def page(
     return detail
 
 
-@router.get("/orphans", summary="Pages no body link reaches, by url")
+@router.get(
+    "/orphans",
+    summary="Pages guaranteed inbound links: their best sources and whether the guarantee was "
+    "met, by url",
+)
 async def orphans(
     run: LatestRun,
     reader: Reader,
     orphan_label: OrphanLabel | None = None,
+    unmet: Annotated[
+        bool | None, Query(description="Fewer suggested links came in than guaranteed.")
+    ] = None,
     after: After = None,
     limit: Limit = 50,
-) -> Listing[PageProfile]:
-    filters = PageFilter(orphan=True, orphan_label=orphan_label)
-    return await reader.pages(run.tenant_id, run.run_id, filters, after, limit)
+) -> Listing[OrphanRescue]:
+    filters = OrphanFilter(orphan_label=orphan_label, unmet=unmet)
+    return await reader.orphans(run.tenant_id, run.run_id, filters, after, limit)
 
 
 @router.get("/hubs", summary="The run's topic hubs, by id")
