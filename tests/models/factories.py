@@ -220,17 +220,16 @@ ANCHOR_KWARGS: dict[str, object] = {
 }
 
 RECOMMENDATION_KWARGS: dict[str, object] = {
+    "id": "0123456789abcdef",
+    "run_id": "run-1",
     "source_url": SOURCE_URL,
     "target_url": TARGET_URL,
     "action_type": ActionType.ADD_LINK,
-    # null for anything that is not CONTENT_GAP
-    "finding": None,
+    "label": "add a link",
     "score": 64.0,
-    # the spec does not pin tier's type; "1" validates as str, int or float
-    "tier": "1",
+    "tier": 1,
+    "rank_in_source": 2,
     "status": RecommendationStatus.PENDING,
-    # null for ADD_LINK — there is no existing anchor to replace
-    "current_anchor": None,
     "proposed_anchors": (AnchorCandidate(**ANCHOR_KWARGS),),
     "rationale": "Target is orphaned and sits in the same hub as the source.",
     "signals": {"content_cosine": 0.62, "target_is_orphan": 1.0},

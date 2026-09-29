@@ -252,6 +252,62 @@ class PageHub(BaseModel):
         return self
 
 
+class PageFacts(BaseModel):
+    """What the served output reads of one crawled page: its place in the site and its link
+    state, as the analytics stages stored them."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    url: str = Field(min_length=1)
+    language: str | None = None
+    page_type: PageType | None = None
+    word_count: int = Field(default=0, ge=0)
+    # Body links from and to other crawled pages of the tenant, distinct pages each.
+    inbound: int = Field(ge=0)
+    outbound: int = Field(ge=0)
+    crawl_depth: int | None = Field(default=None, ge=0)
+    page_rank_percentile: float | None = Field(default=None, ge=0, lt=1)
+    # -1 is HDBSCAN noise.
+    hub_id: int | None = Field(default=None, ge=-1)
+    is_hub_pillar: bool = False
+    is_orphan: bool = False
+    orphan_label: OrphanLabel | None = None
+    is_dead_end: bool = False
+    duplicate_group: int | None = Field(default=None, ge=0)
+    is_canonical: bool | None = None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Self:
+        if self.orphan_label is not None and not self.is_orphan:
+            raise ValueError("only an orphan carries an orphan label")
+        if (self.duplicate_group is None) != (self.is_canonical is None):
+            raise ValueError("is_canonical is set exactly for a page in a duplicate group")
+        return self
+
+
+class HubNode(BaseModel):
+    """A stored Hub node. A retired hub keeps its id, inactive, with size 0 and no pillar."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    hub_id: int = Field(ge=0)
+    size: int = Field(ge=0)
+    pillar_url: str | None = None
+    active: bool
+
+
+class InboundAnchorText(BaseModel):
+    """One anchor text of the body links into a crawled page from crawled pages of one
+    language, and how many links carry it."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    target_url: str = Field(min_length=1)
+    source_language: str | None = None
+    anchor_text: str
+    links: int = Field(ge=1)
+
+
 class HubCentroid(BaseModel):
     """One active hub: its stable id, size, content centroid and pillar page."""
 

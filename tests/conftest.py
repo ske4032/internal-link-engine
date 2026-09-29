@@ -47,6 +47,7 @@ _TENANT_FIELD_NAMES = (
     "client_tier",
     "diversity_cap_pct",
     "max_recommendations_per_source",
+    "max_content_gaps_per_source",
 )
 
 # Prefixes a pydantic-settings model might plausibly be configured with.

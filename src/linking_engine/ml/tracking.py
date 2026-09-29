@@ -6,11 +6,14 @@ import csv
 import io
 import math
 import time
+from datetime import UTC, datetime
 from importlib.metadata import version
 from typing import TYPE_CHECKING
 
 import mlflow
+import structlog
 from mlflow.entities import Metric
+from mlflow.exceptions import MlflowException
 
 from linking_engine.anchor.extraction import (
     MAX_INNER_STOP_WORDS,
@@ -96,7 +99,15 @@ from linking_engine.ml.quality import (
     has_signal,
     quality_metrics,
 )
-from linking_engine.models import IssueFlag, QualityBaseline
+from linking_engine.models import (
+    ActionType,
+    ExclusionReason,
+    IssueFlag,
+    OrphanLabel,
+    QualityBaseline,
+    QualitySnapshot,
+    UnanchoredReason,
+)
 from linking_engine.models.anchors import SCORE_HISTOGRAM_BINS as ANCHOR_SCORE_BINS
 from linking_engine.models.anchors import SENTENCE_INDEX_BINS, UNANCHORED_ADVICE
 from linking_engine.models.audit import AUDIT_VERDICTS
@@ -123,9 +134,12 @@ if TYPE_CHECKING:
         LinkAuditReport,
         LinkRelevanceReport,
         QualityReport,
+        RecommendationReport,
         ScoreDistribution,
         ScoreReport,
     )
+
+log = structlog.get_logger(__name__)
 
 
 # MLflow 3's UI opens an experiment without a kind in its GenAI (tracing) view, which hides the
@@ -1280,4 +1294,122 @@ def log_quality(report: QualityReport, summary: str) -> str:
         mlflow.log_text(summary, "summary.md")
         for artifact, table in quality_tables(report).items():
             mlflow.log_table(table, artifact)
+        return run_id
+
+
+def latest_quality(tenant_id: str) -> QualitySnapshot | None:
+    """The tenant's latest finished quality-eval run by end time: its run id, end time and
+    metrics, from its own experiment only. None, with a warning, when there is none or MLflow
+    cannot be read. Read-only: a missing experiment is not created."""
+    try:
+        experiment = mlflow.get_experiment_by_name(analytics_experiment(tenant_id))
+        runs = (
+            []
+            if experiment is None
+            else mlflow.MlflowClient().search_runs(
+                [experiment.experiment_id],
+                filter_string=(
+                    f"tags.stage = '{QUALITY_STAGE}' and attributes.status = 'FINISHED'"
+                ),
+                order_by=["attributes.end_time DESC"],
+                max_results=_BASELINE_CANDIDATES,
+            )
+        )
+    except (MlflowException, OSError) as error:
+        log.warning(
+            "recommendations.quality_unavailable",
+            tenant_id=tenant_id,
+            error=type(error).__name__,
+        )
+        return None
+    for run in runs:
+        if run.data.tags.get("tenant_id") == tenant_id:
+            ended = run.info.end_time
+            return QualitySnapshot(
+                mlflow_run_id=run.info.run_id,
+                finished_at=None if ended is None else datetime.fromtimestamp(ended / 1000, UTC),
+                metrics={
+                    name: float(value)
+                    for name, value in run.data.metrics.items()
+                    if math.isfinite(value)
+                },
+            )
+    log.warning("recommendations.no_quality_run", tenant_id=tenant_id)
+    return None
+
+
+def recommendation_metrics(report: RecommendationReport) -> dict[str, float]:
+    """Every count of the run, flat: per action type, tier, unanchored reason, orphan label,
+    exclusion reason and audit flag, and the totals; no urls."""
+    summary = report.summary
+    metrics = {
+        name: float(getattr(summary, name))
+        for name in (
+            "pages",
+            "dead_end_pages",
+            "duplicate_groups",
+            "duplicate_copies",
+            "hubs",
+            "bridge_pairs",
+            "bridge_links",
+            "sources_with_recommendations",
+            "sources_below_limit",
+            "links_audited",
+            "unverified_links",
+            "target_fixes",
+        )
+    }
+    metrics["orphan_pages"] = float(sum(summary.orphan_pages.values()))
+    metrics["recommendations"] = float(sum(summary.recommendations.values()))
+    metrics["pairs_not_assessed"] = float(report.pairs_not_assessed)
+    metrics["limit_per_source"] = float(report.limit_per_source)
+    metrics["content_gap_limit"] = float(report.content_gap_limit)
+    metrics["seconds"] = report.seconds
+    for kind in ActionType:
+        metrics[f"action_{kind.value.lower()}"] = float(summary.recommendations.get(kind, 0))
+    for tier in sorted({1, 2, 3, *summary.tiers}):
+        metrics[f"tier_{tier}"] = float(summary.tiers.get(tier, 0))
+    for reason in UnanchoredReason:
+        metrics[f"unanchored_{reason.value.lower()}"] = float(summary.unanchored.get(reason, 0))
+    for label in OrphanLabel:
+        metrics[f"orphan_{label.value.lower()}"] = float(summary.orphan_pages.get(label, 0))
+    for excluded in ExclusionReason:
+        metrics[f"excluded_{excluded.value.lower()}"] = float(
+            summary.excluded_pages.get(excluded, 0)
+        )
+    for flag in IssueFlag:
+        metrics[f"flag_{flag.value.lower()}"] = float(summary.audit_flags.get(flag, 0))
+    return metrics
+
+
+def log_recommendations(report: RecommendationReport, summary: str) -> str:
+    """Log one recommendations run in the tenant's analytics experiment: its counts as
+    metrics, the report, the metrics and the description; returns the MLflow run id."""
+    use_analytics_experiment(report.tenant_id)
+    with mlflow.start_run(
+        run_name="recommendations",
+        tags={
+            "tenant_id": report.tenant_id,
+            "kind": "pipeline",
+            "stage": "recommendations",
+            "output_run_id": report.run_id,
+            "scorer": report.scorer.value,
+            "model_version": report.model_version or "none",
+            "mlflow.note.content": summary,
+        },
+    ) as run:
+        run_id = str(run.info.run_id)
+        mlflow.log_params(
+            {
+                "limit_per_source": report.limit_per_source,
+                "content_gap_limit": report.content_gap_limit,
+                "scorer": report.scorer.value,
+                "model_version": report.model_version or "none",
+            }
+        )
+        metrics = recommendation_metrics(report)
+        mlflow.log_metrics(metrics)
+        mlflow.log_dict(report.model_dump(mode="json"), "report.json")
+        mlflow.log_dict(metrics, "metrics.json")
+        mlflow.log_text(summary, "summary.md")
         return run_id

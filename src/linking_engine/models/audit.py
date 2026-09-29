@@ -1,7 +1,7 @@
 """Stage 1 output: the scored result of auditing one existing link.
 
 One instance per `LINKS_TO` edge. Written back onto the relationship and kept in
-the `link_audit` collection so issue history over time is queryable.
+the `link_audit` collection until the next completed run replaces it.
 """
 
 from datetime import datetime

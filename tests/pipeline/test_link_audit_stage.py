@@ -1,7 +1,7 @@
 """The link audit stage on the planted tenant, against real Neo4j and MongoDB: every body link is
-scored and judged, kept in link_audit as history and written onto its edge, one tenant at a time.
-The planted data separate cleanly by construction, so full precision and recall prove the
-plumbing, not the method."""
+scored and judged, kept in link_audit until the next run and written onto its edge, one tenant
+at a time. The planted data separate cleanly by construction, so full precision and recall prove
+the plumbing, not the method."""
 
 from __future__ import annotations
 
@@ -129,7 +129,7 @@ async def test_planted_fixture_precision_recall_per_flag(
 
 
 @pytest.mark.integration
-async def test_audit_writes_link_audit_history_and_edges_per_tenant(
+async def test_audit_keeps_the_latest_run_and_writes_edges_per_tenant(
     graph: GraphRepo, mongo: MongoRepo, tenant: str, tmp_path: Path
 ) -> None:
     other = f"{tenant}-other"
@@ -157,11 +157,13 @@ async def test_audit_writes_link_audit_history_and_edges_per_tenant(
 
     assert first_run != second_run
     assert (first.by_flag, first.by_verdict) == (second.by_flag, second.by_verdict)
+    # The second run, once complete, replaced the first.
     stored = await mongo._db["link_audit"].find({"tenantId": tenant}).to_list()
-    assert Counter(doc["runId"] for doc in stored) == {
-        first_run: len(AUDITED),
-        second_run: len(AUDITED),
-    }
+    assert Counter(doc["runId"] for doc in stored) == {second_run: len(AUDITED)}
+    pruned = [
+        (e["pruned_documents"], e["pruned_runs"]) for e in logs if e["event"] == "audit.complete"
+    ]
+    assert pruned == [(0, 0), (len(AUDITED), 1)]
     latest = await mongo.latest_link_audit(tenant)
     assert {r.run_id for r in latest} == {second_run}
     assert len(latest) == len(AUDITED)
@@ -259,6 +261,10 @@ class ShortStores:
     async def complete_link_audit(self, tenant_id: str, run_id: str, **counts: object) -> None:
         self.calls.append("complete")
 
+    async def prune_link_audit(self, tenant_id: str, keep: str) -> tuple[int, int]:
+        self.calls.append("prune")
+        return 0, 0
+
 
 @pytest.mark.parametrize(
     ("short", "store", "calls"),
@@ -280,7 +286,7 @@ async def test_a_short_write_fails_the_run_before_it_is_marked_complete(
     assert stores.calls == calls
 
 
-async def test_complete_writes_mark_the_run_after_both_stores(tmp_path: Path) -> None:
+async def test_complete_writes_mark_the_run_after_both_stores_then_prune(tmp_path: Path) -> None:
     stores = ShortStores()
     report, run_id = await audit_links(
         stores,
@@ -289,7 +295,7 @@ async def test_complete_writes_mark_the_run_after_both_stores(tmp_path: Path) ->
         cache_dir=tmp_path,
         voyage=None,  # type: ignore[arg-type]
     )
-    assert stores.calls == ["edges", "clear", "documents", "complete"]
+    assert stores.calls == ["edges", "clear", "documents", "complete", "prune"]
     assert (report.links, report.healthy, report.run_id) == (1, 1, run_id)
 
 

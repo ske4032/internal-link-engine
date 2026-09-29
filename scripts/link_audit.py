@@ -1,7 +1,7 @@
 """Audit every existing body link of a tenant as the link-audit Prefect flow: scores, issue
-flags and a FIX / REANCHOR / REMOVE verdict with reasons, kept in link_audit as history and
-written onto the LINKS_TO edges; the run is logged to MLflow without urls. Run after graph
-analytics, and after score-links for A2.
+flags and a FIX / REANCHOR / REMOVE verdict with reasons, replacing the previous run in
+link_audit and written onto the LINKS_TO edges; the run is logged to MLflow without urls. Run
+after graph analytics, and after score-links for A2.
 
 uv run --env-file .env python scripts/link_audit.py --tenant <tenant>
 """

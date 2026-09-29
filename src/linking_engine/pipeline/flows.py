@@ -30,6 +30,7 @@ from linking_engine.ingest.graph_load import load_tenant_graph
 from linking_engine.ingest.mongo_repo import CrawlSource, MongoRepo
 from linking_engine.ingest.prepare import BOILERPLATE_SHARE, NAV_SHARE, prepare_tenant
 from linking_engine.ml.tracking import (
+    latest_quality,
     log_analytics,
     log_anchor_selection,
     log_anchors,
@@ -41,6 +42,7 @@ from linking_engine.ml.tracking import (
     log_link_audit,
     log_link_relevance,
     log_quality,
+    log_recommendations,
     log_scores,
     previous_quality_run,
 )
@@ -64,13 +66,16 @@ from linking_engine.models import (
     PrepareReport,
     QualityBaseline,
     QualityReport,
+    QualitySnapshot,
     RankerReport,
     RankReport,
+    RecommendationReport,
     ScoreReport,
     TenantConfig,
     TenantGraphCounts,
     VectorIndex,
 )
+from linking_engine.output.writer import OutputWriter
 from linking_engine.pipeline.analytics import (
     compute_centrality,
     compute_communities,
@@ -89,6 +94,10 @@ from linking_engine.pipeline.link_audit import audit_links, summarise_link_audit
 from linking_engine.pipeline.link_relevance import score_links, summarise_link_relevance
 from linking_engine.pipeline.quality import evaluate_quality, summarise_quality
 from linking_engine.pipeline.ranker import rank_pairs, train_ranker
+from linking_engine.pipeline.recommendations import (
+    publish_recommendations,
+    summarise_recommendations,
+)
 from linking_engine.pipeline.scoring import score_pairs
 
 if TYPE_CHECKING:
@@ -103,6 +112,10 @@ async def neo4j() -> GraphRepo:
 
 async def mongo() -> MongoRepo:
     return await MongoRepo.connect(os.environ["MONGO_URI"], os.environ["MONGO_DB"])
+
+
+async def output_writer() -> OutputWriter:
+    return await OutputWriter.connect(os.environ["MONGO_URI"], os.environ["MONGO_DB"])
 
 
 def voyage_client(tenant_id: str) -> VoyageClient:
@@ -988,8 +1001,8 @@ async def rank_pairs_flow(tenant_id: str, cache_dir: Path = CACHE_DIR) -> tuple[
     return report, path
 
 
-# A retry runs the audit again under a new run id: the edges take the new run and link_audit
-# keeps both as history.
+# A retry runs the audit again under a new run id: the edges take the new run, and link_audit
+# keeps the run that completes last.
 @task(
     name="link-audit",
     retries=1,
@@ -1016,8 +1029,8 @@ async def link_audit_flow(
 ) -> tuple[LinkAuditReport, str]:
     """Scores, issue flags and a FIX / REANCHOR / REMOVE verdict with reasons for every existing
     body link of the tenant after graph analytics (A1), and after score-links with #16's scores
-    (A2). Each run is kept in link_audit as history and written onto the LINKS_TO edges; counts,
-    cut-offs and score distributions go to MLflow without urls."""
+    (A2). Each run replaces the previous one in link_audit and is written onto the LINKS_TO edges;
+    counts, cut-offs and score distributions go to MLflow without urls."""
     logger = get_run_logger()
     with bound_contextvars(run_id=str(flow_run.id)):
         logger.info("auditing the existing links of tenant %s", tenant_id)
@@ -1037,6 +1050,71 @@ async def link_audit_flow(
         report.index_like_pages,
         report.ladder_pairs,
         report.proposals,
+        report.seconds,
+        mlflow_run,
+    )
+    return report, mlflow_run
+
+
+@task(name="latest-quality", cache_policy=NONE)
+def latest_quality_task(tenant_id: str) -> QualitySnapshot | None:
+    return latest_quality(tenant_id)
+
+
+# Read-only against the graph and the stage files. The output is written under a new run id and
+# served only once complete, so a retry writes a run of its own while the previous stays served.
+@task(
+    name="recommendations",
+    retries=1,
+    retry_delay_seconds=30,
+    retry_condition_fn=is_transient,
+    cache_policy=NONE,
+)
+async def recommendations_task(
+    tenant_id: str, cache_dir: Path, quality: QualitySnapshot | None
+) -> RecommendationReport:
+    async with await neo4j() as graph, await mongo() as repo, await output_writer() as writer:
+        await graph.check_server()
+        return await publish_recommendations(
+            graph, repo, writer, tenant_id, cache_dir=cache_dir, quality=quality
+        )
+
+
+@task(name="mlflow-log-recommendations", cache_policy=NONE)
+def log_recommendations_task(report: RecommendationReport) -> str:
+    return log_recommendations(report, summarise_recommendations(report))
+
+
+@flow(name="recommendations")
+async def recommendations_flow(
+    tenant_id: str, cache_dir: Path = CACHE_DIR
+) -> tuple[RecommendationReport, str]:
+    """The tenant's served output after rank-pairs, anchor-selection, hub-bridges and
+    link-audit: new links per source page with their anchors or content gaps, the audit's
+    verdicts, page profiles, hubs, bridges, duplicates, pairs without an anchor and target
+    fixes, written as a new run that replaces the previous one once complete; counts go to
+    MLflow without urls."""
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
+        logger.info("assembling the recommendations of tenant %s", tenant_id)
+        quality = latest_quality_task(tenant_id)
+        report = await recommendations_task(tenant_id, cache_dir, quality)
+        mlflow_run = log_recommendations_task(report)
+    summary = report.summary
+    logger.info(
+        "output run %s ranked by %s: recommendations %s, tiers %s; %d of %d source pages below "
+        "the limit of %d links (%d gaps); %d pairs not assessed; quality run %s; %.1fs; "
+        "mlflow run %s",
+        report.run_id,
+        report.scorer.value,
+        {kind.value: n for kind, n in summary.recommendations.items()},
+        dict(summary.tiers),
+        summary.sources_below_limit,
+        summary.sources_with_recommendations,
+        report.limit_per_source,
+        report.content_gap_limit,
+        report.pairs_not_assessed,
+        quality.mlflow_run_id if quality else "none",
         report.seconds,
         mlflow_run,
     )

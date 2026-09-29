@@ -59,11 +59,11 @@ WRITE_BATCH: Final = 1000
 READ_BATCH: Final = 1000
 _ATTEMPTS: Final = 3
 _AUTH_CODES: Final = frozenset({13, 18})  # Unauthorized, AuthenticationFailed
-_THIRTY_DAYS: Final = 30 * 24 * 3600
 # The GSC rollup stores its fields under their snake_case names, not camelCase.
 _GSC_METRICS_KEYS: Final = {field: field for field in GscMetrics.model_fields}
 
-# All project indexes. Changing options of an existing index needs a manual drop.
+# All project indexes but the served output's (output.collections.INDEXES). Changing options of
+# an existing index needs a manual drop.
 INDEXES: Final[dict[str, tuple[IndexModel, ...]]] = {
     "pages": (
         IndexModel([("tenantId", ASCENDING), ("url", ASCENDING)], unique=True, name="tenant_url"),
@@ -121,19 +121,6 @@ INDEXES: Final[dict[str, tuple[IndexModel, ...]]] = {
             [("tenantId", ASCENDING), ("auditedAt", DESCENDING), ("runId", DESCENDING)],
             name="tenant_audited_run",
         ),
-    ),
-    "recommendations": (
-        IndexModel(
-            [("tenantId", ASCENDING), ("fromUrl", ASCENDING), ("score", DESCENDING)],
-            name="tenant_from_score",
-        ),
-        IndexModel(
-            [("tenantId", ASCENDING), ("actionType", ASCENDING), ("score", DESCENDING)],
-            name="tenant_action_score",
-        ),
-        IndexModel([("tenantId", ASCENDING), ("createdAt", ASCENDING)], name="tenant_created"),
-        # MongoDB allows TTL only on a single-field index, so expiry is the same for every tenant.
-        IndexModel([("createdAt", ASCENDING)], expireAfterSeconds=_THIRTY_DAYS, name="created_ttl"),
     ),
     "anchor_feedback": (
         IndexModel([("tenantId", ASCENDING), ("createdAt", DESCENDING)], name="tenant_created"),
@@ -659,6 +646,28 @@ class MongoRepo:
                 titles.append(title)
         return titles
 
+    async def page_titles_by_url(
+        self, tenant_id: str, *, batch_size: int = READ_BATCH
+    ) -> dict[str, str | None]:
+        """The meta title of every stored page of the tenant, by url."""
+        _require_tenant(tenant_id)
+        titles: dict[str, str | None] = {}
+        async for documents in _find_batches(
+            self._db["pages"],
+            {"tenantId": tenant_id},
+            PageRecord,
+            batch_size,
+            keys={"url": "url", "metaTitle": "meta_title"},
+        ):
+            for document in documents:
+                url, title = document.get("url"), document.get("metaTitle")
+                if not isinstance(url, str) or not (title is None or isinstance(title, str)):
+                    raise DatabaseReadError(
+                        "mongodb", f"a page of {tenant_id!r} has url {url!r} and title {title!r}"
+                    )
+                titles[url] = title
+        return titles
+
     async def gsc_query_stats(
         self, tenant_id: str, *, batch_size: int = READ_BATCH
     ) -> list[GscQueryStats]:
@@ -724,7 +733,7 @@ class MongoRepo:
         *,
         batch_size: int = WRITE_BATCH,
     ) -> int:
-        """Add one audit run to the tenant's history, one document per edge. A retried run
+        """Add one audit run of the tenant, one document per edge. A retried run
         rewrites its own documents and never another run's. Returns the documents written."""
         _require_tenant(tenant_id)
         if not run_id.strip():
@@ -798,21 +807,71 @@ class MongoRepo:
             what="mark link audit run complete",
         )
 
-    async def latest_link_audit(self, tenant_id: str) -> tuple[LinkAuditResult, ...]:
-        """The tenant's most recent completed audit run, ordered by source url and position;
-        empty when none was completed. The latest auditedAt picks the run, the greatest runId
-        breaks a tie."""
+    async def prune_link_audit(self, tenant_id: str, keep: str) -> tuple[int, int]:
+        """Delete the tenant's link_audit documents and run markers of every run but ``keep``,
+        once ``keep`` is complete. Returns (documents, markers) deleted."""
         _require_tenant(tenant_id)
+        if not keep.strip():
+            raise ValueError("keep must be a non-empty run id")
         marker = await _retrying(
             partial(
                 self._db["link_audit_runs"].find_one,
+                {"tenantId": tenant_id, "runId": keep},
+                {"_id": 1},
+            ),
+            write=False,
+            what="read link audit run",
+        )
+        if marker is None:
+            raise DatabaseWriteError(
+                "mongodb", f"run {keep!r} of {tenant_id!r} is not complete; nothing pruned"
+            )
+        others: Document = {"tenantId": tenant_id, "runId": {"$ne": keep}}
+        documents = await _retrying(
+            partial(self._db["link_audit"].delete_many, others),
+            write=True,
+            what="prune link audit documents",
+        )
+        markers = await _retrying(
+            partial(self._db["link_audit_runs"].delete_many, others),
+            write=True,
+            what="prune link audit runs",
+        )
+        return documents.deleted_count, markers.deleted_count
+
+    async def latest_link_audit_run(self, tenant_id: str) -> tuple[str, datetime] | None:
+        """The run id and completion time of the tenant's most recent completed audit run, as
+        `latest_link_audit` picks it; None when none was completed."""
+        _require_tenant(tenant_id)
+        marker = await self._latest_link_audit_marker(tenant_id)
+        if marker is None:
+            return None
+        run_id, completed = marker.get("runId"), marker.get("completedAt")
+        if not isinstance(run_id, str) or not run_id or not isinstance(completed, datetime):
+            raise DatabaseReadError(
+                "mongodb", f"the latest link audit of {tenant_id!r} has no run or completion time"
+            )
+        return run_id, completed
+
+    async def _latest_link_audit_marker(self, tenant_id: str) -> Document | None:
+        marker: Document | None = await _retrying(
+            partial(
+                self._db["link_audit_runs"].find_one,
                 {"tenantId": tenant_id},
-                {"_id": 0, "runId": 1},
+                {"_id": 0, "runId": 1, "completedAt": 1},
                 sort=[("auditedAt", DESCENDING), ("runId", DESCENDING)],
             ),
             write=False,
             what="read latest link audit run",
         )
+        return marker
+
+    async def latest_link_audit(self, tenant_id: str) -> tuple[LinkAuditResult, ...]:
+        """The tenant's most recent completed audit run, ordered by source url and position;
+        empty when none was completed. The latest auditedAt picks the run, the greatest runId
+        breaks a tie."""
+        _require_tenant(tenant_id)
+        marker = await self._latest_link_audit_marker(tenant_id)
         if marker is None:
             return ()
         run_id = marker.get("runId")
