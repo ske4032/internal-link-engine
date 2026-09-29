@@ -33,10 +33,13 @@ from linking_engine.models import (
     AnchorTypeProfile,
     CrawlPage,
     ExcludedPage,
+    ExportedPair,
     ExtractionSettings,
     GscMetrics,
     GscQuery,
     GscQueryStats,
+    LabelEvent,
+    LabelExport,
     LanguageRules,
     LinkAuditResult,
     LinkRecord,
@@ -128,6 +131,30 @@ INDEXES: Final[dict[str, tuple[IndexModel, ...]]] = {
             [("tenantId", ASCENDING), ("actionType", ASCENDING), ("accepted", ASCENDING)],
             name="tenant_action_accepted",
         ),
+        # Hand labels only: production feedback carries no import.
+        IndexModel(
+            [("tenantId", ASCENDING), ("importId", ASCENDING), ("pairId", ASCENDING)],
+            unique=True,
+            partialFilterExpression={"importId": {"$exists": True}},
+            name="tenant_import_pair",
+        ),
+    ),
+    "label_pairs": (
+        IndexModel(
+            [("tenantId", ASCENDING), ("pairId", ASCENDING)], unique=True, name="tenant_pair"
+        ),
+        IndexModel([("tenantId", ASCENDING), ("exportId", ASCENDING)], name="tenant_export"),
+    ),
+    "label_exports": (
+        IndexModel(
+            [("tenantId", ASCENDING), ("exportId", ASCENDING)], unique=True, name="tenant_export"
+        ),
+    ),
+    "label_imports": (
+        IndexModel(
+            [("tenantId", ASCENDING), ("importId", ASCENDING)], unique=True, name="tenant_import"
+        ),
+        IndexModel([("tenantId", ASCENDING), ("completedAt", ASCENDING)], name="tenant_completed"),
     ),
     "excluded_pages": (
         IndexModel([("tenantId", ASCENDING), ("url", ASCENDING)], unique=True, name="tenant_url"),
@@ -890,6 +917,213 @@ class MongoRepo:
 
         documents = await _retrying(read, write=False, what="read link audit")
         return tuple(_from_document(LinkAuditResult, document) for document in documents)
+
+    async def insert_label_pairs(
+        self, tenant_id: str, export_id: str, pairs: Sequence[ExportedPair]
+    ) -> int:
+        """Add the pairs of one label export. A retried export rewrites its own pairs; a pair id
+        of another export is refused. Returns the pairs written."""
+        _require_tenant(tenant_id)
+        if not export_id.strip():
+            raise ValueError("export_id must be a non-empty string")
+        ids = [pair.pair_id for pair in pairs]
+        if len(set(ids)) != len(ids):
+            raise ValueError("one document per pair: duplicate pair_id")
+        ops = [
+            UpdateOne(
+                {"tenantId": tenant_id, "pairId": pair.pair_id, "exportId": export_id},
+                {"$set": {**_to_document(pair), "tenantId": tenant_id, "exportId": export_id}},
+                upsert=True,
+            )
+            for pair in pairs
+        ]
+        written, _ = await self._bulk("label_pairs", ops, WRITE_BATCH)
+        return written
+
+    async def complete_label_export(self, tenant_id: str, export: LabelExport) -> None:
+        """Mark an export complete once all its pairs are written; only a marked export's pairs
+        can be imported."""
+        _require_tenant(tenant_id)
+        stored = await self._count(
+            "label_pairs", {"tenantId": tenant_id, "exportId": export.export_id}, "label pairs"
+        )
+        if stored != export.pairs:
+            raise DatabaseWriteError(
+                "mongodb",
+                f"export {export.export_id!r} of {tenant_id!r} has {stored} of {export.pairs} "
+                "pairs; not marked complete",
+            )
+        await _retrying(
+            partial(
+                self._db["label_exports"].update_one,
+                {"tenantId": tenant_id, "exportId": export.export_id},
+                {
+                    "$set": {
+                        **_to_document(export),
+                        "tenantId": tenant_id,
+                        "completedAt": datetime.now(UTC),
+                    }
+                },
+                upsert=True,
+            ),
+            write=True,
+            what="mark label export complete",
+        )
+
+    async def label_export_ids(self, tenant_id: str, pair_ids: Sequence[str]) -> frozenset[str]:
+        """The tenant's complete exports holding any of ``pair_ids``."""
+        _require_tenant(tenant_id)
+        found: set[str] = set()
+        for chunk in batched(pair_ids, READ_BATCH):
+            exports = await _retrying(
+                partial(
+                    self._db["label_pairs"].distinct,
+                    "exportId",
+                    {"tenantId": tenant_id, "pairId": {"$in": list(chunk)}},
+                ),
+                write=False,
+                what="read label export ids",
+            )
+            found.update(str(export) for export in exports)
+        if not found:
+            return frozenset()
+        complete = await _retrying(
+            partial(
+                self._db["label_exports"].distinct,
+                "exportId",
+                {"tenantId": tenant_id, "exportId": {"$in": sorted(found)}},
+            ),
+            write=False,
+            what="read complete label exports",
+        )
+        return frozenset(str(export) for export in complete)
+
+    async def label_export(
+        self, tenant_id: str, export_id: str
+    ) -> tuple[LabelExport, tuple[ExportedPair, ...]] | None:
+        """A complete export of the tenant and its pairs; None when there is no such export."""
+        _require_tenant(tenant_id)
+        marker: Document | None = await _retrying(
+            partial(
+                self._db["label_exports"].find_one,
+                {"tenantId": tenant_id, "exportId": export_id},
+                dict.fromkeys(_keys(LabelExport), 1),
+            ),
+            write=False,
+            what="read label export",
+        )
+        if marker is None:
+            return None
+        export = _from_document(LabelExport, marker)
+        pairs: list[ExportedPair] = []
+        async for documents in _find_batches(
+            self._db["label_pairs"],
+            {"tenantId": tenant_id, "exportId": export_id},
+            ExportedPair,
+            READ_BATCH,
+        ):
+            pairs.extend(_from_document(ExportedPair, document) for document in documents)
+        if len(pairs) != export.pairs:
+            raise DatabaseReadError(
+                "mongodb",
+                f"export {export_id!r} of {tenant_id!r} has {len(pairs)} of {export.pairs} pairs",
+            )
+        return export, tuple(sorted(pairs, key=lambda pair: pair.pair_id))
+
+    async def insert_label_events(
+        self, tenant_id: str, import_id: str, events: Sequence[LabelEvent]
+    ) -> int:
+        """Add the label events of one import to anchor_feedback. A retried import rewrites its
+        own events and never another import's. Returns the events written."""
+        _require_tenant(tenant_id)
+        if not import_id.strip():
+            raise ValueError("import_id must be a non-empty string")
+        if any(event.import_id != import_id for event in events):
+            raise ValueError(f"every event must belong to import {import_id!r}")
+        ids = [event.pair_id for event in events]
+        if len(set(ids)) != len(ids):
+            raise ValueError("one event per pair: duplicate pair_id")
+        ops = [
+            UpdateOne(
+                {"tenantId": tenant_id, "importId": import_id, "pairId": event.pair_id},
+                {"$set": {**_to_document(event), "tenantId": tenant_id}},
+                upsert=True,
+            )
+            for event in events
+        ]
+        written, _ = await self._bulk("anchor_feedback", ops, WRITE_BATCH)
+        return written
+
+    async def complete_label_import(
+        self, tenant_id: str, import_id: str, *, export_id: str, events: int
+    ) -> None:
+        """Mark an import complete once all its events are written; only a marked import's
+        labels are ever read."""
+        _require_tenant(tenant_id)
+        if not import_id.strip() or not export_id.strip():
+            raise ValueError("import_id and export_id must be non-empty strings")
+        stored = await self._count(
+            "anchor_feedback", {"tenantId": tenant_id, "importId": import_id}, "label events"
+        )
+        if stored != events:
+            raise DatabaseWriteError(
+                "mongodb",
+                f"import {import_id!r} of {tenant_id!r} has {stored} of {events} label events; "
+                "not marked complete",
+            )
+        await _retrying(
+            partial(
+                self._db["label_imports"].update_one,
+                {"tenantId": tenant_id, "importId": import_id},
+                {
+                    "$set": {
+                        "exportId": export_id,
+                        "events": events,
+                        "completedAt": datetime.now(UTC),
+                    }
+                },
+                upsert=True,
+            ),
+            write=True,
+            what="mark label import complete",
+        )
+
+    async def hand_labels(self, tenant_id: str) -> tuple[LabelEvent, ...]:
+        """Each pair's hand label from the tenant's latest complete import that labels it,
+        ordered by source and target url. Earlier labels stay stored as its history."""
+        _require_tenant(tenant_id)
+
+        async def read() -> list[Document]:
+            cursor = (
+                self._db["label_imports"]
+                .find({"tenantId": tenant_id}, {"_id": 0, "importId": 1})
+                .sort([("completedAt", ASCENDING), ("importId", ASCENDING)])
+            )
+            return await cursor.to_list()
+
+        markers = await _retrying(read, write=False, what="read label imports")
+        order = {str(marker["importId"]): index for index, marker in enumerate(markers)}
+        latest: dict[tuple[str, str], LabelEvent] = {}
+        for chunk in batched(sorted(order), READ_BATCH):
+            query: Document = {"tenantId": tenant_id, "importId": {"$in": list(chunk)}}
+            async for documents in _find_batches(
+                self._db["anchor_feedback"], query, LabelEvent, READ_BATCH
+            ):
+                for document in documents:
+                    event = _from_document(LabelEvent, document)
+                    key = (event.source_url, event.target_url)
+                    held = latest.get(key)
+                    if held is None or order[event.import_id] > order[held.import_id]:
+                        latest[key] = event
+        return tuple(latest[key] for key in sorted(latest))
+
+    async def _count(self, name: str, query: Document, what: str) -> int:
+        counted: int = await _retrying(
+            partial(self._db[name].count_documents, query),
+            write=False,
+            what=f"count {what}",
+        )
+        return counted
 
     async def get_pages(
         self, tenant_id: str, urls: Sequence[str], *, batch_size: int = READ_BATCH
