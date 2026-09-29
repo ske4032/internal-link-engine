@@ -13,6 +13,7 @@ import pytest
 from ranking_seed import (
     NOISE_URLS,
     OFFSETS,
+    ORPHANS,
     SIZE,
     TOPICS,
     URLS,
@@ -23,6 +24,7 @@ from ranking_seed import (
     linked,
     links,
     names,
+    orphan_targets,
     page_url,
     phrase,
     seed_ranking,
@@ -147,6 +149,41 @@ async def test_rounds_labels_are_hidden_links_and_views_recomputed(
     assert {line["tenant_id"] for line in logs if line["event"] == "ranker.round"} == {tenant}
     logged = " ".join(str(value) for entry in logs for value in entry.values())
     assert [u for u in URLS if u in logged] == [], "page urls in the log"
+
+
+@pytest.mark.integration
+async def test_orphan_targets_are_the_full_graph_pages_without_inbound_body_links(
+    graph: GraphRepo, mongo: MongoRepo, tenant: str, tmp_path: Path
+) -> None:
+    """Orphans come from the full graph, not a round's view: a page whose only inbound link is
+    hidden in round 0 has none on that view, yet is a positive there, never an orphan."""
+    await seed_ranking(graph, mongo, tenant)
+    source, target = min(hidden_in(0))
+    others = {s for s, t in body_links() if t == target and s != source}
+    for other in sorted(others):
+        await graph.replace_links(
+            tenant,
+            [other],
+            [link for link in links() if link.source_url == other and link.target_url != target],
+        )
+
+    rounds = await held_out_rounds(
+        graph, mongo, tenant, settings=TWO_ROUNDS, cache_dir=tmp_path, voyage=client(voyage())
+    )
+
+    assert rounds.orphan_targets == orphan_targets() == ORPHANS | NOISE_URLS
+    assert target not in rounds.orphan_targets
+    frame = load_rounds(rounds.paths)
+    first = frame[frame["round"] == 0]
+    assert (
+        (first["source_url"] == source) & (first["target_url"] == target) & (first["label"] == 1)
+    ).any()
+    into = first[first["target_url"] == target]
+    assert set(into["target_inbound_count"]) == {0}, "the view still counts the hidden link"
+    # The round files keep the orphan rows; training leaves them out.
+    kept = frame[frame["target_url"].isin(rounds.orphan_targets)]
+    assert set(kept["target_url"]) == rounds.orphan_targets
+    assert set(kept["label"]) == {0}
 
 
 @pytest.mark.integration

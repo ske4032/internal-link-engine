@@ -33,6 +33,7 @@ from linking_engine.ml.ranking import (
     MIN_TRAIN_GROUPS,
     PLACEMENT_COLUMNS,
     PREDICT_CHUNK,
+    PRODUCT_K,
     TRAIN_THREADS,
     Trained,
     placement_gain_share,
@@ -41,11 +42,11 @@ from linking_engine.ml.tracking import EXPERIMENT_KIND, EXPERIMENT_KIND_TAG
 from linking_engine.models.ranking import NDCG_HISTOGRAM_BINS
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Callable, Iterable, Iterator, Mapping
 
     from mlflow.entities.model_registry import ModelVersion
 
-    from linking_engine.models import RankerReport
+    from linking_engine.models import RankerReport, SeedResult
 
 PROMOTION_ENV: Final = "RANKER_PROMOTION"
 PROMOTION_ALLOWED: Final = "allowed"
@@ -160,6 +161,9 @@ def ranker_params(report: RankerReport) -> dict[str, object]:
         "early_stopping_rounds": params.early_stopping_rounds,
         "eval_at": params.eval_at,
         "seed": params.seed,
+        "monotone_increasing": ",".join(params.monotone_increasing) or "none",
+        "evaluation_seeds": ",".join(map(str, settings.evaluation_seeds)),
+        "product_k": PRODUCT_K,
         "columns": len(report.columns),
         "excluded_columns": ",".join(report.excluded_columns) or "none",
         "link_derived_columns": ",".join(LINK_DERIVED_COLUMNS),
@@ -185,7 +189,32 @@ def ranker_metrics(report: RankerReport) -> dict[str, float]:
         "positives": float(report.positives),
         "seconds": report.seconds,
         "skipped": float(report.skipped_reason is not None),
+        "unlabelable_targets": float(report.unlabelable_targets),
+        "unlabelable_rows": float(report.unlabelable_rows),
+        "seeds_skipped": float(len(report.skipped_seeds)),
     }
+    if results := report.seed_results:
+        metrics.update(
+            {
+                "seeds_evaluated": float(len(results)),
+                "seeds_worse": float(report.seeds_worse),
+                "seeds_better": float(report.seeds_better),
+                "seed_mean_learned_ndcg_at_10": _mean(r.learned[0] for r in results),
+                "seed_mean_plain_ndcg_at_10": _mean(r.plain[0] for r in results),
+                "seed_mean_baseline_ndcg_at_10": _mean(r.baseline[0] for r in results),
+                "seed_mean_delta": _mean(r.delta for r in results),
+            }
+        )
+    for measured in report.product_measures:
+        prefix = f"product_{measured.scorer.value}"
+        found = {
+            "top_relevance": measured.top_relevance,
+            "same_hub_share": measured.same_hub_share,
+            "orphan_slot_share": measured.orphan_slot_share,
+            "orphan_page_share": measured.orphan_page_share,
+            "orphans_reached": measured.orphans_reached,
+        }
+        metrics.update({f"{prefix}_{k}": v for k, v in found.items() if v is not None})
     if report.best_iteration is not None:
         metrics["best_iteration"] = float(report.best_iteration)
     for entry in report.metrics:
@@ -216,8 +245,14 @@ def ranker_metrics(report: RankerReport) -> dict[str, float]:
     return metrics
 
 
+def _mean(values: Iterable[float]) -> float:
+    found = list(values)
+    return sum(found) / len(found)
+
+
 def ranker_step_metrics(report: RankerReport) -> dict[str, dict[int, float]]:
-    """Distributions as metrics whose step is the round or the histogram bin."""
+    """Distributions as metrics whose step is the round, the histogram bin, or the seed's index
+    among the evaluation seeds (seed_value names the seed)."""
     steps: dict[str, dict[int, float]] = {
         f"round_{field}": {
             r.round: float(value) for r in report.rounds if (value := getattr(r, field)) is not None
@@ -236,7 +271,22 @@ def ranker_step_metrics(report: RankerReport) -> dict[str, dict[int, float]]:
         name = entry.scorer.value
         steps[f"{name}_ndcg_at_10_by_round"] = dict(entry.per_round)
         steps[f"{name}_ndcg_hist"] = {b: float(n) for b, n in enumerate(entry.histogram)}
+    index = {seed: i for i, seed in enumerate(report.settings.evaluation_seeds)}
+    for field, value_of in _SEED_STEPS:
+        steps[f"seed_{field}"] = {index[r.seed]: value_of(r) for r in report.seed_results}
     return {name: values for name, values in steps.items() if values}
+
+
+_SEED_STEPS: Final[tuple[tuple[str, Callable[[SeedResult], float]], ...]] = (
+    ("value", lambda r: float(r.seed)),
+    ("test_pages", lambda r: float(r.test_pages)),
+    ("learned_ndcg_at_10", lambda r: r.learned[0]),
+    ("plain_ndcg_at_10", lambda r: r.plain[0]),
+    ("baseline_ndcg_at_10", lambda r: r.baseline[0]),
+    ("delta", lambda r: r.delta),
+    ("delta_ci_low", lambda r: r.delta_ci_low),
+    ("delta_ci_high", lambda r: r.delta_ci_high),
+)
 
 
 def ranker_tables(report: RankerReport) -> dict[str, dict[str, list[object]]]:
@@ -291,6 +341,36 @@ def ranker_tables(report: RankerReport) -> dict[str, dict[str, list[object]]]:
             "link_derived": [e.column in LINK_DERIVED_COLUMNS for e in report.importance],
             "placement": [e.column in PLACEMENT_COLUMNS for e in report.importance],
         }
+    if results := report.seed_results:
+        table: dict[str, list[object]] = {
+            "seed": [r.seed for r in results],
+            "test_pages": [r.test_pages for r in results],
+        }
+        for name in ("learned", "plain", "baseline"):
+            triples = [getattr(r, name) for r in results]
+            table[f"{name}_ndcg_at_10"] = [t[0] for t in triples]
+            table[f"{name}_ci_low"] = [t[1] for t in triples]
+            table[f"{name}_ci_high"] = [t[2] for t in triples]
+        table["delta"] = [r.delta for r in results]
+        table["delta_ci_low"] = [r.delta_ci_low for r in results]
+        table["delta_ci_high"] = [r.delta_ci_high for r in results]
+        table["against_plain"] = [
+            "worse" if r.significantly_worse else "better" if r.significantly_better else "same"
+            for r in results
+        ]
+        tables["seed_results.json"] = table
+    if skipped := report.skipped_seeds:
+        tables["skipped_seeds.json"] = {"seed": list(skipped), "reason": list(skipped.values())}
+    if measures := report.product_measures:
+        tables["product_measures.json"] = {
+            "scorer": [m.scorer.value for m in measures],
+            "k": [m.k for m in measures],
+            "top_relevance": [m.top_relevance for m in measures],
+            "same_hub_share": [m.same_hub_share for m in measures],
+            "orphan_slot_share": [m.orphan_slot_share for m in measures],
+            "orphan_page_share": [m.orphan_page_share for m in measures],
+            "orphans_reached": [m.orphans_reached for m in measures],
+        }
     return tables
 
 
@@ -338,6 +418,8 @@ def _log_ranker(
             "git_sha": report.git_sha,
             "skipped_reason": report.skipped_reason or "none",
             "dominant_feature": report.dominant_feature or "none",
+            "product_skipped_reason": report.product_skipped_reason or "none",
+            "skipped_seeds": ",".join(map(str, report.skipped_seeds)) or "none",
             "promoted": "false",
             "mlflow.note.content": summary,
         },

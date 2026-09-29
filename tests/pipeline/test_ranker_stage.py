@@ -16,7 +16,7 @@ import pytest
 import ranking_factories as make
 from mlflow import MlflowClient
 from mlflow.artifacts import download_artifacts
-from ranking_seed import KEYWORDS, URLS, graded_frame, seed_ranking, voyage
+from ranking_seed import KEYWORDS, URLS, graded_frame, orphan_targets, seed_ranking, voyage
 from selection_seed import seed_selection
 from selection_seed import voyage as selection_voyage
 from store_state import graph_state, mongo_state
@@ -209,14 +209,23 @@ async def test_train_ranker_end_to_end_logs_and_registers(
     assert groups_of(frame, valid) == report.valid_groups
     assert groups_of(frame, sources - test - valid) == report.train_groups
 
-    # The full model, then without link counts, then without placement, on one split.
+    # On the fixed split: the learned and plain models, then the learned model without link
+    # counts and without placement; then the learned and plain models of every other seed.
     assert [model.columns for model in models] == [
+        MODEL_COLUMNS,
         MODEL_COLUMNS,
         LIKE_FOR_LIKE_COLUMNS,
         EXCL_PLACEMENT_COLUMNS,
+        *(MODEL_COLUMNS,) * 2 * (len(ENOUGH.evaluation_seeds) - 1),
     ]
-    assert not set(PLACEMENT_COLUMNS) & set(models[2].booster.feature_name())
+    assert not set(PLACEMENT_COLUMNS) & set(models[3].booster.feature_name())
     assert set(PLACEMENT_COLUMNS) <= set(models[0].booster.feature_name())
+    assert "[monotone_constraints: ]" in models[1].booster.model_to_string(), "plain is constrained"
+    # Without an anchor choices file the production pairs would lack their placements.
+    assert (report.product_measures, report.product_skipped_reason) == (
+        (),
+        ranker.NO_ANCHOR_CHOICES,
+    )
     metrics = {entry.scorer: entry for entry in report.metrics}
     assert set(metrics) == LEARNED_SCORERS, "no holder yet"
     assert {entry.groups for entry in report.metrics} == {report.test_groups}
@@ -361,17 +370,19 @@ def graded_model(columns: tuple[str, ...]) -> Trained:
         if column not in frame:
             frame[column] = np.random.default_rng(0).random(len(frame))
     valid = frame["source_url"].isin(split_sources(frame["source_url"], share=0.3, seed=7))
-    return train(frame[~valid], frame[valid], columns, RankerParams(max_rounds=20))
+    monotone = tuple(column for column in RankerParams().monotone_increasing if column in columns)
+    params = RankerParams(max_rounds=20, monotone_increasing=monotone)
+    return train(frame[~valid], frame[valid], columns, params)
 
 
 def promote(tenant: str, model: Trained, monkeypatch: pytest.MonkeyPatch, **fields: object) -> str:
     """Register ``model`` for the tenant and give it the production alias; by default trained
     on the current feature code with ENOUGH's split."""
+    values: dict[str, Any] = {"feature_set_version": code_digest(), "settings": ENOUGH, **fields}
+    # The factory's seed results are for seeds 7 and 11.
+    values["settings"] = values["settings"].model_copy(update={"evaluation_seeds": (7, 11)})
     report = make.report(
-        tenant,
-        columns=model.columns,
-        best_iteration=model.best_iteration,
-        **{"feature_set_version": code_digest(), "settings": ENOUGH, **fields},
+        tenant, columns=model.columns, best_iteration=model.best_iteration, **values
     )
     _, version = log_ranker(report, model, summarise_ranker(report))
     assert version is not None
@@ -443,6 +454,7 @@ async def test_rank_pairs_learned_and_baseline_fallback(
     rows = ranked(path)
     assert set(rows["scorer"]) == {"learned"}
     assert set(rows["model_version"]) == {version}
+    assert orphan_targets() <= set(rows["target_url"]), "an orphan target is not ranked"
     matrix_rows = features.set_index(list(KEY_COLUMNS)).loc[
         list(zip(rows["source_url"], rows["target_url"], strict=True))
     ]

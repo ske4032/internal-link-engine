@@ -75,7 +75,8 @@ def local_mlflow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
 def trained() -> Trained:
     frame = graded_frame()
     valid = frame["source_url"].isin(split_sources(frame["source_url"], share=0.3, seed=7))
-    return train(frame[~valid], frame[valid], make.COLUMNS, RankerParams(max_rounds=30))
+    params = RankerParams(max_rounds=30, monotone_increasing=("content_cosine",))
+    return train(frame[~valid], frame[valid], make.COLUMNS, params)
 
 
 def logged(report: RankerReport, model: Trained | None) -> tuple[str, str | None]:
@@ -165,6 +166,10 @@ def test_train_ranker_run_logs_tags_params_metrics_tables_and_registers(
     assert params["excluded_columns"] == "target_crawl_depth"
     assert params["placement_columns"] == ",".join(PLACEMENT_COLUMNS)
     assert params["link_derived_columns"] == ",".join(LINK_DERIVED_COLUMNS)
+    assert params["monotone_increasing"] == "content_cosine,anchor_target_fit,context_relevance"
+    assert params["evaluation_seeds"] == "7,11"
+    assert params["product_k"] == "10"
+    assert tags["product_skipped_reason"] == "none"
 
     metrics = ranker_metrics(report)
     assert {name: run.data.metrics[name] for name in metrics} == pytest.approx(metrics)
@@ -180,6 +185,18 @@ def test_train_ranker_run_logs_tags_params_metrics_tables_and_registers(
         enumerate(map(float, learned.histogram))
     )
     assert history(client, run_id, "round_positives") == [(0, 36.0), (1, 30.0)]
+    # Seed step metrics: the step is the seed's index among the evaluation seeds.
+    assert history(client, run_id, "seed_value") == [(0, 7.0), (1, 11.0)]
+    assert history(client, run_id, "seed_delta") == [(0, 0.02), (1, -0.04)]
+    assert history(client, run_id, "seed_learned_ndcg_at_10") == [(0, 0.62), (1, 0.62)]
+    found = run.data.metrics
+    assert (found["unlabelable_targets"], found["unlabelable_rows"]) == (6.0, 480.0)
+    assert (found["seeds_evaluated"], found["seeds_worse"], found["seeds_better"]) == (2, 1, 0)
+    assert found["seed_mean_delta"] == pytest.approx(-0.01)
+    assert found["seed_mean_plain_ndcg_at_10"] == pytest.approx(0.6)
+    assert found["product_learned_top_relevance"] == pytest.approx(0.71)
+    assert found["product_plain_orphan_slot_share"] == pytest.approx(0.03)
+    assert found["product_baseline_same_hub_share"] == pytest.approx(0.7)
     assert history(client, run_id, "round_positive_placement_share") == [(0, 0.9), (1, 0.9)]
     assert history(client, run_id, "round_negative_placement_share") == [(0, 0.05), (1, 0.05)]
     assert run.data.metrics["placement_gain_share"] == 0.0
@@ -212,6 +229,12 @@ def test_train_ranker_run_logs_tags_params_metrics_tables_and_registers(
     )
     assert rounds["positive_placement_share"] == [0.9, 0.9]
     assert rounds["negative_placement_share"] == [0.05, 0.05]
+    seeds = table(run_id, "seed_results.json")
+    assert (seeds["seed"], seeds["against_plain"]) == ([7, 11], ["same", "worse"])
+    assert (seeds["learned_ci_low"], seeds["delta_ci_high"]) == ([0.55, 0.55], [0.05, -0.01])
+    products = table(run_id, "product_measures.json")
+    assert products["scorer"] == ["learned", "plain", "baseline"]
+    assert products["orphans_reached"] == [0.95, 0.95, 0.95]
     assert table(run_id, "ranking_metrics.json")["scorer"] == [
         "learned",
         "learned_excl_link_counts",
@@ -424,7 +447,10 @@ def test_tag_promoted_marks_the_run_only_after_the_alias_moved(
 def test_a_holder_carries_how_it_was_trained_from_its_version_tags(
     local_mlflow: str, trained: Trained, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    report = make.report(TENANT, settings=HeldOutSettings(rounds=2, split_seed=11, test_share=0.3))
+    report = make.report(
+        TENANT,
+        settings=HeldOutSettings(rounds=2, split_seed=11, test_share=0.3, evaluation_seeds=(7, 11)),
+    )
     run_id, version = logged(report, trained)
     assert version is not None
     monkeypatch.setenv(PROMOTION_ENV, "allowed")
@@ -441,3 +467,35 @@ def test_a_holder_carries_how_it_was_trained_from_its_version_tags(
     blurred = holder(TENANT)
     assert blurred is not None
     assert (blurred.split_seed, blurred.test_share, blurred.valid_share) == (None, None, 0.1)
+
+
+def test_a_run_without_product_measures_says_why(local_mlflow: str, trained: Trained) -> None:
+    report = make.report(
+        TENANT, product_measures=(), product_skipped_reason="no anchor choices for the tenant"
+    )
+
+    run_id, _ = logged(report, trained)
+
+    run = MlflowClient(local_mlflow).get_run(run_id)
+    assert run.data.tags["product_skipped_reason"] == "no anchor choices for the tenant"
+    assert not [name for name in run.data.metrics if name.startswith("product_")]
+    assert "product_measures.json" not in {
+        a.path for a in MlflowClient(local_mlflow).list_artifacts(run_id)
+    }
+
+
+def test_a_skipped_seed_is_logged_with_its_reason(local_mlflow: str, trained: Trained) -> None:
+    reason = "24 test groups with a hidden link, fewer than 30"
+    report = make.report(TENANT, seed_results=(make.seed_result(7),), skipped_seeds={11: reason})
+
+    run_id, _ = logged(report, trained)
+
+    client = MlflowClient(local_mlflow)
+    run = client.get_run(run_id)
+    assert run.data.tags["skipped_seeds"] == "11"
+    assert run.data.metrics["seeds_skipped"] == 1.0
+    assert table(run_id, "skipped_seeds.json") == {"seed": [11], "reason": [reason]}
+    assert history(client, run_id, "seed_value") == [(0, 7.0)]
+    assert make.report(TENANT).skipped_seeds == {}
+    unskipped = client.get_run(logged(make.report(TENANT), trained)[0])
+    assert unskipped.data.tags["skipped_seeds"] == "none"

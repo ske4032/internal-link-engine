@@ -1,6 +1,6 @@
 """The maths of the learned ranker: the source split, query groups, LambdaMART training,
-chunked prediction, NDCG@10 with bootstrap intervals, gain importance and the promotion gate.
-No I/O.
+chunked prediction, NDCG@10 with bootstrap intervals, gain importance, the promotion gate, the
+evaluation across split seeds and the measures on production candidates. No I/O.
 
 A query group is one source page in one held-out round; its candidate pairs are ranked against
 each other, never across sources.
@@ -18,16 +18,23 @@ import numpy as np
 
 from linking_engine.discovery.features import FEATURE_COLUMNS
 from linking_engine.ml.quality import LINK_DERIVED_COLUMNS
-from linking_engine.models import ImportanceEntry, PromotionDecision, RankingMetrics, ScorerName
+from linking_engine.models import (
+    ImportanceEntry,
+    ProductMeasures,
+    PromotionDecision,
+    RankingMetrics,
+    ScorerName,
+    SeedResult,
+)
 from linking_engine.models.ranking import NDCG_HISTOGRAM_BINS
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Mapping, Sequence
+    from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 
     import numpy.typing as npt
     from pandas import DataFrame
 
-    from linking_engine.models import RankerParams, RankerReport
+    from linking_engine.models import HeldOutSettings, NdcgInterval, RankerParams, RankerReport
 
 EXCLUDED_COLUMNS: Final[Mapping[str, str]] = MappingProxyType(
     {"target_crawl_depth": "stored BFS over links that still include the hidden ones"}
@@ -53,6 +60,8 @@ PREDICT_CHUNK: Final = 50_000
 BOOTSTRAP_SAMPLES: Final = 1000
 NDCG_K: Final = 10
 PRECISION_K: Final = 5
+# Pairs per source page an editor is shown, over which the product measures are taken.
+PRODUCT_K: Final = 10
 # Fixed so that training is reproducible whatever the machine's core count.
 TRAIN_THREADS: Final = 4
 _HASH_RANGE: Final = 1 << 256
@@ -81,6 +90,22 @@ def split_sources(sources: Iterable[str], *, share: float, seed: int) -> frozens
         raise ValueError("share must be in (0, 1)")
     cut = int(share * _HASH_RANGE)
     return frozenset(source for source in set(sources) if _source_hash(seed, source) < cut)
+
+
+def seed_split(
+    sources: Iterable[str], settings: HeldOutSettings, seed: int
+) -> tuple[frozenset[str], frozenset[str]]:
+    """The test sources under ``seed``, then the early-stopping sources, drawn from the rest
+    under ``seed + 1``; the split seed gives the split the models are trained on."""
+    pool = frozenset(sources)
+    test = split_sources(pool, share=settings.test_share, seed=seed)
+    return test, split_sources(pool - test, share=settings.valid_share, seed=seed + 1)
+
+
+def without_orphan_targets(frame: DataFrame, orphans: Collection[str]) -> DataFrame:
+    """The rows whose target is not an orphan: an orphan target has no link to hide, so the
+    held-out protocol can only ever label it 0."""
+    return frame.loc[~frame["target_url"].isin(list(orphans)).to_numpy()]
 
 
 def with_groups(frame: DataFrame) -> tuple[DataFrame, npt.NDArray[np.int64]]:
@@ -130,13 +155,39 @@ def _dataset(
     )
 
 
+def params_for(params: RankerParams, columns: Sequence[str]) -> RankerParams:
+    """``params`` with the monotone constraints on ``columns`` only, for a model trained on
+    fewer columns; a name that is no model column raises."""
+    unknown = [name for name in params.monotone_increasing if name not in MODEL_COLUMNS]
+    if unknown:
+        raise ValueError(f"monotone columns that are no model column: {unknown}")
+    kept = tuple(name for name in params.monotone_increasing if name in columns)
+    return params.model_copy(update={"monotone_increasing": kept})
+
+
+def _monotone(params: RankerParams, columns: Sequence[str]) -> dict[str, object]:
+    increasing = params.monotone_increasing
+    unknown = [name for name in increasing if name not in columns]
+    if unknown:
+        raise ValueError(f"monotone columns not among the columns trained: {unknown}")
+    if not increasing:
+        return {}
+    return {
+        "monotone_constraints": [int(column in increasing) for column in columns],
+        "monotone_constraints_method": "advanced",
+    }
+
+
 def train(
     train: DataFrame, valid: DataFrame, columns: Sequence[str], params: RankerParams
 ) -> Trained:
     """LambdaMART on the training groups, stopped early on NDCG at ``eval_at`` of the validation
-    groups; the same data, columns and params give the same model."""
+    groups; the same data, columns and params give the same model. A pair's score never falls
+    when one of the monotone-increasing columns rises and the others stay; with none, training
+    is unconstrained."""
     if not columns or len(set(columns)) != len(columns):
         raise ValueError("columns must be distinct and not empty")
+    monotone = _monotone(params, columns)
     train_set = _dataset(train, columns)
     valid_set = _dataset(valid, columns, reference=train_set)
     booster = lightgbm.train(
@@ -153,6 +204,7 @@ def train(
             "force_row_wise": True,
             "num_threads": TRAIN_THREADS,
             "verbosity": -1,
+            **monotone,
         },
         train_set,
         num_boost_round=params.max_rounds,
@@ -454,6 +506,99 @@ def promotion(
     )
 
 
+def _interval(
+    per_group: npt.NDArray[np.float64], sources: npt.ArrayLike, seed: int
+) -> NdcgInterval:
+    low, high = bootstrap_ci(per_group, clusters=sources, seed=seed)
+    return _mean(per_group), low, high
+
+
+def seed_result(
+    frame: DataFrame, *, seed: int, learned: str, plain: str, baseline: str, bootstrap_seed: int
+) -> SeedResult:
+    """One split seed's evaluation: ``frame`` holds that seed's test groups with a positive and
+    without orphan targets, scored by the columns named ``learned``, ``plain`` and
+    ``baseline``. Intervals resample source pages; the delta is learned - plain, paired."""
+    ordered, sizes = with_groups(frame)
+    if not len(sizes):
+        raise ValueError("no groups to evaluate")
+    labels = ordered[LABEL_COLUMN].to_numpy(dtype=np.float64)
+    if (np.add.reduceat((labels > 0).astype(np.int64), _offsets(sizes)) == 0).any():
+        raise ValueError("a group without a positive; keep positive_groups only")
+    sources = _sources(ordered, sizes)
+    per_group = {
+        column: _ndcg(
+            labels, ordered[column].to_numpy(dtype=np.float64, na_value=np.nan), sizes, NDCG_K
+        )
+        for column in (learned, plain, baseline)
+    }
+    difference = per_group[learned] - per_group[plain]
+    low, high = bootstrap_ci(difference, clusters=sources, seed=bootstrap_seed)
+    return SeedResult(
+        seed=seed,
+        test_pages=len(np.unique(sources)),
+        learned=_interval(per_group[learned], sources, bootstrap_seed),
+        plain=_interval(per_group[plain], sources, bootstrap_seed),
+        baseline=_interval(per_group[baseline], sources, bootstrap_seed),
+        delta=_mean(difference),
+        delta_ci_low=low,
+        delta_ci_high=high,
+    )
+
+
+# The feature columns product_measures reads, besides the pair's source and target url.
+PRODUCT_COLUMNS: Final = ("content_cosine", "same_hub")
+
+
+def product_measures(
+    frame: DataFrame,
+    score_column: str,
+    scorer: ScorerName,
+    orphans: Collection[str],
+    *,
+    k: int = PRODUCT_K,
+) -> ProductMeasures:
+    """``scorer`` on production candidate pairs, over the first ``k`` pairs of every source page
+    by descending score (ties by target, NaN last): their mean content cosine, the share in the
+    source's hub, the share of slots going to orphan targets against the orphans' share of the
+    candidate target pages, and the share of those orphans some source page shows."""
+    if k < 1:
+        raise ValueError("k must be at least 1")
+    missing = sorted(
+        {"source_url", "target_url", *PRODUCT_COLUMNS, score_column} - set(frame.columns)
+    )
+    if missing:
+        raise ValueError(f"missing columns: {missing}")
+    if frame.empty:
+        raise ValueError("no candidate pairs")
+    source_values, source_codes = np.unique(
+        frame["source_url"].to_numpy(dtype=object), return_inverse=True
+    )
+    target_values, target_codes = np.unique(
+        frame["target_url"].to_numpy(dtype=object), return_inverse=True
+    )
+    scores = frame[score_column].to_numpy(dtype=np.float64, na_value=np.nan)
+    order = np.lexsort((target_codes, -np.where(np.isnan(scores), -np.inf, scores), source_codes))
+    sizes = np.bincount(source_codes, minlength=len(source_values)).astype(np.int64)
+    top = order[_ranks(sizes) < k]
+    cosine = frame["content_cosine"].to_numpy(dtype=np.float64, na_value=np.nan)[top]
+    same_hub = frame["same_hub"].to_numpy(dtype=np.float64, na_value=np.nan)[top]
+    orphan_target = np.isin(target_values, np.asarray(list(orphans), dtype=object))
+    orphan_pages = int(orphan_target.sum())
+    reached = np.unique(target_codes[top])
+    return ProductMeasures(
+        scorer=scorer,
+        k=k,
+        top_relevance=None if np.isnan(cosine).all() else _mean(cosine[~np.isnan(cosine)]),
+        same_hub_share=float((np.nan_to_num(same_hub) > 0).mean()),
+        orphan_slot_share=float(orphan_target[target_codes[top]].mean()),
+        orphan_page_share=orphan_pages / len(target_values),
+        orphans_reached=float(orphan_target[reached].sum()) / orphan_pages
+        if orphan_pages
+        else None,
+    )
+
+
 def _percent(share: float | None) -> str:
     return "n/a" if share is None else f"{share:.1%}"
 
@@ -466,9 +611,74 @@ LIMITATIONS: Final = (
     "link's anchor phrase stays in the source copy, so nearly every positive gets an anchor and "
     "the placement columns (context_relevance, anchor_target_fit), while a new pair gets them only "
     "when its source copy names the target; the placement shares by label show the gap and the "
-    "learned_excl_placement row is the like-for-like comparison. With binary labels NDCG behaves "
-    "close to mean average precision."
+    "learned_excl_placement row is the like-for-like comparison. Orphan targets are left out of "
+    "the held-out rows, so held-out NDCG says nothing about how orphans are ranked; the product "
+    "measures do. With binary labels NDCG behaves close to mean average precision."
 )
+
+
+def _triple(found: NdcgInterval) -> str:
+    return f"{found[0]:.4f} [{found[1]:.4f}, {found[2]:.4f}]"
+
+
+def _skipped_seeds(report: RankerReport) -> str:
+    return "".join(f"; seed {seed} skipped: {why}" for seed, why in report.skipped_seeds.items())
+
+
+def _seed_lines(report: RankerReport) -> list[str]:
+    results = report.seed_results
+    if not results and report.skipped_seeds:
+        return [f"No split seed could be evaluated{_skipped_seeds(report)}."]
+    if not results:
+        return []
+
+    def mean(values: Iterable[float]) -> float:
+        return float(np.mean(list(values)))
+
+    split_seed = report.settings.split_seed
+    seeds = "seed" if len(results) == 1 else "seeds"
+    return [
+        f"Across {len(results)} evaluated split {seeds} "
+        f"({', '.join(str(r.seed) for r in results)})"
+        ": every seed but the split seed draws its own test and early-stopping source pages and "
+        f"retrains the learned and plain models; the split seed ({split_seed}) reuses the "
+        "fixed-split models. Mean NDCG@10: learned "
+        f"{mean(r.learned[0] for r in results):.4f}, plain "
+        f"{mean(r.plain[0] for r in results):.4f}, baseline "
+        f"{mean(r.baseline[0] for r in results):.4f}; learned - plain "
+        f"{mean(r.delta for r in results):+.4f} on average, significantly worse in "
+        f"{report.seeds_worse} of {len(results)} evaluated {seeds} and better in "
+        f"{report.seeds_better}{_skipped_seeds(report)}. The plain model has no monotone "
+        "constraints and trains on orphan-target rows; every model is tested without them.",
+        "Per seed: "
+        + "; ".join(
+            f"{r.seed} ({r.test_pages} test pages): learned {_triple(r.learned)}, plain "
+            f"{_triple(r.plain)}, baseline {_triple(r.baseline)}, delta {r.delta:+.4f} "
+            f"[{r.delta_ci_low:+.4f}, {r.delta_ci_high:+.4f}]"
+            for r in results
+        )
+        + ".",
+    ]
+
+
+def _product_lines(report: RankerReport) -> list[str]:
+    if report.product_skipped_reason is not None:
+        return [f"Product measures skipped: {report.product_skipped_reason}."]
+    if not report.product_measures:
+        return []
+    k = report.product_measures[0].k
+    return [
+        f"On the production candidates, the first {k} pairs of every source page: "
+        + "; ".join(
+            f"{m.scorer.value} content cosine "
+            + ("n/a" if m.top_relevance is None else f"{m.top_relevance:.3f}")
+            + f", same hub {m.same_hub_share:.1%}, orphan targets {m.orphan_slot_share:.1%} of "
+            f"the slots against {m.orphan_page_share:.1%} of the target pages, "
+            f"{_percent(m.orphans_reached)} of the orphans shown somewhere"
+            for m in report.product_measures
+        )
+        + "."
+    ]
 
 
 def summarise_ranker(report: RankerReport) -> str:
@@ -509,6 +719,13 @@ def summarise_ranker(report: RankerReport) -> str:
         f"{report.valid_groups} validation, {report.test_groups} test; {report.positives} "
         f"positive pairs. {len(report.columns)} model columns; excluded: {excluded or 'none'}."
     )
+    lines.append(
+        f"Orphan targets: {report.unlabelable_targets} candidate target pages have no inbound "
+        "body link on the full graph, so there is no link of theirs to hide and the protocol "
+        f"could only ever label them 0. Their {report.unlabelable_rows} candidate rows are "
+        "unlabelable: left out of every evaluation, and of training for every model but the "
+        "plain comparison; ranking still scores them."
+    )
     if report.skipped_reason is not None:
         lines.append(f"Skipped: {report.skipped_reason}. No model trained, registered or promoted.")
         return "\n".join([*lines, LIMITATIONS])
@@ -518,6 +735,13 @@ def summarise_ranker(report: RankerReport) -> str:
         f"{params.feature_fraction:g}, seed {params.seed}; best iteration "
         f"{report.best_iteration} of at most {params.max_rounds}, stopped on validation "
         f"NDCG@{params.eval_at}."
+    )
+    monotone = params.monotone_increasing
+    lines.append(
+        f"Monotone-increasing columns: {', '.join(monotone)}; raising one, the others fixed, "
+        "never lowers a pair's score (in each model that has the column)."
+        if monotone
+        else "No monotone constraints."
     )
     for entry in report.metrics:
         lines.append(
@@ -549,8 +773,12 @@ def summarise_ranker(report: RankerReport) -> str:
             f"{report.dominant_feature} holds more than {DOMINANT_SHARE:.0%} of the gain: the "
             "model leans on one column; check it is not a leak of the held-out protocol."
         )
+    lines.extend(_seed_lines(report))
+    lines.extend(_product_lines(report))
     if report.promotion is not None:
-        lines.append(f"Promotion: {report.promotion.reason}")
+        lines.append(
+            f"Promotion: on split seed {report.settings.split_seed}, {report.promotion.reason}"
+        )
     if report.model_version is not None:
         lines.append(f"Registered as version {report.model_version}.")
     return "\n".join([*lines, LIMITATIONS])

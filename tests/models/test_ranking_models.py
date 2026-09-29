@@ -9,6 +9,7 @@ from pydantic import BaseModel, ValidationError
 from linking_engine.models import (
     HeldOutSettings,
     ImportanceEntry,
+    ProductMeasures,
     PromotionDecision,
     RankerParams,
     RankerReport,
@@ -16,9 +17,12 @@ from linking_engine.models import (
     RankReport,
     RoundSummary,
     ScorerName,
+    SeedResult,
 )
 
 MODELS: tuple[type[BaseModel], ...] = (
+    SeedResult,
+    ProductMeasures,
     RankerParams,
     HeldOutSettings,
     RoundSummary,
@@ -50,6 +54,7 @@ def test_the_contract_defaults() -> None:
         "test_share": 0.2,
         "valid_share": 0.1,
         "split_seed": 7,
+        "evaluation_seeds": (7, 11, 23, 42, 99),
     }
     assert RankerParams().model_dump() == {
         "learning_rate": 0.05,
@@ -60,6 +65,7 @@ def test_the_contract_defaults() -> None:
         "early_stopping_rounds": 50,
         "eval_at": 10,
         "seed": 42,
+        "monotone_increasing": ("content_cosine", "anchor_target_fit", "context_relevance"),
     }
 
 
@@ -207,3 +213,108 @@ def test_a_rank_report_names_its_model_or_why_the_baseline_ranked(
     assert baseline.fallback_reason == "no promoted model"
     with pytest.raises(ValidationError, match=match):
         make.rank_report(**fields)
+
+
+# ── #94: monotone columns, evaluation seeds, seed results, product measures ─
+
+
+def test_evaluation_seeds_must_include_the_split_seed() -> None:
+    assert HeldOutSettings(split_seed=11, evaluation_seeds=(11,)).evaluation_seeds == (11,)
+    with pytest.raises(ValidationError, match="must include the split seed"):
+        HeldOutSettings(evaluation_seeds=(11, 23))
+    with pytest.raises(ValidationError, match="must include the split seed"):
+        HeldOutSettings(split_seed=5)
+    with pytest.raises(ValidationError, match="distinct"):
+        HeldOutSettings(evaluation_seeds=(7, 7, 11))
+
+
+@pytest.mark.parametrize(
+    "names", [("content_cosine", "content_cosine"), ("content_cosine", " ")], ids=["twice", "blank"]
+)
+def test_monotone_columns_are_distinct_names(names: tuple[str, ...]) -> None:
+    assert RankerParams(monotone_increasing=()).monotone_increasing == ()
+    with pytest.raises(ValidationError, match="distinct names"):
+        RankerParams(monotone_increasing=names)
+
+
+@pytest.mark.parametrize(
+    ("fields", "match"),
+    [
+        ({"learned": (0.5, 0.7, 0.6)}, "in \\[0, 1\\], low <= high"),
+        ({"plain": (0.5, 0.4, 1.2)}, "in \\[0, 1\\], low <= high"),
+        ({"delta_ci_low": 0.06}, "delta_ci_low must not exceed"),
+        ({"test_pages": 0}, "greater than or equal to 1"),
+    ],
+)
+def test_a_seed_result_is_consistent(fields: dict[str, object], match: str) -> None:
+    assert make.seed_result().seed == 7
+    with pytest.raises(ValidationError, match=match):
+        make.seed_result(**fields)
+
+
+def test_a_seed_is_significant_only_when_its_interval_leaves_zero() -> None:
+    assert (make.seed_result().significantly_better, make.seed_result().significantly_worse) == (
+        False,
+        False,
+    )
+    better = make.seed_result(delta=0.05, delta_ci_low=0.01, delta_ci_high=0.09)
+    worse = make.seed_result(delta=-0.05, delta_ci_low=-0.09, delta_ci_high=-0.01)
+    edge = make.seed_result(delta=0.02, delta_ci_low=0.0, delta_ci_high=0.04)
+    assert (better.significantly_better, better.significantly_worse) == (True, False)
+    assert (worse.significantly_better, worse.significantly_worse) == (False, True)
+    assert (edge.significantly_better, edge.significantly_worse) == (False, False)
+    report = make.report(
+        settings=HeldOutSettings(rounds=2, evaluation_seeds=(7, 11, 23, 42)),
+        seed_results=(
+            better,
+            make.seed_result(11),
+            make.seed_result(23, **{"delta": -0.05, "delta_ci_low": -0.09, "delta_ci_high": -0.01}),
+        ),
+        skipped_seeds={42: "24 test groups with a hidden link, fewer than 30"},
+    )
+    assert (report.seeds_better, report.seeds_worse) == (1, 1)
+
+
+def test_product_measures_reach_orphans_exactly_when_there_are_some() -> None:
+    none = make.product(orphan_slot_share=0.0, orphan_page_share=0.0, orphans_reached=None)
+    assert none.orphans_reached is None
+    with pytest.raises(ValidationError, match="orphans_reached is None exactly"):
+        make.product(orphan_page_share=0.0, orphan_slot_share=0.0)
+    with pytest.raises(ValidationError, match="orphans_reached is None exactly"):
+        make.product(orphans_reached=None)
+    assert make.product(top_relevance=None).top_relevance is None
+
+
+@pytest.mark.parametrize(
+    ("fields", "match"),
+    [
+        ({"seed_results": (make.seed_result(7), make.seed_result(7))}, "distinct evaluation"),
+        ({"seed_results": (make.seed_result(8),)}, "distinct evaluation"),
+        ({"product_measures": (make.product(), make.product())}, "measured twice"),
+        ({"product_measures": ()}, "product measures or the reason"),
+        ({"seed_results": (make.seed_result(7),)}, "a result or a skip reason for every seed"),
+        ({"skipped_seeds": {11: "too few"}}, "skipped seeds are evaluation seeds without a"),
+        ({"skipped_seeds": {23: "too few"}}, "skipped seeds are evaluation seeds without a"),
+        (
+            {"seed_results": (make.seed_result(7),), "skipped_seeds": {11: " "}},
+            "a skipped seed names its reason",
+        ),
+        ({"product_skipped_reason": "no anchor choices"}, "product measures or the reason"),
+        ({"unlabelable_rows": -1}, "greater than or equal to 0"),
+    ],
+)
+def test_a_ranker_report_holds_its_seeds_and_product_measures_once(
+    fields: dict[str, object], match: str
+) -> None:
+    skipped_products = make.report(product_measures=(), product_skipped_reason="no anchor choices")
+    assert skipped_products.product_skipped_reason == "no anchor choices"
+    with pytest.raises(ValidationError, match=match):
+        make.report(**fields)
+    with pytest.raises(ValidationError, match="no seed results, skipped seeds or product"):
+        make.skipped(seed_results=(make.seed_result(),))
+    with pytest.raises(ValidationError, match="no seed results, skipped seeds or product"):
+        make.skipped(skipped_seeds={7: "too few"})
+    one_skipped = make.report(
+        seed_results=(make.seed_result(7),), skipped_seeds={11: "no validation group"}
+    )
+    assert one_skipped.skipped_seeds == {11: "no validation group"}

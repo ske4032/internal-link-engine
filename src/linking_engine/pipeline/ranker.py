@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import Counter
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final
 
@@ -18,6 +20,7 @@ import structlog
 
 from linking_engine.discovery.features import FEATURE_COLUMNS, KEY_COLUMNS, code_digest
 from linking_engine.discovery.scoring import default_weights, score_frame
+from linking_engine.errors import DatabaseError
 from linking_engine.ml.ranker_tracking import (
     RegistryUnavailableError,
     holder,
@@ -39,17 +42,22 @@ from linking_engine.ml.ranking import (
     MODEL_COLUMNS,
     NDCG_K,
     PREDICT_CHUNK,
+    PRODUCT_COLUMNS,
     dominant_feature,
     group_ndcg,
     group_sources,
     importance,
+    params_for,
     positive_groups,
     predict,
+    product_measures,
     promotion,
     ranking_metrics,
-    split_sources,
+    seed_result,
+    seed_split,
     summarise_ranker,
     train,
+    without_orphan_targets,
 )
 from linking_engine.models import (
     HeldOutSettings,
@@ -59,12 +67,12 @@ from linking_engine.models import (
     ScorerName,
 )
 from linking_engine.pipeline.anchors import cache_folder, write_atomically
-from linking_engine.pipeline.features import assemble_features
+from linking_engine.pipeline.features import ANCHOR_CHOICES_FILE, assemble_features
 from linking_engine.pipeline.quality import git_sha
 from linking_engine.pipeline.ranking_data import BASELINE_COLUMN, held_out_rounds, load_rounds
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Mapping, Sequence
+    from collections.abc import Iterable, Iterator, Mapping, Sequence, Set
     from pathlib import Path
 
     import lightgbm
@@ -75,7 +83,13 @@ if TYPE_CHECKING:
     from linking_engine.ingest.mongo_repo import MongoRepo
     from linking_engine.ml.ranker_tracking import Holder
     from linking_engine.ml.ranking import Trained
-    from linking_engine.models import PromotionDecision, RankingMetrics, ScorerWeights
+    from linking_engine.models import (
+        ProductMeasures,
+        PromotionDecision,
+        RankingMetrics,
+        ScorerWeights,
+        SeedResult,
+    )
     from linking_engine.pipeline.ranking_data import HeldOutRounds
 
 log = structlog.get_logger(__name__)
@@ -93,6 +107,24 @@ RANKED_SCHEMA: Final = pa.schema(
     ]
 )
 NO_MODEL: Final = "no promoted model"
+NO_ANCHOR_CHOICES: Final = (
+    "no anchor choices for the tenant, so its production pairs lack their placement features"
+)
+UNREADABLE_ANCHOR_CHOICES: Final = (
+    "the tenant's anchor choices are unreadable, so its production pairs lack their placement "
+    "features"
+)
+NO_PRODUCTION_PAIRS: Final = "the tenant has no production candidate pairs"
+
+
+@dataclass(frozen=True, slots=True)
+class _Fit:
+    """A training run's report fields but the product measures and the timing, and its learned
+    and plain models; none when training was skipped."""
+
+    fields: dict[str, object]
+    trained: Trained | None = None
+    plain: Trained | None = None
 
 
 async def train_ranker(
@@ -119,9 +151,22 @@ async def train_ranker(
     )
     rival = await asyncio.to_thread(holder, tenant_id)
     sha = await asyncio.to_thread(git_sha)
-    report, trained = await asyncio.to_thread(
-        _train, tenant_id, rounds, settings, params, rival, promotion_allowed(), sha, started
+    fit = await asyncio.to_thread(
+        _train, tenant_id, rounds, settings, params, rival, allowed=promotion_allowed(), sha=sha
     )
+    fields, trained = fit.fields, fit.trained
+    if trained is not None and fit.plain is not None:
+        measured, reason = await _product_measures(
+            graph,
+            mongo,
+            tenant_id,
+            cache_dir=cache_dir,
+            orphans=rounds.orphan_targets,
+            trained=trained,
+            plain=fit.plain,
+        )
+        fields = {**fields, "product_measures": measured, "product_skipped_reason": reason}
+    report = _report(fields, started)
     run_id, version = await asyncio.to_thread(log_ranker, report, trained, summarise_ranker(report))
     report = RankerReport.model_validate({**report.model_dump(), "model_version": version})
     if report.promotion is not None and report.promotion.promoted:
@@ -144,12 +189,52 @@ async def train_ranker(
         valid_groups=report.valid_groups,
         test_groups=report.test_groups,
         best_iteration=report.best_iteration,
+        unlabelable_targets=report.unlabelable_targets,
+        unlabelable_rows=report.unlabelable_rows,
+        seeds=len(report.seed_results),
+        seeds_worse=report.seeds_worse,
+        seeds_better=report.seeds_better,
+        product_skipped=report.product_skipped_reason is not None,
         skipped=report.skipped_reason is not None,
         would_promote=report.promotion is not None and report.promotion.would_promote,
         promoted=report.promotion is not None and report.promotion.promoted,
         seconds=report.seconds,
     )
     return report
+
+
+async def _product_measures(
+    graph: GraphRepo,
+    mongo: MongoRepo,
+    tenant_id: str,
+    *,
+    cache_dir: Path,
+    orphans: Set[str],
+    trained: Trained,
+    plain: Trained,
+) -> tuple[tuple[ProductMeasures, ...], str | None]:
+    """The learned, plain and baseline scorers on the tenant's production candidate pairs, from
+    its cached feature matrix with the anchor placements; none, with the reason, without usable
+    anchor choices or pairs. A failure to read them skips the measures, never the run."""
+    if not (cache_folder(cache_dir, tenant_id) / ANCHOR_CHOICES_FILE).is_file():
+        return (), NO_ANCHOR_CHOICES
+    try:
+        weights = await mongo.get_scorer_weights(tenant_id) or default_weights()
+        features, matrix = await assemble_features(graph, mongo, tenant_id, cache_dir=cache_dir)
+        if features.anchor_choices_digest is None:
+            return (), UNREADABLE_ANCHOR_CHOICES
+        if not features.pairs:
+            return (), NO_PRODUCTION_PAIRS
+        measured = await asyncio.to_thread(_measure, matrix, weights, orphans, trained, plain)
+    except (DatabaseError, OSError, pa.ArrowException) as error:
+        log.warning(
+            "ranker.product_skipped",
+            stage=STAGE,
+            tenant_id=tenant_id,
+            error=type(error).__name__,
+        )
+        return (), f"production pairs unreadable ({type(error).__name__})"
+    return measured, None
 
 
 def _groups(frame: pandas.DataFrame) -> int:
@@ -170,41 +255,54 @@ def _scored(
     return _scores(predict(model, columns, chunks))
 
 
+def _plain(params: RankerParams) -> RankerParams:
+    return params.model_copy(update={"monotone_increasing": ()})
+
+
+def _split(
+    kept: pandas.DataFrame, sources: Sequence[str], settings: HeldOutSettings, seed: int
+) -> tuple[dict[str, npt.NDArray[np.bool_]], frozenset[str]]:
+    """The train, valid and test rows of ``seed``'s split of the source pages, and its test
+    sources."""
+    test, valid = seed_split(sources, settings, seed)
+    in_test = kept["source_url"].isin(test).to_numpy()
+    in_valid = kept["source_url"].isin(valid).to_numpy()
+    return {"train": ~in_test & ~in_valid, "valid": in_valid, "test": in_test}, test
+
+
 def _train(
     tenant_id: str,
     rounds: HeldOutRounds,
     settings: HeldOutSettings,
     params: RankerParams,
     rival: Holder | None,
+    *,
     allowed: bool,
     sha: str,
-    started: float,
-) -> tuple[RankerReport, Trained | None]:
+) -> _Fit:
+    orphans = rounds.orphan_targets
     sources = load_rounds(rounds.paths, ["source_url"])["source_url"].unique().tolist()
-    test = split_sources(sources, share=settings.test_share, seed=settings.split_seed)
-    valid = split_sources(
-        [source for source in sources if source not in test],
-        share=settings.valid_share,
-        seed=settings.split_seed + 1,
-    )
-    # A round at a time, so only one round's rows are held in full.
-    all_test_groups = 0
+    # A round at a time, so only one round's rows are held in full. Groups are counted per
+    # source page over the labelable rows, so any split's test groups are known before those
+    # without a positive are dropped.
+    groups_of: Counter[str] = Counter()
+    unlabelable_rows = 0
+    unlabelable: set[str] = set()
     found: list[pandas.DataFrame] = []
     for path in rounds.paths:
         frame = load_rounds([path])
-        all_test_groups += _groups(frame[frame["source_url"].isin(test).to_numpy()])
+        labelled = without_orphan_targets(frame, orphans)
+        unlabelable_rows += len(frame) - len(labelled)
+        unlabelable.update(set(frame["target_url"].unique()) - set(labelled["target_url"].unique()))
+        groups_of.update(labelled["source_url"].unique().tolist())
         found.append(positive_groups(frame))
-        del frame
+        del frame, labelled
     kept = pandas.concat(found, ignore_index=True)
     del found
-    in_test = kept["source_url"].isin(test).to_numpy()
-    in_valid = kept["source_url"].isin(valid).to_numpy()
-    parts = {
-        "train": kept[~in_test & ~in_valid],
-        "valid": kept[in_valid],
-        "test": kept[in_test],
-    }
-    del kept
+    # Orphan targets can only ever be labelled 0: no model learns from them or is judged on them.
+    labelable = kept.index.isin(without_orphan_targets(kept, orphans).index)
+    masks, test = _split(kept, sources, settings, settings.split_seed)
+    parts = {name: kept[mask & labelable] for name, mask in masks.items()}
     counts = {name: _groups(part) for name, part in parts.items()}
     fields: dict[str, object] = {
         "tenant_id": tenant_id,
@@ -221,12 +319,16 @@ def _train(
         "valid_groups": counts["valid"],
         "test_groups": counts["test"],
         "positives": sum(summary.positives for summary in rounds.summaries),
+        "unlabelable_targets": len(unlabelable),
+        "unlabelable_rows": unlabelable_rows,
     }
     reason = _too_little(counts)
     if reason is not None:
-        return _report(fields, started, skipped_reason=reason), None
+        return _Fit({**fields, "skipped_reason": reason})
 
     trained = train(parts["train"], parts["valid"], MODEL_COLUMNS, params)
+    # The plain model: no constraints, and the orphan rows kept, as before #94.
+    plain = train(kept[masks["train"]], kept[masks["valid"]], MODEL_COLUMNS, _plain(params))
     tested = parts["test"].copy()
     tested[ScorerName.LEARNED.value] = _scored(trained, MODEL_COLUMNS, tested)
     # Like-for-like models, evaluated only: without the link-derived, then the placement columns.
@@ -234,7 +336,7 @@ def _train(
         (ScorerName.LEARNED_EXCL_LINK_COUNTS, LIKE_FOR_LIKE_COLUMNS),
         (ScorerName.LEARNED_EXCL_PLACEMENT, EXCL_PLACEMENT_COLUMNS),
     ):
-        model = train(parts["train"], parts["valid"], columns, params)
+        model = train(parts["train"], parts["valid"], columns, params_for(params, columns))
         tested[scorer.value] = _scored(model, columns, tested)
     tested[ScorerName.BASELINE.value] = tested[BASELINE_COLUMN]
     scorers = [
@@ -258,21 +360,107 @@ def _train(
         else:
             tested[ScorerName.HOLDER.value] = _scored(rival.booster, rival.columns, tested)
             scorers.append(ScorerName.HOLDER)
+    all_test_groups = sum(groups_of[source] for source in test)
     metrics: list[RankingMetrics] = [
         ranking_metrics(tested, scorer.value, scorer, all_groups=all_test_groups, seed=params.seed)
         for scorer in scorers
     ]
-    entries = importance(trained)
-    report = _report(
-        fields,
-        started,
-        best_iteration=trained.best_iteration,
-        metrics=tuple(metrics),
-        importance=entries,
-        dominant_feature=dominant_feature(entries),
-        promotion=_promotion(tested, rival, allowed=allowed, seed=params.seed),
+    decision = _promotion(tested, rival, allowed=allowed, seed=params.seed)
+    del tested, parts
+    seeds, skipped_seeds = _seed_results(
+        tenant_id, kept, labelable, sources, settings, params, fixed=(trained, plain)
     )
-    return report, trained
+    del kept
+    entries = importance(trained)
+    return _Fit(
+        {
+            **fields,
+            "best_iteration": trained.best_iteration,
+            "metrics": tuple(metrics),
+            "importance": entries,
+            "dominant_feature": dominant_feature(entries),
+            "promotion": decision,
+            "seed_results": seeds,
+            "skipped_seeds": skipped_seeds,
+        },
+        trained,
+        plain,
+    )
+
+
+def _seed_results(
+    tenant_id: str,
+    kept: pandas.DataFrame,
+    labelable: npt.NDArray[np.bool_],
+    sources: Sequence[str],
+    settings: HeldOutSettings,
+    params: RankerParams,
+    *,
+    fixed: tuple[Trained, Trained],
+) -> tuple[tuple[SeedResult, ...], dict[int, str]]:
+    """Every evaluation seed's split: the learned model (``params``, orphan targets unlabelable)
+    against the plain one (no constraints, orphan rows kept), and the baseline, on that seed's
+    test groups without orphan targets. The split seed reuses the ``fixed`` learned and plain
+    models; a seed whose split has too little signal is left out, with the reason."""
+    results: list[SeedResult] = []
+    skipped: dict[int, str] = {}
+    for seed in settings.evaluation_seeds:
+        masks, _ = _split(kept, sources, settings, seed)
+        counts = {name: _groups(kept[mask & labelable]) for name, mask in masks.items()}
+        reason = _too_little(counts)
+        if reason is not None:
+            log.warning(
+                "ranker.seed_skipped", stage=STAGE, tenant_id=tenant_id, seed=seed, reason=reason
+            )
+            skipped[seed] = reason
+            continue
+        if seed == settings.split_seed:
+            learned, plain = fixed
+        else:
+            learned = train(
+                kept[masks["train"] & labelable],
+                kept[masks["valid"] & labelable],
+                MODEL_COLUMNS,
+                params,
+            )
+            plain = train(kept[masks["train"]], kept[masks["valid"]], MODEL_COLUMNS, _plain(params))
+        tested = kept[masks["test"] & labelable].copy()
+        tested[ScorerName.LEARNED.value] = _scored(learned, MODEL_COLUMNS, tested)
+        tested[ScorerName.PLAIN.value] = _scored(plain, MODEL_COLUMNS, tested)
+        results.append(
+            seed_result(
+                tested,
+                seed=seed,
+                learned=ScorerName.LEARNED.value,
+                plain=ScorerName.PLAIN.value,
+                baseline=BASELINE_COLUMN,
+                bootstrap_seed=params.seed,
+            )
+        )
+    return tuple(results), skipped
+
+
+def _measure(
+    matrix: Path,
+    weights: ScorerWeights,
+    orphans: Set[str],
+    trained: Trained,
+    plain: Trained,
+) -> tuple[ProductMeasures, ...]:
+    # The models read their columns a chunk at a time, so only these are held in full.
+    wanted = dict.fromkeys(
+        [*KEY_COLUMNS, *PRODUCT_COLUMNS, *(feature.column for feature in weights.features)]
+    )
+    frame = pq.read_table(matrix, columns=list(wanted)).to_pandas()
+    frame[ScorerName.BASELINE.value] = score_frame(frame, weights)["score"].to_numpy(np.float64)
+    for scorer, model in ((ScorerName.LEARNED, trained), (ScorerName.PLAIN, plain)):
+        frame[scorer.value] = _scores(
+            predict(model, model.columns, _batches(matrix, model.columns))
+        )
+    return tuple(
+        product_measures(frame, scorer.value, scorer, orphans)
+        for scorer in (ScorerName.LEARNED, ScorerName.PLAIN, ScorerName.BASELINE)
+    )
 
 
 def _refused_rival(

@@ -7,8 +7,10 @@ the exact rung finds it there. Page i's copy also names page i+8's keyword witho
 each trail page names the tent page of its index: no body link crosses trail and tent, the
 planted bridge gap. Two strategic pages, one trail and one kayak, have no inbound body link
 (orphans); pages 3 and 9 of their topic name them. Four noise pages are reached from the menu
-template only, with vectors in no topic. Voyage answers with a vector drawn from the text's
-hash, so the semantic rung matches nothing. That proves the plumbing, not the method.
+template only, with vectors in no topic. The two strategic pages and the four noise pages are
+the orphan targets: no inbound body link on the full graph, so no round can label them. Voyage
+answers with a vector drawn from the text's hash, so the semantic rung matches nothing. That
+proves the plumbing, not the method.
 """
 
 from __future__ import annotations
@@ -19,15 +21,17 @@ import numpy as np
 import pandas
 from selection_seed import respond
 from test_keyword_stage import page_record, url
-from voyage_fakes import MODEL, FakeVoyage
+from voyage_fakes import MODEL, FakeVoyage, client
 
 from linking_engine.discovery.features import FEATURE_COLUMNS
 from linking_engine.graph.algorithms import NOISE
 from linking_engine.models import LanguageRules, Link, Page
+from linking_engine.pipeline.anchor_selection import select_anchors
 from linking_engine.pipeline.keywords import resolve_tenant_keywords
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from pathlib import Path
 
     import numpy.typing as npt
 
@@ -158,6 +162,11 @@ def links() -> list[Link]:
 
 def body_links() -> frozenset[tuple[str, str]]:
     return frozenset((link.source_url, link.target_url) for link in links())
+
+
+def orphan_targets() -> frozenset[str]:
+    """The pages no body link reaches on the full graph."""
+    return frozenset(URLS) - {target for _, target in body_links()}
 
 
 def inbound() -> dict[str, int]:
@@ -334,3 +343,11 @@ async def seed_ranking(graph: GraphRepo, mongo: MongoRepo, tenant: str) -> None:
         ]
     )
     await resolve_tenant_keywords(graph, mongo, tenant)
+
+
+async def choose_anchors(graph: GraphRepo, mongo: MongoRepo, tenant: str, cache_dir: Path) -> Path:
+    """The tenant's production anchor choices file, as the anchor-selection stage writes it."""
+    _, path = await select_anchors(
+        graph, mongo, tenant, cache_dir=cache_dir, voyage=client(voyage())
+    )
+    return path
