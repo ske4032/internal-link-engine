@@ -150,7 +150,7 @@ class Link(BaseModel):
     surrounding_embedding: tuple[float, ...] | None = None
     target_status_code: int | None = Field(default=None, ge=100, le=599)
     issue_flags: frozenset[IssueFlag] = frozenset()
-    # FIX whenever the target answers 3xx, 4xx or 5xx.
+    # Written only by the link audit (FIX, REANCHOR or REMOVE); None until audited or when healthy.
     verdict: ActionType | None = None
 
 

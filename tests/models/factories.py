@@ -144,7 +144,9 @@ LINK_KWARGS: dict[str, object] = {
 
 AUDIT_KWARGS: dict[str, object] = {
     "source_url": SOURCE_URL,
+    "position": 3,
     "target_url": TARGET_URL,
+    "run_id": "0f3a9c",
     "anchor_quality_score": 72.5,
     "keyword_alignment": 0.81,
     "context_relevance": 0.64,
@@ -152,6 +154,7 @@ AUDIT_KWARGS: dict[str, object] = {
     "equity_efficiency": 0.42,
     "issue_flags": frozenset({IssueFlag.GENERIC, IssueFlag.MISALIGNED}),
     "verdict": ActionType.REANCHOR,
+    "reasons": ("the anchor is generic", "the anchor shares no word with the target's keywords"),
     "audited_at": TIMESTAMP,
 }
 

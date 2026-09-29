@@ -38,6 +38,7 @@ from linking_engine.ml.tracking import (
     log_duplicates,
     log_features,
     log_keywords,
+    log_link_audit,
     log_link_relevance,
     log_quality,
     log_scores,
@@ -57,6 +58,7 @@ from linking_engine.models import (
     HeldOutSettings,
     HubReport,
     KeywordReport,
+    LinkAuditReport,
     LinkEmbedReport,
     LinkRelevanceReport,
     PrepareReport,
@@ -83,6 +85,7 @@ from linking_engine.pipeline.embed import FLUSH_SIZE, embed_tenant
 from linking_engine.pipeline.embed_links import embed_links
 from linking_engine.pipeline.features import CACHE_DIR, assemble_features
 from linking_engine.pipeline.keywords import resolve_tenant_keywords, summarise_keywords
+from linking_engine.pipeline.link_audit import audit_links, summarise_link_audit
 from linking_engine.pipeline.link_relevance import score_links, summarise_link_relevance
 from linking_engine.pipeline.quality import evaluate_quality, summarise_quality
 from linking_engine.pipeline.ranker import rank_pairs, train_ranker
@@ -983,3 +986,58 @@ async def rank_pairs_flow(tenant_id: str, cache_dir: Path = CACHE_DIR) -> tuple[
         report.seconds,
     )
     return report, path
+
+
+# A retry runs the audit again under a new run id: the edges take the new run and link_audit
+# keeps both as history.
+@task(
+    name="link-audit",
+    retries=1,
+    retry_delay_seconds=30,
+    retry_condition_fn=is_transient,
+    cache_policy=NONE,
+)
+async def link_audit_task(tenant_id: str, cache_dir: Path) -> LinkAuditReport:
+    voyage = keyword_voyage(tenant_id)
+    async with await neo4j() as graph, await mongo() as repo:
+        await graph.check_server()
+        report, _ = await audit_links(graph, repo, tenant_id, cache_dir=cache_dir, voyage=voyage)
+        return report
+
+
+@task(name="mlflow-log-link-audit", cache_policy=NONE)
+def log_link_audit_task(report: LinkAuditReport) -> str:
+    return log_link_audit(report, summarise_link_audit(report))
+
+
+@flow(name="link-audit")
+async def link_audit_flow(
+    tenant_id: str, cache_dir: Path = CACHE_DIR
+) -> tuple[LinkAuditReport, str]:
+    """Scores, issue flags and a FIX / REANCHOR / REMOVE verdict with reasons for every existing
+    body link of the tenant after graph analytics (A1), and after score-links with #16's scores
+    (A2). Each run is kept in link_audit as history and written onto the LINKS_TO edges; counts,
+    cut-offs and score distributions go to MLflow without urls."""
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
+        logger.info("auditing the existing links of tenant %s", tenant_id)
+        report = await link_audit_task(tenant_id, cache_dir)
+        mlflow_run = log_link_audit_task(report)
+    logger.info(
+        "audit run %s: %d links, %d unverified, %d healthy; flags %s; verdicts %s; %s; "
+        "%d index-like source pages; %d pairs searched for a better phrase, %d REANCHOR with "
+        "one; %.1fs; mlflow run %s",
+        report.run_id,
+        report.links,
+        report.unverified,
+        report.healthy,
+        {flag.value: n for flag, n in report.by_flag.items()},
+        {verdict.value: n for verdict, n in report.by_verdict.items()},
+        "A2" if report.embeddings else f"A1 only: {report.embeddings_skipped_reason}",
+        report.index_like_pages,
+        report.ladder_pairs,
+        report.proposals,
+        report.seconds,
+        mlflow_run,
+    )
+    return report, mlflow_run

@@ -30,6 +30,7 @@ from linking_engine.errors import (
     SchemaError,
 )
 from linking_engine.models import (
+    AuditEdge,
     CommunityContext,
     DuplicateInput,
     EmbeddingModelCount,
@@ -62,6 +63,7 @@ if TYPE_CHECKING:
         EdgeRef,
         HubCentroid,
         KeywordTarget,
+        LinkAuditResult,
         PageCentrality,
         PageCommunities,
         PageHub,
@@ -78,6 +80,7 @@ LINK_BATCH: Final = 1000
 CENTRALITY_BATCH: Final = 5000
 # Source pages per link scoring transaction; a hub page alone can carry hundreds of links.
 LINK_SCORE_BATCH: Final = 200
+AUDIT_BATCH: Final = 5000
 # anchor_tenant_text rejects index entries over ~8 KB (an 8149-byte text failed at 8150 on 5.26);
 # half of that leaves room for tenantId. A longer key would fail its flush on every run.
 ANCHOR_KEY_MAX_BYTES: Final = 4096
@@ -147,52 +150,33 @@ LINK_PROPERTIES: Final = {
     "verdict": "verdict",
 }
 
-# Status flags and the FIX verdict on edge r, derived from its target t. Other audit flags are kept.
-_EDGE_STATUS: Final = """
-    r.targetStatusCode = t.statusCode,
-    r.issueFlags = [f IN coalesce(r.issueFlags, []) WHERE NOT f IN ['BROKEN', 'REDIRECTED']]
-        + CASE WHEN t.statusIssue IS NULL THEN [] ELSE [t.statusIssue] END,
-    r.verdict = CASE
-        WHEN t.statusIssue IS NOT NULL THEN 'FIX'
-        WHEN r.verdict = 'FIX' THEN null
-        ELSE r.verdict
-    END"""
-
-# Inbound edges are re-flagged in the same statement, so a status change never leaves stale verdicts.
-_UPSERT_PAGES: Final = (
-    """
+# Inbound edges take the new status in the same statement. Edges carry the target's status code
+# only: issue flags and verdicts are written by the link audit alone.
+_UPSERT_PAGES: Final = """
 UNWIND $rows AS row
 MERGE (p:Page {tenantId: $tenant, url: row.url})
 SET p += row.props, p.isPlaceholder = false, p.statusIssue = row.statusIssue
 WITH p
 CALL (p) {
   MATCH (:Page)-[r:LINKS_TO]->(p)
-  WITH r, p AS t
-  SET"""
-    + _EDGE_STATUS
-    + """
+  SET r.targetStatusCode = p.statusCode
 }
 RETURN count(p) AS n
 """
-)
 _UPSERT_PLACEHOLDERS: Final = """
 UNWIND $urls AS url
 MERGE (p:Page {tenantId: $tenant, url: url})
 ON CREATE SET p.isPlaceholder = true
 RETURN count(p) AS n
 """
-_UPSERT_LINKS: Final = (
-    """
+_UPSERT_LINKS: Final = """
 UNWIND $rows AS row
 MATCH (s:Page {tenantId: $tenant, url: row.source})
 MATCH (t:Page {tenantId: $tenant, url: row.target})
 MERGE (s)-[r:LINKS_TO {position: row.position}]->(t)
-SET r += row.props,"""
-    + _EDGE_STATUS
-    + """
+SET r += row.props, r.targetStatusCode = t.statusCode
 RETURN count(r) AS n
 """
-)
 _PRUNE_LINKS: Final = """
 UNWIND $sources AS src
 MATCH (s:Page {tenantId: $tenant, url: src.url})-[r:LINKS_TO]->(t:Page)
@@ -230,9 +214,9 @@ WITH count(p) AS total,
      sum(CASE WHEN coalesce(p.isPlaceholder, false) THEN 1 ELSE 0 END) AS ph,
      sum(CASE WHEN p.statusIssue = 'REDIRECTED' THEN 1 ELSE 0 END) AS redirected,
      sum(CASE WHEN p.statusIssue = 'BROKEN' THEN 1 ELSE 0 END) AS broken
-OPTIONAL MATCH (:Page {tenantId: $tenant})-[r:LINKS_TO]->()
+OPTIONAL MATCH (:Page {tenantId: $tenant})-[r:LINKS_TO]->(t:Page {tenantId: $tenant})
 RETURN total - ph AS pages, ph AS placeholders, redirected, broken, count(r) AS links,
-       sum(CASE WHEN r.verdict = 'FIX' THEN 1 ELSE 0 END) AS fix
+       count(CASE WHEN t.statusIssue IS NOT NULL THEN r END) AS fix
 """
 # A target is a crawled 2xx page whose vector is missing or was computed from another body.
 _EMBEDDING_SELECTION: Final = """
@@ -547,6 +531,63 @@ RETURN s.url AS source_url, r.position AS position, t.url AS target_url,
        r.contextRelevance AS context_relevance, r.anchorTargetFit AS anchor_target_fit,
        coalesce(r.anchorGeneric, false) AS anchor_generic
 ORDER BY source_url, position
+"""
+_AUDIT_CANONICALS: Final = """
+MATCH (p:Page {tenantId: $tenant})
+WHERE p.isCanonical = true AND p.duplicateGroup IS NOT NULL AND NOT coalesce(p.isPlaceholder, false)
+RETURN p.duplicateGroup AS duplicate_group, p.url AS url
+"""
+# Links into placeholders are kept: the audit counts them as unverified.
+_AUDIT_EDGES: Final = """
+MATCH (s:Page {tenantId: $tenant})-[r:LINKS_TO]->(t:Page {tenantId: $tenant})
+WHERE NOT coalesce(s.isPlaceholder, false)
+RETURN s.url AS source_url,
+       r.position AS position,
+       t.url AS target_url,
+       coalesce(r.anchorText, '') AS anchor_text,
+       coalesce(r.isFollow, true) AS is_follow,
+       r.contextRelevance AS context_relevance,
+       r.anchorTargetFit AS anchor_target_fit,
+       s.language AS source_language,
+       s.pageRankPercentile AS source_page_rank_percentile,
+       s.wordCount AS source_word_count,
+       coalesce(t.isPlaceholder, false) AS target_placeholder,
+       t.statusCode AS target_status_code,
+       t.isIndexable AS target_indexable,
+       t.hubId AS target_hub_id,
+       t.pageRankPercentile AS target_page_rank_percentile,
+       t.duplicateGroup AS target_group,
+       t.isCanonical AS target_is_canonical
+ORDER BY source_url, position
+"""
+# Null values remove the property, so a rerun leaves nothing stale. #16's relevance scores on the
+# edge are left as they are. The target is matched too: a re-pointed edge rolls the batch back.
+_WRITE_LINK_AUDIT: Final = """
+UNWIND $rows AS row
+MATCH (:Page {tenantId: $tenant, url: row.source})-[r:LINKS_TO {position: row.position}]->
+      (:Page {tenantId: $tenant, url: row.target})
+SET r.anchorQualityScore = row.anchorQualityScore,
+    r.keywordAlignment = row.keywordAlignment,
+    r.equityEfficiency = row.equityEfficiency,
+    r.issueFlags = row.issueFlags,
+    r.verdict = row.verdict,
+    r.auditedAt = row.auditedAt,
+    r.auditRunId = $run
+RETURN count(r) AS n
+"""
+_DROPPED_AUDIT: Final = "each row must match its edge (source url, position) into its target url"
+# Audit properties this run did not write go: another run's, and flags or verdicts from before
+# runs were recorded. #16's scores and the target status stay. Each pass takes the next $limit.
+_CLEAR_STALE_LINK_AUDIT: Final = """
+MATCH (:Page {tenantId: $tenant})-[r:LINKS_TO]->()
+WHERE coalesce(r.auditRunId, '') <> $run
+  AND (r.issueFlags IS NOT NULL OR r.verdict IS NOT NULL OR r.anchorQualityScore IS NOT NULL
+       OR r.keywordAlignment IS NOT NULL OR r.equityEfficiency IS NOT NULL
+       OR r.auditedAt IS NOT NULL OR r.auditRunId IS NOT NULL)
+WITH r LIMIT $limit
+REMOVE r.anchorQualityScore, r.keywordAlignment, r.equityEfficiency, r.issueFlags, r.verdict,
+       r.auditedAt, r.auditRunId
+RETURN count(r) AS n
 """
 _COMMUNITY_CONTEXT: Final = """
 MATCH (p:Page {tenantId: $tenant})
@@ -1381,6 +1422,33 @@ class GraphRepo:
         except ValidationError as error:
             raise DatabaseReadError("neo4j", f"link relevance of {tenant_id!r}: {error}") from error
 
+    async def audit_edges(self, tenant_id: str) -> list[AuditEdge]:
+        """Every body link from a crawled page of the tenant, into placeholders too, with what
+        the link audit scores, ordered by (source url, position). A link into a non-canonical
+        copy carries the url of that copy's canonical page."""
+        _require_tenant(tenant_id)
+        try:
+            async with self._driver.session(default_access_mode=READ_ACCESS) as session:
+                canonicals, rows = await session.execute_read(_audit_snapshot, tenant_id)
+        except (Neo4jError, DriverError) as error:
+            raise _translate(error, write=False) from error
+        canonical = _canonical_by_group(tenant_id, canonicals)
+        for row in rows:
+            group = row.pop("target_group")
+            row["target_canonical_url"] = None
+            if row.pop("target_is_canonical") is False:
+                if group not in canonical:
+                    raise DatabaseReadError(
+                        "neo4j",
+                        f"page {row['target_url']!r} of {tenant_id!r} is a copy in group "
+                        f"{group!r}, which has no canonical page",
+                    )
+                row["target_canonical_url"] = canonical[group]
+        try:
+            return [AuditEdge.model_validate(row) for row in rows]
+        except ValidationError as error:
+            raise DatabaseReadError("neo4j", f"audit edges of {tenant_id!r}: {error}") from error
+
     async def page_languages(self, tenant_id: str) -> dict[str, str | None]:
         """The language of every crawled page; None when ingestion assigned none."""
         _require_tenant(tenant_id)
@@ -1562,6 +1630,68 @@ class GraphRepo:
             cleared += _int_row(row, "cleared")
         return scored, cleared
 
+    async def write_link_audit(
+        self, tenant_id: str, rows: Sequence[LinkAuditResult], *, batch_size: int = AUDIT_BATCH
+    ) -> int:
+        """Write one audit run's scores, flags, verdicts and run id onto its edges, ``batch_size``
+        edges per transaction; None removes a property. A row whose edge is gone or now points
+        elsewhere rolls its batch back. Rewriting a run is idempotent. Returns the edges written."""
+        _require_tenant(tenant_id)
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        runs = {row.run_id for row in rows}
+        if len(runs) > 1:
+            raise ValueError("rows of more than one audit run in one call")
+        _check_unique_edges((row.source_url, row.position) for row in rows)
+        run = next(iter(runs), None)
+        written = 0
+        for chunk in batched(rows, batch_size):
+            params = [
+                {
+                    "source": row.source_url,
+                    "position": row.position,
+                    "target": row.target_url,
+                    "anchorQualityScore": row.anchor_quality_score,
+                    "keywordAlignment": row.keyword_alignment,
+                    "equityEfficiency": row.equity_efficiency,
+                    "issueFlags": sorted(flag.value for flag in row.issue_flags),
+                    "verdict": _to_property(row.verdict),
+                    "auditedAt": row.audited_at,
+                }
+                for row in chunk
+            ]
+            written += await self._write_exactly(
+                _WRITE_LINK_AUDIT,
+                len(params),
+                _DROPPED_AUDIT,
+                tenant=tenant_id,
+                run=run,
+                rows=params,
+            )
+        return written
+
+    async def clear_stale_link_audit(
+        self, tenant_id: str, run_id: str, *, batch_size: int = AUDIT_BATCH
+    ) -> int:
+        """Remove the audit properties from the tenant's edges that carry any not written by
+        ``run_id``, ``batch_size`` edges per transaction; call it after the run's last write.
+        Returns the edges cleared."""
+        _require_tenant(tenant_id)
+        if not run_id.strip():
+            raise ValueError("run_id must be a non-empty string")
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        cleared = 0
+        while True:
+            n = _int(
+                await self._write(
+                    _CLEAR_STALE_LINK_AUDIT, tenant=tenant_id, run=run_id, limit=batch_size
+                )
+            )
+            cleared += n
+            if n < batch_size:
+                return cleared
+
     async def replace_keyword_targets(
         self,
         tenant_id: str,
@@ -1668,6 +1798,14 @@ async def _snapshot(
     pages = await (await tx.run(_SNAPSHOT_PAGES, tenant=tenant_id)).values()
     links = await (await tx.run(_SNAPSHOT_LINKS, tenant=tenant_id)).values()
     return pages, links
+
+
+async def _audit_snapshot(
+    tx: AsyncManagedTransaction, tenant_id: str
+) -> tuple[list[Row], list[Row]]:
+    # Both reads in one transaction: every copy's group is in the canonical list.
+    params = {"tenant": tenant_id}
+    return await _collect(tx, _AUDIT_CANONICALS, params), await _collect(tx, _AUDIT_EDGES, params)
 
 
 async def _write_page_rows(
@@ -1846,6 +1984,18 @@ def _check_unique_edges(edges: Iterable[tuple[str, int]]) -> None:
         if edge in seen:
             raise ValueError(f"duplicate edge {edge[0]!r} position {edge[1]} in one call")
         seen.add(edge)
+
+
+def _canonical_by_group(tenant_id: str, rows: list[Row]) -> dict[object, str]:
+    canonical: dict[object, str] = {}
+    for row in rows:
+        group = row["duplicate_group"]
+        if group in canonical:
+            raise DatabaseReadError(
+                "neo4j", f"duplicate group {group!r} of {tenant_id!r} has two canonical pages"
+            )
+        canonical[group] = str(row["url"])
+    return canonical
 
 
 def _model_counts(rows: list[Row]) -> tuple[EmbeddingModelCount, ...]:
