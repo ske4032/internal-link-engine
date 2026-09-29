@@ -7,6 +7,7 @@ from collections import Counter
 from datetime import UTC, datetime
 
 import pytest
+import test_audit_models as audit_models
 from link_audit_seed import (
     AUDITED,
     LINKS,
@@ -175,3 +176,13 @@ def test_an_a1_audit_run_logs_why_it_had_no_embeddings(local_mlflow: str) -> Non
     summary = load_text(f"runs:/{run_id}/summary.md")
     assert summary.startswith(f"Link audit run-1 of tenant {TENANT}: {len(AUDITED)} body links")
     assert f"A1 only: {NO_STORED_SCORES}" in summary
+
+
+def test_both_fixable_rates_are_logged_and_one_without_a_denominator_is_left_out() -> None:
+    # Two verdicts over four links, one of them unverified.
+    metrics = link_audit_metrics(audit_models.report())
+    unverified = link_audit_metrics(audit_models.report(**audit_models.ALL_UNVERIFIED))
+
+    assert (metrics["fixable_rate"], metrics["fixable_rate_verified"]) == (2 / 4, 2 / 3)
+    assert unverified["fixable_rate"] == 0.0
+    assert "fixable_rate_verified" not in unverified

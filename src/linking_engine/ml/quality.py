@@ -357,6 +357,16 @@ def quality_metrics(report: QualityReport) -> dict[str, float]:
                     "extract_stem_set_threshold": extract.stem_set_threshold,
                 }
             )
+            for rung, part in extract.by_source.items():
+                name = f"extract_{rung.value.lower()}"
+                metrics.update(
+                    {
+                        f"{name}_pairs": float(part.pairs),
+                        f"{name}_found_primary": part.found_primary,
+                        f"{name}_found_set": part.found_set,
+                        f"{name}_words_primary": part.words_primary,
+                    }
+                )
         if (anchors := keywords.anchors) is not None:
             metrics.update(
                 {

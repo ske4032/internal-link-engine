@@ -712,6 +712,10 @@ def link_audit_metrics(report: LinkAuditReport) -> dict[str, float]:
     statistics and split, flat; absent values left out."""
     metrics = {name: float(getattr(report, name)) for name in _AUDIT_COUNTS}
     metrics["embeddings"] = float(report.embeddings)
+    if report.fixable_rate is not None:
+        metrics["fixable_rate"] = report.fixable_rate
+    if report.verified_fixable_rate is not None:
+        metrics["fixable_rate_verified"] = report.verified_fixable_rate
     metrics.update(
         {f"flag_{flag.value.lower()}": float(report.by_flag.get(flag, 0)) for flag in IssueFlag}
     )

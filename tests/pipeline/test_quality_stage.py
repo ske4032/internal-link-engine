@@ -48,6 +48,7 @@ from linking_engine.models import (
     CommunityContext,
     FeatureWeight,
     KeywordRung,
+    KeywordSource,
     LinkGraphSnapshot,
     LinkRelevance,
     PageStructure,
@@ -55,6 +56,7 @@ from linking_engine.models import (
     QualityBaseline,
     ResolvedKeyword,
     ScorerWeights,
+    SourceExtractability,
     TargetCandidates,
     TargetSelection,
 )
@@ -418,6 +420,47 @@ def test_uniqueness_is_the_share_of_distinct_keywords_that_one_page_resolved() -
     assert unique_share({}) is None
 
 
+def test_extractability_is_split_by_the_rung_of_the_targets_primary_keyword() -> None:
+    shoes, jacket, pegs = toy("shoes"), toy("jacket"), toy("pegs")
+    keywords = {
+        target: [(rank, text, KeywordSource.INFERRED) for rank, text in enumerate(texts, 1)]
+        for target, texts in (
+            (shoes, ("trail shoes", "hiking boots")),
+            (jacket, ("rain jacket",)),
+            (pegs, ("tent pegs",)),
+        )
+    }
+    sources = {
+        toy("a"): quality._SourcePage("Our trail shoes, tent pegs and a rain jacket.", (), "en"),
+        toy("b"): quality._SourcePage("Hiking boots for rocky ground.", (), "en"),
+    }
+    # Page c has no stored body: its pair counts, with nothing found.
+    wanted = {toy("a"): [shoes, jacket, pegs], toy("b"): [shoes, jacket], toy("c"): [shoes]}
+
+    extract = quality._extractability(
+        wanted,
+        keywords,
+        sources,
+        0.6,
+        frozenset(),
+        {shoes: KeywordRung.H1, jacket: KeywordRung.GSC},
+    )
+
+    assert extract is not None
+    # The pegs target resolved no keyword: its one pair, found on a, is in the totals only.
+    assert (extract.pairs, extract.found_primary, extract.found_set) == (6, 3 / 6, 4 / 6)
+    assert extract.words_primary == 3 / 6
+    # shoes: its primary on a, only its second keyword on b, nothing on c.
+    assert extract.by_source == {
+        KeywordRung.GSC: SourceExtractability(
+            pairs=2, found_primary=1 / 2, found_set=1 / 2, words_primary=1 / 2
+        ),
+        KeywordRung.H1: SourceExtractability(
+            pairs=3, found_primary=1 / 3, found_set=2 / 3, words_primary=1 / 3
+        ),
+    }
+
+
 # ── the summary ─────────────────────────────────────────────────────────────
 
 
@@ -434,6 +477,8 @@ def test_the_summary_of_a_first_run_says_what_was_checked_and_that_there_is_no_b
         "0.6), existing anchors aside: the primary keyword is found in the source copy for "
         "50.0%, some keyword of the set for 75.0% (best rung exact 37.5%, stemmed 25.0%, "
         "stem set 12.5%)",
+        "75.0% set. H1 keywords: 25.0% found, 50.0% ceiling, 4 pairs. STRATEGIC keywords: "
+        "50.0% found, 100.0% ceiling, 2 pairs.",
         "Existing anchors: of 4 descriptive anchors",
         "rank 1 0.600 (n=3), rank 2 0.400 (n=2)",
         "By origin: primary_h1 0.600 (median 0.600, n=3), secondary_gsc_observed 0.400",
@@ -703,6 +748,15 @@ async def test_a_planted_tenant_gets_every_check_and_nothing_is_written(
         24 / 480,
     )
     assert (extract.words_primary, extract.words_set) == (48 / 480, 48 / 480)
+    # Split by the rung each target's primary keyword was resolved at, from the flow's plan.
+    assert extract.by_source == {
+        KeywordRung.H1: SourceExtractability(
+            pairs=460, found_primary=46 / 460, found_set=46 / 460, words_primary=46 / 460
+        ),
+        KeywordRung.STRATEGIC: SourceExtractability(
+            pairs=20, found_primary=2 / 20, found_set=2 / 20, words_primary=2 / 20
+        ),
+    }
     # Offset 1 anchors name the target's keyword, offset 2 are generic and skipped, offset 3
     # name only the topic.
     anchors = keywords.anchors

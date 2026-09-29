@@ -145,6 +145,7 @@ from linking_engine.models.quality import (
     RelevanceGroup,
     RetrievalCheck,
     ScorerCheck,
+    SourceExtractability,
 )
 from linking_engine.models.ranking import (
     HeldOutSettings,
@@ -331,6 +332,7 @@ __all__ = [
     "SentenceTarget",
     "SignalReport",
     "SiteSummary",
+    "SourceExtractability",
     "StageResult",
     "StageStatus",
     "StrategicKeyword",

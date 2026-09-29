@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+import test_audit_models as audit_models
 from link_audit_seed import (
     AUDITED,
     LINKS,
@@ -31,7 +32,7 @@ from linking_engine.audit.links import NO_STORED_SCORES
 from linking_engine.errors import DatabaseWriteError
 from linking_engine.models import AnchorRules, AuditEdge, IssueFlag, LinkAuditReport
 from linking_engine.pipeline import link_audit as link_audit_stage
-from linking_engine.pipeline.link_audit import audit_links, summarise_link_audit
+from linking_engine.pipeline.link_audit import audit_links, fixable_band, summarise_link_audit
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -377,3 +378,44 @@ def test_the_script_prints_the_summary_and_the_mlflow_run(
     assert calls == ["test-tenant"]
     assert summarise_link_audit(report) in out
     assert out.rstrip().endswith("mlflow run mlflow-run-7")
+
+
+@pytest.mark.parametrize(
+    ("rate", "band"),
+    [
+        (0.0, "below 10%"),
+        (0.0999, "below 10%"),
+        (0.10, "10%-30%"),
+        (0.30, "10%-30%"),
+        (0.3001, "above 30%"),
+        (1.0, "above 30%"),
+    ],
+)
+def test_the_fixable_band_is_strict_below_10_and_strict_above_30_percent(
+    rate: float, band: str
+) -> None:
+    assert fixable_band(rate).startswith(f"{band}: "), fixable_band(rate)
+
+
+BELOW = "below 10%: the audit is a feature, discovery is the product"
+BETWEEN = "10%-30%: both the audit and discovery matter"
+
+
+@pytest.mark.parametrize(
+    ("fields", "line"),
+    [
+        # Two verdicts over 25 links, 15 of them into uncrawled pages.
+        (
+            {"links": 25, "unverified": 15, "healthy": 8},
+            f"Fixable-link rate: 8.0% of all audited links ({BELOW}); 20.0% of the links into "
+            f"crawled pages ({BETWEEN}).",
+        ),
+        (audit_models.ALL_UNVERIFIED, f"Fixable-link rate: 0.0% of all audited links ({BELOW})."),
+        (audit_models.NO_LINKS, "Fixable-link rate: no audited links."),
+    ],
+    ids=["both-rates", "all-unverified", "no-links"],
+)
+def test_the_summary_gives_each_fixable_rate_with_its_band(
+    fields: dict[str, object], line: str
+) -> None:
+    assert line in summarise_link_audit(audit_models.report(**fields))

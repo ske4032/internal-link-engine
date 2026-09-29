@@ -98,6 +98,7 @@ from linking_engine.models import (
     RetrievalCheck,
     ScorerCheck,
     ScorerWeights,
+    SourceExtractability,
 )
 from linking_engine.models.scoring import SCORE_HISTOGRAM_BINS
 from linking_engine.pipeline.embed import NO_MODEL
@@ -424,13 +425,16 @@ def _extractability(
     sources: Mapping[str, _SourcePage],
     threshold: float,
     brand: frozenset[str],
+    rungs: Mapping[str, KeywordRung],
 ) -> KeywordExtractability | None:
-    """The ladder over every (source, target) pair in ``wanted``, source to its targets; a
-    source without a stored body carries nothing."""
+    """The ladder over every (source, target) pair in ``wanted``, source to its targets, also
+    split by the rung in ``rungs`` the target's primary keyword was resolved at; a source
+    without a stored body carries nothing."""
     stems: dict[str | None, Stems] = {}
     words_of: dict[str, tuple[frozenset[str], ...]] = {}
     best: Counter[AnchorRung] = Counter()
     pairs = found_primary = found_set = words_primary = words_set = 0
+    parts: defaultdict[KeywordRung, Counter[str]] = defaultdict(Counter)
     for source_url, targets in wanted.items():
         page = sources.get(source_url)
         index = None
@@ -448,15 +452,22 @@ def _extractability(
             if target not in words_of:
                 words_of[target] = tuple(keyword_words(text) for _, text, _ in ranked)
             words = words_of[target]
-            words_primary += bool(words[0]) and words[0] <= present
+            has_words = bool(words[0]) and words[0] <= present
+            words_primary += has_words
             words_set += any(bool(found) and found <= present for found in words)
+            part = parts[rungs[target]] if target in rungs else Counter[str]()
+            part["pairs"] += 1
+            part["words_primary"] += has_words
             if index is None:
                 continue
             matches, _, _ = extract(index, target, ranked, threshold=threshold)
             if not matches:
                 continue
+            primary = any(match.keyword_rank == ranked[0][0] for match in matches)
             found_set += 1
-            found_primary += any(match.keyword_rank == ranked[0][0] for match in matches)
+            found_primary += primary
+            part["found_set"] += 1
+            part["found_primary"] += primary
             best[min((match.rung for match in matches), key=_RUNGS.index)] += 1
     if not pairs:
         return None
@@ -470,6 +481,15 @@ def _extractability(
         words_primary=words_primary / pairs,
         words_set=words_set / pairs,
         stem_set_threshold=threshold,
+        by_source={
+            rung: SourceExtractability(
+                pairs=part["pairs"],
+                found_primary=part["found_primary"] / part["pairs"],
+                found_set=part["found_set"] / part["pairs"],
+                words_primary=part["words_primary"] / part["pairs"],
+            )
+            for rung, part in sorted(parts.items())
+        },
     )
 
 
@@ -481,6 +501,7 @@ async def keyword_extractability(
     *,
     threshold: float = DEFAULT_THRESHOLD,
     brand: frozenset[str] = frozenset(),
+    rungs: Mapping[str, KeywordRung] | None = None,
 ) -> KeywordExtractability | None:
     """Over the candidate pairs whose target has a ranked keyword set, as (rank, text, source)
     rank ascending: does the extraction ladder find the target's primary keyword, or any
@@ -502,7 +523,9 @@ async def keyword_extractability(
                 tuple(heading.text for heading in record.headings),
                 record.language,
             )
-    return await asyncio.to_thread(_extractability, wanted, keywords, sources, threshold, brand)
+    return await asyncio.to_thread(
+        _extractability, wanted, keywords, sources, threshold, brand, rungs or {}
+    )
 
 
 def _anchor_counts(
@@ -798,6 +821,7 @@ async def evaluate_quality(
             ranked,
             threshold=settings.stem_set_threshold,
             brand=brand,
+            rungs={url: keyword.rung for url, keyword in plan.resolved.items()},
         )
         del production
     del vectors
@@ -989,6 +1013,11 @@ def summarise_quality(report: QualityReport) -> str:
             f"{extract.exact_set:.1%}, stemmed {extract.stemmed_set:.1%}, stem set "
             f"{extract.stem_set_set:.1%}); every word anywhere, the literal upper bound of the "
             f"exact rung: {extract.words_primary:.1%} primary, {extract.words_set:.1%} set."
+            + "".join(
+                f" {rung.value} keywords: {part.found_primary:.1%} found, "
+                f"{part.words_primary:.1%} ceiling, {part.pairs} pairs."
+                for rung, part in extract.by_source.items()
+            )
         )
         anchors = keywords.anchors
         lines.append(

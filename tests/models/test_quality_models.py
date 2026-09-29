@@ -22,6 +22,7 @@ MODELS: tuple[type[BaseModel], ...] = (
     type(make.retrieval()),
     type(make.feature_signal()),
     type(make.scorer()),
+    type(make.source()),
     type(make.extractability()),
     type(make.anchor_match()),
     type(make.rank()),
@@ -177,6 +178,20 @@ def test_the_primary_keyword_never_matches_more_pairs_than_its_set(
     assert make.extractability(**{primary: 0.75, whole_set: 0.75})
     with pytest.raises(ValidationError, match="cannot match more pairs"):
         make.extractability(**{primary: 0.875, whole_set: 0.75})
+
+
+def test_a_sources_primary_keyword_never_matches_more_pairs_than_its_set() -> None:
+    assert make.source(found_primary=0.5, found_set=0.5)
+    with pytest.raises(ValidationError, match="cannot match more pairs"):
+        make.source(found_primary=0.75, found_set=0.5)
+
+
+def test_the_sources_never_hold_more_pairs_than_the_whole() -> None:
+    whole = {KeywordRung.H1: make.source(pairs=6), KeywordRung.GSC: make.source(pairs=2)}
+
+    assert make.extractability(by_source=whole).by_source == whole
+    with pytest.raises(ValidationError, match="more pairs than the whole"):
+        make.extractability(by_source={**whole, KeywordRung.TITLE: make.source(pairs=1)})
 
 
 def test_the_best_rungs_add_up_to_the_pairs_found() -> None:
