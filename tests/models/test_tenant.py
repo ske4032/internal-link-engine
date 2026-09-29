@@ -32,6 +32,12 @@ EXPECTED_DEFAULTS = {
     "diversity_cap_pct": 0.15,
     "max_recommendations_per_source": 10,
     "max_content_gaps_per_source": 3,
+    "words_per_link": 200,
+    "guaranteed_inbound_links": 2,
+    "guaranteed_inbound_below": 1,
+    "max_suggested_inbound": 5,
+    "pillar_floor_quantile": 0.10,
+    "pillar_floor_min_links": 50,
 }
 
 EXPECTED_ANCHOR_PROFILE = {"exact": 0.15, "partial": 0.20, "natural": 0.50, "branded": 0.15}

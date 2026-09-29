@@ -33,7 +33,7 @@ from linking_engine.discovery.scoring import (
     score_frame,
 )
 from linking_engine.ml.ranker_tracking import load_production
-from linking_engine.ml.ranking import PREDICT_CHUNK
+from linking_engine.ml.ranking import PREDICT_CHUNK, gini
 from linking_engine.models import (
     ActionType,
     AnchorCandidate,
@@ -46,10 +46,13 @@ from linking_engine.models import (
     BridgePair,
     DuplicateGroup,
     HubSummary,
+    OrphanRescue,
+    OrphanSlotReason,
     PageProfile,
     Recommendation,
     RecommendationReport,
     RecommendationStatus,
+    RescueSource,
     RunInfo,
     ScorerName,
     SiteSummary,
@@ -63,6 +66,7 @@ from linking_engine.output.collections import (
     BRIDGES,
     DUPLICATES,
     HUBS,
+    ORPHANS,
     PAGES,
     RECOMMENDATIONS,
     TARGET_FIXES,
@@ -77,7 +81,7 @@ from linking_engine.pipeline.features import ANCHOR_CHOICES_FILE, assemble_featu
 from linking_engine.pipeline.ranker import RANKED_PAIRS_FILE
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
     from pathlib import Path
 
     import numpy.typing as npt
@@ -177,6 +181,14 @@ class Inputs:
     # ADD_LINKs, and content gaps beside them, per source page.
     limit: int
     gap_limit: int
+    # A page's link budget: one suggested link per this many words, less its existing links.
+    words_per_link: int
+    # Suggested inbound links guaranteed to each page with fewer inbound body links than
+    # `guaranteed_inbound_below`.
+    guaranteed_inbound_links: int
+    guaranteed_inbound_below: int
+    # Suggested links into one page, hub main pages exempt; 0 sets no cap.
+    max_suggested_inbound: int
     tier_shares: tuple[float, float]
     scorer: ScorerName
     # _RANKED_COLUMNS but the scorer's; _CHOICE_COLUMNS; _UNANCHORED_COLUMNS.
@@ -191,6 +203,9 @@ class Inputs:
     excluded: Sequence[ExcludedPage]
     pages: Sequence[PageFacts]
     hubs: Sequence[HubNode]
+    # The pages retrieval can target (indexable, with a vector), less non-canonical copies:
+    # the only pages a guarantee can reach.
+    linkable: frozenset[str]
     titles: Mapping[str, str | None]
     keywords: Mapping[str, tuple[str, KeywordRung]]
     # Each page's ranked keyword texts, the resolved keyword first.
@@ -204,17 +219,32 @@ class Inputs:
     def excluded_urls(self) -> frozenset[str]:
         return frozenset(page.url for page in self.excluded)
 
+    @property
+    def guarantee(self) -> int:
+        """Suggested inbound links guaranteed to a page, never more than the cap."""
+        links, cap = self.guaranteed_inbound_links, self.max_suggested_inbound
+        return links if cap == 0 else min(links, cap)
+
 
 @dataclass(frozen=True, slots=True)
 class Walk:
     """The ranked pairs, each with its score, tier and what it became, and the new links kept."""
 
     # The ranked pairs with percentile, tier, candidates (the source's ranked pairs), reason,
-    # advice, best_score, excluded and action ("" for no record).
+    # advice, best_score, excluded, action ("" for no record), anchored and hub_ok (the source
+    # is in the target's hub, or the target in none).
     pairs: pandas.DataFrame
     # The new links kept, source by source: its ADD_LINKs, then its content gaps, each in rank
-    # order with place, their rank within their own list.
+    # order with place, their rank within their own list, suggested and orphan_slot.
     emitted: pandas.DataFrame
+    # Every page's and source's link budget, by url.
+    budgets: Mapping[str, int]
+    # The pages guaranteed inbound links, by url, and the reason of each left short.
+    guaranteed: tuple[str, ...]
+    unmet: Mapping[str, OrphanSlotReason]
+    # Suggestions the inbound cap moved to the source's next reserve, or left unfilled.
+    moved_by_cap: int
+    dropped_by_cap: int
     not_assessed: int
     # Pairs whose every extracted phrase is too long to serve as an anchor.
     anchors_too_long: int
@@ -233,6 +263,7 @@ class Assembly:
     duplicates: tuple[DuplicateGroup, ...]
     unanchored: tuple[UnanchoredOut, ...]
     target_fixes: tuple[TargetFix, ...]
+    orphans: tuple[OrphanRescue, ...]
     summary: SiteSummary
 
     def collections(self) -> tuple[tuple[str, Sequence[BaseModel]], ...]:
@@ -244,6 +275,7 @@ class Assembly:
             (DUPLICATES, self.duplicates),
             (UNANCHORED, self.unanchored),
             (TARGET_FIXES, self.target_fixes),
+            (ORPHANS, self.orphans),
         )
 
 
@@ -318,6 +350,10 @@ async def publish_recommendations(
         inputs={**files, "link_audit": audit_completed},
         limit_per_source=inputs.limit,
         content_gap_limit=inputs.gap_limit,
+        words_per_link=inputs.words_per_link,
+        guaranteed_inbound_links=inputs.guaranteed_inbound_links,
+        guaranteed_inbound_below=inputs.guaranteed_inbound_below,
+        max_suggested_inbound=inputs.max_suggested_inbound,
         quality=quality,
     )
     await writer.ensure_indexes()
@@ -335,6 +371,10 @@ async def publish_recommendations(
         model_version=model_version,
         limit_per_source=inputs.limit,
         content_gap_limit=inputs.gap_limit,
+        words_per_link=inputs.words_per_link,
+        guaranteed_inbound_links=inputs.guaranteed_inbound_links,
+        guaranteed_inbound_below=inputs.guaranteed_inbound_below,
+        max_suggested_inbound=inputs.max_suggested_inbound,
         summary=assembly.summary,
         pairs_not_assessed=walked.not_assessed,
         seconds=round(time.perf_counter() - started, 3),
@@ -415,12 +455,18 @@ async def _read_inputs(
         for url, found in (await graph.ranked_keywords(tenant_id)).items()
     }
     config = TenantConfig(tenant_id=tenant_id)
+    targets = await graph.candidate_targets(tenant_id)
+    copies = await graph.non_canonical_copies(tenant_id)
     inputs = Inputs(
         tenant_id=tenant_id,
         run_id=uuid.uuid4().hex,
         started_at=started_at,
         limit=config.max_recommendations_per_source,
         gap_limit=config.max_content_gaps_per_source,
+        words_per_link=config.words_per_link,
+        guaranteed_inbound_links=config.guaranteed_inbound_links,
+        guaranteed_inbound_below=config.guaranteed_inbound_below,
+        max_suggested_inbound=config.max_suggested_inbound,
         tier_shares=weights.tier_shares,
         scorer=scorer,
         ranked=ranked,
@@ -433,6 +479,7 @@ async def _read_inputs(
         excluded=excluded,
         pages=await graph.page_facts(tenant_id),
         hubs=await graph.hub_nodes(tenant_id),
+        linkable=frozenset(target.url for target in targets.targets) - copies,
         titles=titles,
         keywords=await graph.resolved_keywords(tenant_id),
         ranked_keywords=ranked_keywords,
@@ -494,11 +541,13 @@ def percentiles(values: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
 
 def walk(inputs: Inputs) -> Walk:
     """Each source page's ranked pairs in rank order, links first: its first ``limit`` pairs
-    with an anchor become ADD_LINK. The pairs whose source lacks the copy become CONTENT_GAP,
-    up to ``gap_limit``, only when ranked above the page's last ADD_LINK, or all of them on a
-    page without one. Pairs of excluded pages are skipped and the other unanchored reasons add
-    no record; a pair with neither an anchor nor a reason is counted as not assessed while the
-    walk for links passes it."""
+    with an anchor become ADD_LINK, the first of them up to the page's link budget suggested
+    and the rest reserves. Pages with too few inbound links then get their guaranteed inbound
+    links as orphan slots (see `_guarantee`). The pairs whose source lacks the copy become
+    CONTENT_GAP, up to ``gap_limit`` on a page with a budget, only when ranked above its last
+    suggested link, or all of them on a page without one. Pairs of excluded pages are skipped
+    and the other unanchored reasons add no record; a pair with neither an anchor nor a reason
+    is counted as not assessed while the walk for links passes it."""
     pairs = inputs.ranked.loc[:, ["source_url", "target_url", "score", "rank_in_source"]].copy()
     values = pairs["score"].to_numpy(dtype=np.float64)
     pairs["percentile"] = percentiles(values)
@@ -524,21 +573,40 @@ def walk(inputs: Inputs) -> Walk:
         ["", ActionType.ADD_LINK.value, ActionType.CONTENT_GAP.value],
         default="",
     )
-    links = _placed(pairs.loc[pairs["action"] == ActionType.ADD_LINK.value], inputs.limit)
-    # A gap would outrank a proposed link once the copy is written; on a page without a link,
+    pairs["anchored"] = anchored
+    hub_of = {page.url: page.hub_id for page in inputs.pages if _in_hub(page.hub_id)}
+    target_hub = pairs["target_url"].map(hub_of)
+    pairs["hub_ok"] = target_hub.isna() | (pairs["source_url"].map(hub_of) == target_hub)
+    budgets = link_budgets(inputs, pairs["source_url"].unique().tolist())
+
+    ranked_links = _placed(pairs.loc[pairs["action"] == ActionType.ADD_LINK.value], inputs.limit)
+    ranked_links = ranked_links.assign(
+        suggested=ranked_links["place"] <= ranked_links["source_url"].map(budgets),
+        orphan_slot=False,
+    )
+    capped, moved, dropped = _cap(inputs, ranked_links)
+    guaranteed = _guaranteed(inputs)
+    links, unmet = _guarantee(inputs, pairs, capped, guaranteed)
+    # A gap would outrank a suggested link once the copy is written; on a page without one,
     # every gap would.
-    last = links.groupby("source_url")["rank_in_source"].max()
+    last = links.loc[links["suggested"]].groupby("source_url")["rank_in_source"].max()
     gaps = pairs.loc[pairs["action"] == ActionType.CONTENT_GAP.value]
     last_link = gaps["source_url"].map(last)
     gaps = _placed(
-        gaps.loc[last_link.isna() | (gaps["rank_in_source"] < last_link)], inputs.gap_limit
-    )
+        gaps.loc[
+            (gaps["source_url"].map(budgets) >= 1)
+            & (last_link.isna() | (gaps["rank_in_source"] < last_link))
+        ],
+        inputs.gap_limit,
+    ).assign(suggested=False, orphan_slot=False)
     emitted = pandas.concat([links, gaps]).sort_values(
         ["source_url", "action", "place"], kind="stable"
     )
     emitted = emitted.reset_index(drop=True)
     # Where each source that reached the limit stopped; the walk never passes the pairs below.
-    stops = links.loc[links["place"] == inputs.limit].set_index("source_url")["rank_in_source"]
+    stops = ranked_links.loc[ranked_links["place"] == inputs.limit].set_index("source_url")[
+        "rank_in_source"
+    ]
     unassessed = pairs.loc[
         ~pairs["excluded"] & ~anchored & ~too_long & pairs["reason"].isna(),
         ["source_url", "rank_in_source"],
@@ -548,6 +616,11 @@ def walk(inputs: Inputs) -> Walk:
     return Walk(
         pairs=pairs,
         emitted=emitted,
+        budgets=budgets,
+        guaranteed=guaranteed,
+        unmet=unmet,
+        moved_by_cap=moved,
+        dropped_by_cap=dropped,
         not_assessed=int(walked.sum()),
         anchors_too_long=int((too_long & ~pairs["excluded"].to_numpy()).sum()),
         unanchored_not_ranked=len(inputs.unanchored) - int(pairs["reason"].notna().sum()),
@@ -559,6 +632,203 @@ def _placed(pairs: pandas.DataFrame, limit: int) -> pandas.DataFrame:
     ordered = pairs.sort_values(["source_url", "rank_in_source"], kind="stable")
     ordered = ordered.assign(place=ordered.groupby("source_url").cumcount() + 1)
     return ordered.loc[ordered["place"] <= limit]
+
+
+def _in_hub(hub_id: int | None) -> bool:
+    return hub_id is not None and hub_id >= 0
+
+
+def link_budget(words: int, outbound: int, *, limit: int, words_per_link: int) -> int:
+    """Suggested new links a page takes: one per ``words_per_link`` words, at least one and at
+    most ``limit``, less the pages it already links to."""
+    return max(0, min(limit, max(1, words // words_per_link)) - outbound)
+
+
+def link_budgets(inputs: Inputs, sources: Iterable[str]) -> dict[str, int]:
+    """The link budget of every page and of every source; a source without page facts counts
+    as a page without words or links."""
+    facts = {page.url: (page.word_count, page.outbound) for page in inputs.pages}
+    return {
+        url: link_budget(
+            *facts.get(url, (0, 0)), limit=inputs.limit, words_per_link=inputs.words_per_link
+        )
+        for url in {*facts, *sources}
+    }
+
+
+def _cap(inputs: Inputs, links: pandas.DataFrame) -> tuple[pandas.DataFrame, int, int]:
+    """``links`` with no page but a hub main page taking more than ``max_suggested_inbound``
+    suggested links, and how many suggestions moved or were left unfilled. The suggestions
+    are visited best first; one into a full page becomes a reserve, and its source suggests
+    instead its first reserve, in rank order, into a page that is not full, if it has one."""
+    cap = inputs.max_suggested_inbound
+    if cap == 0 or links.empty:
+        return links, 0, 0
+    exempt = frozenset(page.url for page in inputs.pages if page.is_hub_pillar)
+    targets = links["target_url"].tolist()
+    suggested = links["suggested"].to_numpy(dtype=bool, copy=True)
+    visits = (
+        links.reset_index(drop=True)
+        .sort_values(
+            ["percentile", "source_url", "place", "target_url"],
+            ascending=[False, True, True, True],
+            kind="stable",
+        )
+        .index.to_numpy()
+    )
+    rows = links.groupby("source_url").indices
+    sources = links["source_url"].tolist()
+    into: Counter[str] = Counter()
+    moved = dropped = 0
+
+    def full(target: str) -> bool:
+        return target not in exempt and into[target] >= cap
+
+    for row in visits[suggested[visits]]:
+        if not full(targets[row]):
+            into[targets[row]] += 1
+            continue
+        suggested[row] = False
+        spare = next(
+            (i for i in rows[sources[row]] if not suggested[i] and not full(targets[i])), None
+        )
+        if spare is None:
+            dropped += 1
+            continue
+        suggested[spare] = True
+        into[targets[spare]] += 1
+        moved += 1
+    return links.assign(suggested=suggested), moved, dropped
+
+
+def _guaranteed(inputs: Inputs) -> tuple[str, ...]:
+    """The linkable pages with fewer inbound links than the cut-off, by url; none when
+    nothing is guaranteed."""
+    below = inputs.guaranteed_inbound_below
+    if inputs.guaranteed_inbound_links == 0 or below == 0:
+        return ()
+    excluded = inputs.excluded_urls
+    return tuple(
+        sorted(
+            page.url
+            for page in inputs.pages
+            if page.inbound < below and page.url in inputs.linkable and page.url not in excluded
+        )
+    )
+
+
+@dataclass(slots=True)
+class _Link:
+    target: str
+    rank: int
+    suggested: bool
+    orphan_slot: bool = False
+
+
+def _guarantee(
+    inputs: Inputs,
+    pairs: pandas.DataFrame,
+    links: pandas.DataFrame,
+    guaranteed: Sequence[str],
+) -> tuple[pandas.DataFrame, dict[str, OrphanSlotReason]]:
+    """``links`` with each guaranteed page's orphan slots placed, and why each page left short
+    fell short. A page needs its guaranteed links less the suggested links it already gets.
+    Its eligible sources hold an anchored tier-1 or tier-2 pair into it, are in its hub when it
+    has one, and have a suggested link to give up: one into a page not guaranteed, so one
+    guarantee never undoes another. Each gives one slot, best score first, then source
+    PageRank, then url; the pages with the fewest eligible sources go first. A slot is a
+    suggested link; the source's lowest-ranked link it can give up becomes a reserve, and a
+    slot from beyond its first ``limit`` links drops its lowest-ranked reserve."""
+    wanted = frozenset(guaranteed)
+    into = pairs.loc[pairs["target_url"].isin(wanted) & ~pairs["excluded"] & pairs["hub_ok"]]
+    relevant = into.loc[into["tier"] <= 2]
+    strength = {page.url: page.page_rank_percentile for page in inputs.pages}
+    givers = links.loc[links["suggested"] & ~links["target_url"].isin(wanted), "source_url"]
+    eligible = relevant.loc[relevant["anchored"] & relevant["source_url"].isin(frozenset(givers))]
+    eligible = eligible.assign(
+        strength=eligible["source_url"].map(strength).astype("float64").fillna(-1.0)
+    ).sort_values(
+        ["target_url", "percentile", "strength", "source_url"],
+        ascending=[True, False, False, True],
+        kind="stable",
+    )
+    suggested = set(
+        zip(
+            links.loc[links["suggested"], "source_url"],
+            links.loc[links["suggested"], "target_url"],
+            strict=True,
+        )
+    )
+    inbound = Counter(target for _, target in suggested)
+    sources_of: dict[str, list[str]] = {}
+    ranks: dict[Pair, int] = {}
+    for source, target, rank in eligible[["source_url", "target_url", "rank_in_source"]].itertuples(
+        index=False
+    ):
+        ranks[(source, target)] = int(rank)
+        sources_of.setdefault(target, []).append(source)
+    order = sorted(
+        guaranteed,
+        key=lambda page: (
+            sum((source, page) not in suggested for source in sources_of.get(page, ())),
+            page,
+        ),
+    )
+    rows = links.groupby("source_url").indices
+    held: dict[str, list[_Link]] = {}
+    for target in order:
+        for source in sources_of.get(target, ()):
+            if inbound[target] >= inputs.guarantee:
+                break
+            if source in held or (source, target) in suggested:
+                continue
+            own = held[source] = [
+                _Link(str(row.target_url), int(row.rank_in_source), bool(row.suggested))
+                for row in links.iloc[rows[source]].itertuples(index=False)
+            ]
+            displaced = max(
+                (link for link in own if link.suggested and link.target not in wanted),
+                key=lambda link: link.rank,
+            )
+            displaced.suggested = False
+            suggested.discard((source, displaced.target))
+            inbound[displaced.target] -= 1
+            slot = next((link for link in own if link.target == target), None)
+            if slot is None:
+                own.append(_Link(target, ranks[(source, target)], suggested=True))
+                own.sort(key=lambda link: link.rank)
+                if len(own) > inputs.limit:
+                    own.remove(max((x for x in own if not x.suggested), key=lambda x: x.rank))
+                slot = next(link for link in own if link.target == target)
+            slot.suggested = slot.orphan_slot = True
+            suggested.add((source, target))
+            inbound[target] += 1
+    if held:
+        changed = pandas.DataFrame(
+            [
+                (source, link.target, link.suggested, link.orphan_slot)
+                for source, own in held.items()
+                for link in own
+            ],
+            columns=[*KEY_COLUMNS, "suggested", "orphan_slot"],
+        )
+        placed = pairs.merge(changed, on=list(KEY_COLUMNS), how="inner")
+        links = _placed(
+            pandas.concat([links.loc[~links["source_url"].isin(held)], placed]), inputs.limit
+        )
+    with_pairs = set(relevant["target_url"])
+    with_anchor = set(relevant.loc[relevant["anchored"], "target_url"])
+    unmet: dict[str, OrphanSlotReason] = {}
+    for page in guaranteed:
+        if inbound[page] >= inputs.guarantee:
+            continue
+        if page not in with_pairs:
+            unmet[page] = OrphanSlotReason.NO_RELEVANT_SOURCE
+        elif page not in with_anchor:
+            unmet[page] = OrphanSlotReason.NO_ANCHOR
+        else:
+            unmet[page] = OrphanSlotReason.SOURCES_FULL
+    return links, unmet
 
 
 async def _signals(
@@ -693,11 +963,12 @@ def assemble(
     ]
     records.sort(key=_record_order)
     bridges = _bridge_pairs(inputs, links, added)
-    profiles = _profiles(inputs, records, typer)
+    profiles = _profiles(inputs, records, typer, walked.budgets)
     hubs = _hubs(inputs, profiles, records, bridges)
     duplicates = _duplicates(inputs)
     unanchored = _unanchored(walked)
     fixes = _target_fixes(inputs, walked)
+    orphans = _orphans(inputs, walked, records, profiles)
     summary = _summary(
         inputs, walked, records, profiles, hubs, bridges, duplicates, unanchored, fixes
     )
@@ -709,6 +980,7 @@ def assemble(
         duplicates=duplicates,
         unanchored=unanchored,
         target_fixes=fixes,
+        orphans=orphans,
         summary=summary,
     )
 
@@ -746,8 +1018,21 @@ def _new_links(
     emitted = walked.emitted
     anchors = _anchor_candidates(inputs.choices, emitted)
     scorer = _SCORER_WORDS.get(inputs.scorer, inputs.scorer.value.replace("_", " "))
+    rows = list(emitted.itertuples(index=False))
+    # Site-wide best first, by the unrounded score, then where each record is served.
+    best = sorted(
+        range(len(rows)),
+        key=lambda i: (
+            -float(rows[i].percentile),
+            str(rows[i].source_url),
+            int(rows[i].place),
+            str(rows[i].action),
+            str(rows[i].target_url),
+        ),
+    )
+    best_ranks = {i: rank for rank, i in enumerate(best, 1)}
     found: list[Recommendation] = []
-    for row in emitted.itertuples(index=False):
+    for i, row in enumerate(rows):
         key = (str(row.source_url), str(row.target_url))
         action = ActionType(str(row.action))
         pair_signals = tuple(signals.get(key, ()))
@@ -766,6 +1051,9 @@ def _new_links(
                 score=round(100 * float(row.percentile), 1),
                 tier=int(row.tier),
                 rank_in_source=int(row.place),
+                best_rank=best_ranks[i],
+                suggested=bool(row.suggested),
+                orphan_slot=bool(row.orphan_slot),
                 status=RecommendationStatus.PENDING,
                 proposed_anchors=None if gap else anchors[key],
                 bridge=marks.get(key),
@@ -923,7 +1211,10 @@ def _bridge_pairs(
 
 
 def _profiles(
-    inputs: Inputs, records: Sequence[Recommendation], typer: _Typer
+    inputs: Inputs,
+    records: Sequence[Recommendation],
+    typer: _Typer,
+    budgets: Mapping[str, int],
 ) -> tuple[PageProfile, ...]:
     excluded = inputs.excluded_urls
     mix: defaultdict[str, Counter[AnchorType]] = defaultdict(Counter)
@@ -979,6 +1270,7 @@ def _profiles(
             recommendations_out=out[page.url],
             recommendations_in=into[page.url],
             audit_verdicts_out=verdicts[page.url],
+            link_budget=budgets[page.url],
         )
         found.append(profile)
     return tuple(found)
@@ -1130,6 +1422,13 @@ def _summary(
         for result in inputs.audit
         if result.source_url not in excluded and result.target_url not in excluded
     ]
+    suggested = [record for record in new if record.suggested]
+    reached = Counter(record.target_url for record in suggested)
+    cap = inputs.max_suggested_inbound
+    exempt = {page.url for page in inputs.pages if page.is_hub_pillar}
+    pillars = {hub.hub_id: hub.pillar_url for hub in hubs}
+    to_pillar = {(record.source_url, record.target_url) for record in suggested}
+    targets = walked.pairs.loc[~walked.pairs["excluded"], "target_url"].unique()
     return SiteSummary(
         pages=len(profiles),
         excluded_pages=Counter(page.reason for page in inputs.excluded),
@@ -1152,6 +1451,94 @@ def _summary(
         audit_flags=Counter(flag for result in audited for flag in result.issue_flags),
         unanchored=Counter(row.reason for row in unanchored),
         target_fixes=len(fixes),
+        suggested_links=len(suggested),
+        reserve_links=sum(links.values()) - len(suggested),
+        guaranteed_pages=len(walked.guaranteed),
+        orphan_slots=sum(record.orphan_slot for record in suggested),
+        guarantees_unmet=Counter(walked.unmet.values()),
+        orphans_reached=sum(profile.is_orphan and reached[profile.url] > 0 for profile in profiles),
+        orphans_to_pillar=sum(
+            profile.is_orphan
+            and profile.hub_id is not None
+            and (profile.url, pillars.get(profile.hub_id)) in to_pillar
+            for profile in profiles
+        ),
+        # None without a suggested link: every suggested target is a ranked target.
+        inbound_gini=gini([reached[target] for target in targets]),
+        pages_at_cap=sum(n >= cap for page, n in reached.items() if page not in exempt)
+        if cap
+        else 0,
+        links_moved_by_cap=walked.moved_by_cap,
+        links_dropped_by_cap=walked.dropped_by_cap,
+        top10_inbound_share=sum(n for _, n in reached.most_common(10)) / len(suggested)
+        if suggested
+        else None,
+    )
+
+
+def _orphans(
+    inputs: Inputs,
+    walked: Walk,
+    records: Sequence[Recommendation],
+    profiles: Sequence[PageProfile],
+) -> tuple[OrphanRescue, ...]:
+    """One per page guaranteed inbound links, by url: its suggested inbound links, why it was
+    left short, and its best sources in its hub, or any when it has none: anchored first, then
+    by score, then source PageRank, then url."""
+    if not walked.guaranteed:
+        return ()
+    pairs = walked.pairs
+    strength = {page.url: page.page_rank_percentile for page in inputs.pages}
+    into = pairs.loc[
+        pairs["target_url"].isin(frozenset(walked.guaranteed))
+        & ~pairs["excluded"]
+        & pairs["hub_ok"]
+    ]
+    into = (
+        into.assign(strength=into["source_url"].map(strength).astype("float64").fillna(-1.0))
+        .sort_values(
+            ["target_url", "anchored", "percentile", "strength", "source_url"],
+            ascending=[True, False, False, False, True],
+            kind="stable",
+        )
+        .groupby("target_url", sort=False)
+        .head(BEST_SOURCES)
+    )
+    usable = inputs.choices.loc[inputs.choices["phrase"].str.len() <= ANCHOR_MAX_CHARS]
+    chosen = usable.sort_values([*KEY_COLUMNS, "rank"], kind="stable").drop_duplicates(
+        list(KEY_COLUMNS)
+    )
+    phrases: dict[Pair, str] = {
+        (str(source), str(target)): str(phrase)
+        for source, target, phrase in chosen[[*KEY_COLUMNS, "phrase"]].itertuples(index=False)
+    }
+    suggested = {
+        (record.source_url, record.target_url): record.id for record in records if record.suggested
+    }
+    sources: defaultdict[str, list[RescueSource]] = defaultdict(list)
+    for row in into.itertuples(index=False):
+        key = (str(row.source_url), str(row.target_url))
+        sources[key[1]].append(
+            RescueSource(
+                source_url=key[0],
+                score=round(100 * float(row.percentile), 1),
+                tier=int(row.tier),
+                anchor=phrases.get(key),
+                source_page_rank_percentile=strength.get(key[0]),
+                recommendation_id=suggested.get(key),
+            )
+        )
+    inbound = Counter(target for _, target in suggested)
+    by_url = {profile.url: profile for profile in profiles}
+    return tuple(
+        OrphanRescue(
+            profile=by_url[page],
+            guaranteed=inputs.guarantee,
+            suggested_in=inbound[page],
+            sources=tuple(sources.get(page, ())),
+            unmet_reason=walked.unmet.get(page),
+        )
+        for page in walked.guaranteed
     )
 
 
@@ -1178,6 +1565,13 @@ def summarise_recommendations(report: RecommendationReport) -> str:
     ranked_by = report.scorer.value + (
         f" version {report.model_version}" if report.model_version else ""
     )
+    unmet = (
+        ", ".join(f"{reason.value} {n}" for reason, n in sorted(summary.guarantees_unmet.items()))
+        or "none"
+    )
+    gini = "none" if summary.inbound_gini is None else f"{summary.inbound_gini:.3f}"
+    top10 = "none" if summary.top10_inbound_share is None else f"{summary.top10_inbound_share:.1%}"
+    cap = report.max_suggested_inbound or "none"
     return "\n".join(
         [
             f"Recommendations run {report.run_id} of tenant {report.tenant_id}, ranked by "
@@ -1188,6 +1582,18 @@ def summarise_recommendations(report: RecommendationReport) -> str:
             f"{summary.sources_below_limit} with fewer links than the limit; "
             f"{report.pairs_not_assessed} ranked pairs passed without an anchor choice or a "
             "reason.",
+            f"{summary.suggested_links} links suggested within the page budgets (one per "
+            f"{report.words_per_link} words, less the existing links), {summary.reserve_links} "
+            f"reserves. {summary.guaranteed_pages} pages with fewer than "
+            f"{report.guaranteed_inbound_below} inbound links guaranteed "
+            f"{report.guaranteed_inbound_links}: {summary.orphan_slots} orphan slots placed, "
+            f"unmet {unmet}. {summary.orphans_reached} orphans reached, "
+            f"{summary.orphans_to_pillar} with a link up to their hub's main page; inbound Gini "
+            f"{gini}.",
+            f"Suggested links into one page capped at {cap}, hub main pages exempt: "
+            f"{summary.pages_at_cap} pages at the cap, {summary.links_moved_by_cap} links moved to "
+            f"a reserve, {summary.links_dropped_by_cap} left unfilled; the ten pages receiving "
+            f"the most take {top10} of the suggested links.",
             f"{summary.links_audited} existing links audited, {summary.unverified_links} "
             "unverified.",
             f"Pairs without an anchor: {unanchored}. {summary.target_fixes} target pages need a "

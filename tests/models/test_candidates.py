@@ -416,3 +416,96 @@ def test_linked_counts_must_match_the_report() -> None:
 def test_full_short_and_empty_must_match_the_entries() -> None:
     with pytest.raises(ValidationError, match="full, short and empty targets do not match"):
         candidate_set(report=report(full_targets=2, short_targets=0))
+
+
+# ── hub-main-page channel ───────────────────────────────────────────────────
+
+
+def with_pillar_pair() -> TargetCandidates:
+    """The full target plus one channel source, weaker than its nearest ones."""
+    return candidates(
+        target_url="example.com/full",
+        sources=("example.com/a", "example.com/b", "example.com/c"),
+        similarities=(0.9, 0.5, 0.45),
+        pillar_pairs=1,
+    )
+
+
+FLOORS: dict[str, object] = {
+    "pillar_floors": {"en": 0.4, "*": 0.3},
+    "pillar_floor_basis": {"en": "existing_links", "*": "candidate_pairs"},
+    "pillar_floor_links": {"en": 60, "*": 12},
+}
+
+
+def test_channel_sources_follow_the_nearest_ones_each_part_in_order() -> None:
+    entry = with_pillar_pair()
+    assert (entry.nearest, entry.pillar_pairs) == (2, 1)
+    # Past the cap, a channel source may be more similar than the last nearest one.
+    stronger = candidates(
+        sources=("example.com/a", "example.com/b", "example.com/c"),
+        similarities=(0.9, 0.5, 0.6),
+        pillar_pairs=1,
+    )
+    assert stronger.nearest == 2
+    with pytest.raises(ValidationError, match="ordered best first"):
+        candidates(
+            sources=("example.com/a", "example.com/b", "example.com/c", "example.com/d"),
+            similarities=(0.9, 0.5, 0.4, 0.45),
+            eligible=4,
+            pillar_pairs=2,
+        )
+    with pytest.raises(ValidationError, match="more pillar pairs than sources"):
+        candidates(pillar_pairs=3)
+
+
+def test_the_cap_holds_for_the_nearest_sources_and_channel_pairs_are_counted() -> None:
+    full = candidate_set()
+    targets = (with_pillar_pair(), *full.targets[1:])
+
+    found = candidate_set(
+        report=report(candidates=4, pillar_pairs=1, drop_rate=2 / 5, **FLOORS), targets=targets
+    )
+
+    assert found.report.candidates == 4
+    with pytest.raises(ValidationError, match="candidate count does not match"):
+        candidate_set(report=report(pillar_pairs=1, drop_rate=2 / 4, **FLOORS), targets=targets)
+    with pytest.raises(ValidationError, match="pillar pair count does not match"):
+        candidate_set(report=report(candidates=4, drop_rate=2 / 6), targets=targets)
+
+
+def test_the_drop_rate_is_over_the_nearest_candidates_only() -> None:
+    assert report(candidates=4, pillar_pairs=1, drop_rate=0.4, **FLOORS).drop_rate == 0.4
+    with pytest.raises(ValidationError, match="drop_rate is set exactly"):
+        report(
+            candidates=1,
+            pillar_pairs=1,
+            linked_nearer=0,
+            linked_pairs=0,
+            drop_rate=0.0,
+            **FLOORS,
+        )
+    with pytest.raises(ValidationError, match="more pillar pairs than candidates"):
+        report(pillar_pairs=4, **FLOORS)
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    [
+        ({**FLOORS, "pillar_floor_links": {"en": 60}}, "its basis and link count"),
+        ({**FLOORS, "pillar_floor_basis": {"en": "existing_links"}}, "its basis and link count"),
+        ({**FLOORS, "pillar_floors": {"en": 1.5, "*": 0.3}}, r"cosine in \[-1, 1\]"),
+        ({**FLOORS, "pillar_floor_links": {"en": -1, "*": 12}}, "cannot be negative"),
+        ({"pillar_pairs": 1, "candidates": 4, "drop_rate": 2 / 5}, "pillar pairs need a floor"),
+    ],
+)
+def test_pillar_floors_are_reported_whole(fields: dict[str, object], message: str) -> None:
+    assert report(**FLOORS).pillar_floor_basis["*"] == "candidate_pairs"
+    with pytest.raises(ValidationError, match=message):
+        report(**fields)
+
+
+def test_an_unknown_floor_basis_is_refused() -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        report(**{**FLOORS, "pillar_floor_basis": {"en": "guessed", "*": "candidate_pairs"}})
+    assert only_error(exc_info)["type"] == "literal_error"

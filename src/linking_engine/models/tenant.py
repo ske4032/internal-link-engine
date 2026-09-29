@@ -120,3 +120,16 @@ class TenantConfig(BaseSettings):
     max_recommendations_per_source: int = Field(default=10, ge=1)
     # Content gaps listed per source page beside its new links; 0 lists none.
     max_content_gaps_per_source: int = Field(default=3, ge=0)
+    # A page's suggested new links: one per this many body words, less its existing body links.
+    words_per_link: int = Field(default=200, ge=1)
+    # Inbound suggested links guaranteed to each page with fewer inbound body links than
+    # `guaranteed_inbound_below`; 1 guarantees orphans only.
+    guaranteed_inbound_links: int = Field(default=2, ge=0)
+    guaranteed_inbound_below: int = Field(default=1, ge=0)
+    # Suggested new links into one page per run, hub main pages exempt; 0 sets no cap. The
+    # default is provisional until measured across tenants.
+    max_suggested_inbound: int = Field(default=5, ge=0)
+    # The hub-main-page channel keeps pairs at least as similar as this share's quantile of
+    # the tenant's existing body links, or of its candidate pairs with fewer links than the minimum.
+    pillar_floor_quantile: float = Field(default=0.10, gt=0, lt=1)
+    pillar_floor_min_links: int = Field(default=50, ge=1)

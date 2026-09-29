@@ -104,6 +104,8 @@ def product(scorer: ScorerName = ScorerName.LEARNED, **fields: object) -> Produc
         "orphan_slot_share": 0.09,
         "orphan_page_share": 0.08,
         "orphans_reached": 0.95,
+        "orphans_to_pillar": 0.5,
+        "inbound_gini": 0.42,
         **fields,
     }
     return ProductMeasures.model_validate(values)

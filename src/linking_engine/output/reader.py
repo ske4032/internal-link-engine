@@ -4,7 +4,7 @@ stable order."""
 import re
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from typing import Final
+from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pydantic.alias_generators import to_camel
@@ -28,6 +28,7 @@ from linking_engine.models import (
     HubSummary,
     Listing,
     OrphanLabel,
+    OrphanRescue,
     PageDetail,
     PageProfile,
     Recommendation,
@@ -41,6 +42,7 @@ from linking_engine.output.collections import (
     DUPLICATES,
     EXCLUDED_PAGES,
     HUBS,
+    ORPHANS,
     PAGES,
     RECOMMENDATIONS,
     RUNS,
@@ -51,10 +53,16 @@ from linking_engine.output.collections import (
 )
 from linking_engine.urls import UrlKey
 
-# A cursor is the last item's ordinal: a canonical non-negative integer that fits int64.
-_ORDINAL: Final = re.compile(r"0|[1-9][0-9]{0,17}")
+# A cursor is the last item's ordinal, or its best rank in best-first order: a canonical
+# non-negative integer that fits int64.
+_CURSOR: Final = re.compile(r"0|[1-9][0-9]{0,17}")
 _EXCLUDED_KEYS: Final = {to_camel(field): field for field in ExcludedPage.model_fields}
 _AUTH_CODES: Final = frozenset({13, 18})  # Unauthorized, AuthenticationFailed
+
+
+# "page" is the stored order, by source page; "best" is the tenant's best-first order of new-link
+# actions, which lists those only.
+RecommendationOrder = Literal["page", "best"]
 
 
 class InvalidCursorError(ValueError):
@@ -70,6 +78,8 @@ class RecommendationFilter(BaseModel):
     target: UrlKey | None = None
     action_types: tuple[ActionType, ...] = ()
     tier: int | None = Field(default=None, ge=1)
+    suggested: bool | None = None
+    orphan_slot: bool | None = None
 
 
 class PageFilter(BaseModel):
@@ -103,6 +113,16 @@ class UnanchoredFilter(BaseModel):
     target: UrlKey | None = None
 
 
+class OrphanFilter(BaseModel):
+    """Exact-match filters on a run's pages guaranteed inbound links."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    orphan_label: OrphanLabel | None = None
+    # Fewer suggested links came in than guaranteed.
+    unmet: bool | None = None
+
+
 class ExcludedFilter(BaseModel):
     """Exact-match filter on the pages prepare-corpus kept out."""
 
@@ -134,6 +154,7 @@ class OutputReader:
         filters: RecommendationFilter,
         after: str | None = None,
         limit: int = 50,
+        order: RecommendationOrder = "page",
     ) -> Listing[Recommendation]:
         query: Document = {}
         if filters.source is not None:
@@ -144,8 +165,22 @@ class OutputReader:
             query["action_type"] = {"$in": [str(action) for action in filters.action_types]}
         if filters.tier is not None:
             query["tier"] = filters.tier
+        if filters.suggested is not None:
+            query["suggested"] = filters.suggested
+        if filters.orphan_slot is not None:
+            query["orphan_slot"] = filters.orphan_slot
+        if order == "best":
+            # Only new-link actions have a best rank; every rank is at least 1.
+            query["best_rank"] = {"$gte": 1}
         items, cursor, total = await self._page(
-            RECOMMENDATIONS, Recommendation, tenant_id, run_id, query, after, limit
+            RECOMMENDATIONS,
+            Recommendation,
+            tenant_id,
+            run_id,
+            query,
+            after,
+            limit,
+            key="best_rank" if order == "best" else "ordinal",
         )
         return Listing[Recommendation](items=items, next_cursor=cursor, total=total)
 
@@ -203,6 +238,24 @@ class OutputReader:
             outgoing=tuple(from_document(Recommendation, item) for item in outgoing),
             incoming_total=incoming,
         )
+
+    async def orphans(
+        self,
+        tenant_id: str,
+        run_id: str,
+        filters: OrphanFilter,
+        after: str | None = None,
+        limit: int = 50,
+    ) -> Listing[OrphanRescue]:
+        query: Document = {}
+        if filters.orphan_label is not None:
+            query["profile.orphan_label"] = str(filters.orphan_label)
+        if filters.unmet is not None:
+            query["unmet_reason"] = {"$ne": None} if filters.unmet else None
+        items, cursor, total = await self._page(
+            ORPHANS, OrphanRescue, tenant_id, run_id, query, after, limit
+        )
+        return Listing[OrphanRescue](items=items, next_cursor=cursor, total=total)
 
     async def hubs(
         self, tenant_id: str, run_id: str, after: str | None = None, limit: int = 50
@@ -310,25 +363,26 @@ class OutputReader:
         filters: Document,
         after: str | None,
         limit: int,
+        *,
+        key: str = "ordinal",
     ) -> tuple[tuple[M, ...], str | None, int]:
-        """Items after the cursor in ordinal order, the next cursor, and the filtered total."""
+        """Items after the cursor in ascending ``key`` order, the next cursor, and the filtered
+        total. ``key`` is unique within the run."""
         _require_tenant(tenant_id)
         _require_limit(limit)
         query: Document = {**filters, "tenantId": tenant_id, "runId": run_id}
-        page_query: Document = (
-            query if after is None else {**query, "ordinal": {"$gt": _ordinal(after)}}
-        )
+        page_query: Document = query if after is None else {**query, key: {"$gt": _cursor(after)}}
         with store_errors(f"read {collection}"):
             documents = (
                 await self._db[collection]
                 .find(page_query)
-                .sort("ordinal", ASCENDING)
+                .sort(key, ASCENDING)
                 .limit(limit + 1)
                 .to_list()
             )
             total = await self._db[collection].count_documents(query)
         items = tuple(from_document(model, document) for document in documents[:limit])
-        cursor = str(documents[limit - 1]["ordinal"]) if len(documents) > limit else None
+        cursor = str(documents[limit - 1][key]) if len(documents) > limit else None
         return items, cursor, total
 
 
@@ -346,8 +400,8 @@ def store_errors(what: str, *, write: bool = False) -> Iterator[None]:
         raise kind("mongodb", f"{what}: {error}") from error
 
 
-def _ordinal(cursor: str) -> int:
-    if not _ORDINAL.fullmatch(cursor):
+def _cursor(cursor: str) -> int:
+    if not _CURSOR.fullmatch(cursor):
         raise InvalidCursorError(f"invalid cursor {cursor!r}")
     return int(cursor)
 

@@ -71,6 +71,17 @@ class ExclusionReason(StrEnum):
     INSUFFICIENT_CONTENT = "INSUFFICIENT_CONTENT"
 
 
+class OrphanSlotReason(StrEnum):
+    """Why a page guaranteed inbound links got fewer than guaranteed."""
+
+    # No candidate source of tier 1 or 2 (in its hub, when it has one).
+    NO_RELEVANT_SOURCE = "NO_RELEVANT_SOURCE"
+    # Relevant sources exist, but none holds an anchor phrase for the page.
+    NO_ANCHOR = "NO_ANCHOR"
+    # Relevant anchored sources exist, but each has no budget or already gave an orphan slot.
+    SOURCES_FULL = "SOURCES_FULL"
+
+
 class OrphanLabel(StrEnum):
     """What still links to a crawled page that no body link reaches.
 

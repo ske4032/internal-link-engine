@@ -1,8 +1,10 @@
-"""retrieve_candidates on hand-made vectors through a fake repo, and the report maths.
+"""retrieve_candidates on hand-made vectors through a fake repo, the hub-main-page channel,
+and the report maths.
 
-The fake returns what the three tenant-scoped reads return: the target selection, the
-pool of vectors keyed by url in url order, and the tenant's link graph. Scoring is checked
-against hand-computed cosines, and on random vectors against a float64 brute force.
+The fake returns what the tenant-scoped reads return: the target selection, the pool of
+vectors keyed by url in url order, the copies, languages and hub members, and the tenant's link
+graph. Scoring is checked against hand-computed cosines, and on random vectors against a
+float64 brute force.
 """
 
 from __future__ import annotations
@@ -18,17 +20,26 @@ from structlog.testing import capture_logs
 from linking_engine.discovery.candidates import (
     PER_TARGET,
     TARGET_CHUNK,
+    add_pillar_pairs,
     candidate_report,
+    floor_of,
+    link_similarities,
     nearest_eligible,
+    page_pillars,
+    pillar_floors,
     retrieve_candidates,
     summarise_candidates,
 )
+from linking_engine.discovery.features import cache_key
 from linking_engine.errors import DatabaseReadError
 from linking_engine.models import (
+    ANY_LANGUAGE,
     CandidateReport,
     CandidateSet,
     CandidateTarget,
     LinkGraphSnapshot,
+    PageHub,
+    PillarFloor,
     TargetCandidates,
     TargetSelection,
 )
@@ -62,6 +73,9 @@ class FakeGraph:
     languages: dict[str, str] = field(default_factory=dict)
     # Pages stored as non-canonical duplicate copies.
     copies: frozenset[str] = frozenset()
+    # Pages in a hub, and the hubs' pillars.
+    hubs: dict[str, int] = field(default_factory=dict)
+    pillars: frozenset[str] = frozenset()
     reads: list[tuple[str, str, str | None]] = field(default_factory=list)
 
     async def candidate_targets(
@@ -91,6 +105,13 @@ class FakeGraph:
     async def page_languages(self, tenant_id: str) -> dict[str, str | None]:
         self.reads.append(("page_languages", tenant_id, None))
         return {u: self.languages.get(u) for u in sorted({*self.vectors, *self.no_vector})}
+
+    async def hub_members(self, tenant_id: str) -> list[PageHub]:
+        self.reads.append(("hub_members", tenant_id, None))
+        return [
+            PageHub(url=url, hub_id=hub, is_hub_pillar=url in self.pillars)
+            for url, hub in sorted(self.hubs.items())
+        ]
 
     async def link_graph(self, tenant_id: str) -> LinkGraphSnapshot:
         self.reads.append(("link_graph", tenant_id, None))
@@ -377,6 +398,7 @@ async def test_the_tenant_and_index_reach_every_read() -> None:
 
     assert sorted(graph.reads) == [
         ("candidate_targets", TENANT, "page_gnn"),
+        ("hub_members", TENANT, None),
         ("link_graph", TENANT, None),
         ("non_canonical_copies", TENANT, None),
         ("page_languages", TENANT, None),
@@ -779,3 +801,385 @@ async def test_without_stored_copies_every_duplicate_url_stays_in_the_pool() -> 
 
     assert found.report.non_canonical_excluded == 0
     assert by_url(found)[page("post")].sources[:2] == (page("blog/post"), page("news/post"))
+
+
+# ── hub-main-page channel ───────────────────────────────────────────────────
+
+HUB = 7
+PILLAR = page("hub/pillar")
+
+
+def at(degrees: float) -> list[float]:
+    """A unit vector whose cosine with the pillar's is cos(degrees)."""
+    radians = np.deg2rad(degrees)
+    return [float(np.cos(radians)), float(np.sin(radians))]
+
+
+def cos(a: float, b: float) -> float:
+    return float(np.cos(np.deg2rad(a - b)))
+
+
+ANGLES = {
+    PILLAR: 0.0,
+    page("close"): 5.0,
+    page("hub/near"): 10.0,
+    page("hub/german"): 12.0,
+    page("hub/linked"): 15.0,
+    page("hub/mid"): 30.0,
+    page("hub/far"): 80.0,
+}
+# The links' cosines are cos 15°, cos 25° and cos 75°: their median floor keeps /hub/near only.
+HUB_LINKS = [
+    (page("hub/linked"), PILLAR),
+    (page("close"), page("hub/mid")),
+    (page("hub/far"), page("close")),
+]
+
+
+def hub_tenant(**fields: Any) -> FakeGraph:
+    """A pillar whose nearest source is outside its hub, and hub pages at rising angles: one
+    German, one already linking to it."""
+    values: dict[str, Any] = {
+        "links": list(HUB_LINKS),
+        "languages": {url: "en" for url in ANGLES} | {page("hub/german"): "de"},
+        "hubs": {url: HUB for url in ANGLES if "/hub/" in url},
+        "pillars": frozenset({PILLAR}),
+        **fields,
+    }
+    return FakeGraph({url: at(angle) for url, angle in ANGLES.items()}, **values)
+
+
+def channel(
+    graph: FakeGraph, *, per_target: int = 1, quantile: float = 0.5, min_links: int = 2
+) -> tuple[dict[str, TargetCandidates], dict[str, PillarFloor]]:
+    urls = sorted(graph.vectors)
+    vectors = [graph.vectors[url] for url in urls]
+    languages = {url: graph.languages.get(url) for url in urls}
+    nearest = nearest_eligible(
+        urls, vectors, urls, graph.links, per_target=per_target, languages=languages
+    )
+    targets, floors = add_pillar_pairs(
+        urls,
+        vectors,
+        nearest,
+        graph.links,
+        languages,
+        graph.hubs,
+        {graph.hubs[url]: url for url in graph.pillars},
+        quantile=quantile,
+        min_links=min_links,
+    )
+    unchanged = [entry for entry in targets if entry.target_url != PILLAR]
+    assert unchanged == [entry for entry in nearest if entry.target_url != PILLAR]
+    return {entry.target_url: entry for entry in targets}, floors
+
+
+def test_the_channel_adds_hub_pages_above_the_floor_past_the_pillars_nearest() -> None:
+    targets, floors = channel(hub_tenant())
+
+    pillar = targets[PILLAR]
+    assert pillar.sources == (page("close"), page("hub/near"))
+    assert pillar.similarities == pytest.approx((cos(0, 5), cos(0, 10)), abs=1e-6)
+    assert (pillar.nearest, pillar.pillar_pairs) == (1, 1)
+    # Nothing past the cap for any other target, pillar pages of other hubs included.
+    assert {url: entry.pillar_pairs for url, entry in targets.items()} == {
+        url: int(url == PILLAR) for url in ANGLES
+    }
+    assert set(floors) == {"en"}
+    assert (floors["en"].basis, floors["en"].links) == ("existing_links", 3)
+    assert floors["en"].floor == pytest.approx(cos(5, 30), abs=1e-6)
+
+
+def test_the_floor_decides_which_hub_pages_join() -> None:
+    lenient, floors = channel(hub_tenant(), quantile=0.01)
+
+    # /hub/far is below every link; /hub/linked already links, /hub/german is German.
+    assert cos(0, 80) < floors["en"].floor < cos(0, 30)
+    assert lenient[PILLAR].sources == (page("close"), page("hub/near"), page("hub/mid"))
+    assert lenient[PILLAR].pillar_pairs == 2
+
+
+def test_a_hub_page_exactly_at_the_floor_joins_and_one_just_below_does_not() -> None:
+    # 3-4-5 vectors give the one link and the hub page the same float32 cosine, 0.6.
+    vectors: dict[str, list[float]] = {
+        PILLAR: [1, 0],
+        page("close"): [4, 3],
+        page("linking"): [3, 4],
+        page("hub/at-floor"): [3, 4],
+        page("hub/below"): [3, 4.001],
+    }
+    graph = FakeGraph(
+        vectors,
+        links=[(page("linking"), PILLAR)],
+        languages=dict.fromkeys(vectors, "en"),
+        hubs=dict.fromkeys((PILLAR, page("hub/at-floor"), page("hub/below")), HUB),
+        pillars=frozenset({PILLAR}),
+    )
+
+    targets, floors = channel(graph, min_links=1)
+
+    pillar = targets[PILLAR]
+    assert floors["en"].floor == pytest.approx(0.6)
+    assert pillar.sources == (page("close"), page("hub/at-floor"))
+    assert pillar.similarities[-1] == floors["en"].floor
+    assert pillar.pillar_pairs == 1
+
+
+def test_a_hub_page_already_among_the_nearest_is_not_added_twice() -> None:
+    targets, _ = channel(hub_tenant(), per_target=2)
+
+    assert targets[PILLAR].sources == (page("close"), page("hub/near"))
+    assert targets[PILLAR].pillar_pairs == 0
+
+
+def test_only_a_hub_pillar_gets_channel_pairs() -> None:
+    graph = hub_tenant(pillars=frozenset())
+
+    urls = sorted(graph.vectors)
+    vectors = [graph.vectors[url] for url in urls]
+    nearest = nearest_eligible(urls, vectors, urls, graph.links, per_target=1)
+    targets, floors = add_pillar_pairs(
+        urls, vectors, nearest, graph.links, {}, graph.hubs, {}, quantile=0.5, min_links=2
+    )
+
+    assert (targets, floors) == (nearest, {})
+    with pytest.raises(ValueError, match="already carry pillar pairs"):
+        add_pillar_pairs(
+            urls,
+            vectors,
+            tuple(channel(hub_tenant())[0].values()),
+            graph.links,
+            {},
+            graph.hubs,
+            {HUB: PILLAR},
+            quantile=0.5,
+            min_links=2,
+        )
+
+
+def test_a_pillar_without_open_hub_pages_or_a_floor_keeps_its_nearest_only() -> None:
+    graph = hub_tenant()
+    urls = sorted(graph.vectors)
+    vectors = [graph.vectors[url] for url in urls]
+    languages = {url: graph.languages.get(url) for url in urls}
+    nearest = nearest_eligible(urls, vectors, urls, graph.links, per_target=1, languages=languages)
+    every_hub_page = [(url, PILLAR) for url in graph.hubs if url != PILLAR]
+
+    linked, linked_floors = add_pillar_pairs(
+        urls,
+        vectors,
+        nearest,
+        every_hub_page,
+        languages,
+        graph.hubs,
+        {HUB: PILLAR},
+        quantile=0.5,
+        min_links=2,
+    )
+    # No links enough and no candidate pairs: no floor, so nothing is added.
+    unfloored, floors = add_pillar_pairs(
+        urls,
+        vectors,
+        [
+            TargetCandidates.model_validate(
+                {**entry.model_dump(), "sources": (), "similarities": ()}
+            )
+            for entry in nearest
+        ],
+        [],
+        languages,
+        graph.hubs,
+        {HUB: PILLAR},
+        quantile=0.5,
+        min_links=2,
+    )
+
+    assert linked == nearest
+    assert set(linked_floors) == {"en"}
+    assert floors == {}
+    assert all(entry.pillar_pairs == 0 for entry in unfloored)
+    with pytest.raises(ValueError, match="one row per url"):
+        add_pillar_pairs(
+            urls, vectors[:2], nearest, [], languages, graph.hubs, {}, quantile=0.5, min_links=2
+        )
+
+
+def test_every_hub_page_but_the_pillar_maps_to_its_pillar() -> None:
+    members = [
+        PageHub(url=page("a"), hub_id=1, is_hub_pillar=True),
+        PageHub(url=page("b"), hub_id=1),
+        PageHub(url=page("c"), hub_id=2),
+        PageHub(url=page("d"), hub_id=3, is_hub_pillar=True),
+    ]
+
+    assert page_pillars(members, TENANT) == {page("b"): page("a")}
+    with pytest.raises(DatabaseReadError, match="hub 1 of 'acme' has more than one pillar"):
+        page_pillars([*members, PageHub(url=page("e"), hub_id=1, is_hub_pillar=True)], TENANT)
+
+
+def test_link_cosines_are_distinct_same_language_pool_links_per_language() -> None:
+    urls = [page("a"), page("b"), page("c"), page("d"), page("zero")]
+    vectors = [[1, 0], [0, 1], [1, 1], [1, 0], [0, 0]]
+    languages = {page("a"): "en", page("b"): "en", page("c"): "en", page("zero"): "en"}
+    links = [
+        (page("a"), page("c")),
+        (page("a"), page("c")),
+        (page("c"), page("a")),
+        (page("a"), page("a")),
+        (page("a"), page("b")),
+        (page("a"), page("d")),
+        (page("a"), page("outside")),
+        (page("zero"), page("a")),
+    ]
+
+    found = link_similarities(urls, vectors, links, languages, chunk_size=2)
+
+    assert set(found) == {"en"}
+    assert sorted(found["en"].tolist()) == pytest.approx([0.0, 0.0, 2**-0.5, 2**-0.5])
+    assert link_similarities(urls, vectors, [], languages) == {}
+    with pytest.raises(ValueError, match="chunk_size"):
+        link_similarities(urls, vectors, links, languages, chunk_size=0)
+    with pytest.raises(ValueError, match="one row per url"):
+        link_similarities(urls, vectors[:2], links, languages)
+
+
+def test_a_language_short_of_links_falls_back_to_the_tenant_then_the_candidates() -> None:
+    links = {
+        "en": np.linspace(0.2, 0.8, 7),
+        "de": np.array([0.9, 0.95]),
+        None: np.array([0.1]),
+    }
+    candidates = np.linspace(0.5, 0.9, 5)
+
+    own = pillar_floors(links, candidates, {"en", "de"}, quantile=0.5, min_links=5)
+    tenant = pillar_floors(links, candidates, {"de", None}, quantile=0.5, min_links=10)
+    pairs = pillar_floors(links, candidates, {"de"}, quantile=0.5, min_links=11)
+
+    assert own["en"] == PillarFloor(floor=0.5, basis="existing_links", links=7)
+    assert own[ANY_LANGUAGE] == PillarFloor(
+        floor=float(np.median([*links["en"], 0.9, 0.95, 0.1])), basis="existing_links", links=10
+    )
+    assert set(own) == {"en", ANY_LANGUAGE}
+    assert floor_of("de", own) == own[ANY_LANGUAGE]
+    assert floor_of("en", own) == own["en"]
+    assert set(tenant) == {ANY_LANGUAGE}
+    assert tenant[ANY_LANGUAGE].basis == "existing_links"
+    assert set(pairs) == {ANY_LANGUAGE}
+    assert (pairs[ANY_LANGUAGE].basis, pairs[ANY_LANGUAGE].links) == ("candidate_pairs", 10)
+    assert pairs[ANY_LANGUAGE].floor == pytest.approx(0.7)
+    assert pillar_floors({}, [], {"en"}, quantile=0.5, min_links=1) == {}
+    assert floor_of("en", {}) is None
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [({"quantile": 0.0, "min_links": 1}, "quantile"), ({"quantile": 0.5, "min_links": 0}, "min")],
+)
+def test_the_floor_refuses_meaningless_settings(options: dict[str, Any], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        pillar_floors({}, [], {"en"}, **options)
+
+
+async def test_retrieval_reports_the_channel_with_the_tenants_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TENANT_PILLAR_FLOOR_QUANTILE", "0.5")
+    monkeypatch.setenv("TENANT_PILLAR_FLOOR_MIN_LINKS", "2")
+
+    found = await retrieve(hub_tenant(), per_target=1)
+
+    report = found.report
+    pillar = by_url(found)[PILLAR]
+    assert pillar.sources == (page("close"), page("hub/near"))
+    # The German page is alone in its language, so it has no source.
+    assert (report.pillar_pairs, report.candidates) == (1, len(ANGLES))
+    assert (report.max_per_target, report.full_targets, report.empty_targets) == (1, 6, 1)
+    assert report.pillar_floor_basis == {"en": "existing_links"}
+    assert report.pillar_floor_links == {"en": 3}
+    assert report.pillar_floors["en"] == pytest.approx(cos(5, 30), abs=1e-6)
+    summary = summarise_candidates(report)
+    assert "1 of the candidates are hub pages" in summary
+    assert "en 0.906 from existing links (3 links)" in summary
+
+
+async def test_a_tenant_short_of_links_holds_the_channel_to_its_candidate_pairs() -> None:
+    found = await retrieve(hub_tenant(), per_target=1)
+
+    report = found.report
+    nearest = [s for entry in found.targets for s in entry.similarities[: entry.nearest]]
+    assert report.pillar_floor_basis == {ANY_LANGUAGE: "candidate_pairs"}
+    assert report.pillar_floor_links == {ANY_LANGUAGE: 3}
+    assert report.pillar_floors[ANY_LANGUAGE] == pytest.approx(np.quantile(nearest, 0.1))
+    assert "tenant-wide" in summarise_candidates(report)
+
+
+async def test_each_tenant_gets_a_floor_from_its_own_links(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TENANT_PILLAR_FLOOR_MIN_LINKS", "2")
+    close_links = hub_tenant(links=[(page("hub/near"), page("close")), (PILLAR, page("close"))])
+
+    loose = await retrieve(hub_tenant(), per_target=1)
+    tight = await retrieve(close_links, "acme-two", per_target=1)
+
+    assert loose.report.pillar_floors["en"] < tight.report.pillar_floors["en"]
+    assert by_url(loose)[PILLAR].sources[1:] == (page("hub/near"), page("hub/mid"))
+    # Every hub page is further from the pillar than the tight tenant's linked pages are apart.
+    assert by_url(tight)[PILLAR].pillar_pairs == 0
+
+
+async def test_a_held_out_view_can_return_a_hidden_link_as_a_channel_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TENANT_PILLAR_FLOOR_QUANTILE", "0.5")
+    monkeypatch.setenv("TENANT_PILLAR_FLOOR_MIN_LINKS", "2")
+    graph = hub_tenant(links=[*HUB_LINKS, (page("hub/near"), PILLAR)])
+
+    stored = await retrieve(graph, per_target=1)
+    held = await retrieve(graph, per_target=1, links=HUB_LINKS)
+
+    assert page("hub/near") not in by_url(stored)[PILLAR].sources
+    assert by_url(held)[PILLAR].sources[1:] == (page("hub/near"),)
+
+
+async def test_a_hub_page_without_a_vector_is_never_a_channel_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TENANT_PILLAR_FLOOR_QUANTILE", "0.01")
+    monkeypatch.setenv("TENANT_PILLAR_FLOOR_MIN_LINKS", "2")
+    blank = page("hub/blank")
+    graph = hub_tenant(no_vector=(blank,))
+    graph.hubs[blank] = HUB
+    graph.languages[blank] = "en"
+
+    found = await retrieve(graph, per_target=1)
+
+    pillar = by_url(found)[PILLAR]
+    assert pillar.sources == (page("close"), page("hub/near"), page("hub/mid"))
+    assert (pillar.pillar_pairs, found.report.pillar_pairs) == (2, 2)
+
+
+async def test_a_hub_with_two_pillars_fails_the_read() -> None:
+    graph = hub_tenant(pillars=frozenset({PILLAR, page("hub/near")}))
+
+    with pytest.raises(DatabaseReadError, match=f"hub {HUB} of 'acme' has more than one pillar"):
+        await retrieve(graph)
+
+
+def test_a_channel_pair_changes_the_feature_cache_key() -> None:
+    targets, _ = channel(hub_tenant())
+    without = [
+        entry
+        if entry.target_url != PILLAR
+        else TargetCandidates.model_validate(
+            {
+                **entry.model_dump(),
+                "sources": entry.sources[:1],
+                "similarities": entry.similarities[:1],
+                "pillar_pairs": 0,
+            }
+        )
+        for entry in targets.values()
+    ]
+
+    assert cache_key(TENANT, targets.values(), {}) != cache_key(TENANT, without, {})

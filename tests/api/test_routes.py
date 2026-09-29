@@ -31,10 +31,13 @@ from linking_engine.models import (
     IssueFlag,
     Listing,
     OrphanLabel,
+    OrphanRescue,
+    OrphanSlotReason,
     PageDetail,
     PageProfile,
     Recommendation,
     RecommendationStatus,
+    RescueSource,
     RunInfo,
     ScorerName,
     SiteSummary,
@@ -46,6 +49,7 @@ from linking_engine.output.collections import (
     BRIDGES,
     DUPLICATES,
     HUBS,
+    ORPHANS,
     PAGES,
     RECOMMENDATIONS,
     RUNS,
@@ -86,6 +90,7 @@ class Output:
     duplicates: tuple[DuplicateGroup, ...]
     unanchored: tuple[UnanchoredOut, ...]
     target_fixes: tuple[TargetFix, ...]
+    orphans: tuple[OrphanRescue, ...]
 
 
 @dataclass(frozen=True)
@@ -109,6 +114,10 @@ def run_info(tenant: str, run_id: str, *, complete: bool, pages: int) -> RunInfo
         package_version="0.1.0",
         limit_per_source=10,
         content_gap_limit=3,
+        words_per_link=200,
+        guaranteed_inbound_links=1,
+        guaranteed_inbound_below=1,
+        max_suggested_inbound=5,
         summary=SiteSummary(
             pages=pages,
             dead_end_pages=1,
@@ -129,7 +138,16 @@ def run_info(tenant: str, run_id: str, *, complete: bool, pages: int) -> RunInfo
 
 
 def new_link(
-    tenant: str, run_id: str, source: str, target: str, rank: int, *, gap: bool = False
+    tenant: str,
+    run_id: str,
+    source: str,
+    target: str,
+    rank: int,
+    *,
+    best: int,
+    gap: bool = False,
+    suggested: bool = False,
+    orphan_slot: bool = False,
 ) -> Recommendation:
     action = ActionType.CONTENT_GAP if gap else ActionType.ADD_LINK
     anchor = AnchorCandidate(
@@ -152,6 +170,9 @@ def new_link(
         score=80.0 - rank,
         tier=rank,
         rank_in_source=rank,
+        best_rank=best,
+        suggested=suggested,
+        orphan_slot=orphan_slot,
         status=RecommendationStatus.PENDING,
         proposed_anchors=None if gap else (anchor,),
         rationale="baseline scorer; strongest signal content cosine",
@@ -188,23 +209,30 @@ def profile(url: str, **fields: object) -> PageProfile:
 
 
 def output_a(tenant: str, run_id: str) -> Output:
+    slot = new_link(tenant, run_id, A, B, 1, best=1, suggested=True, orphan_slot=True)
+    pages = (
+        profile(A, hub_id=0, is_hub_pillar=True, duplicate_group=0, is_canonical=True),
+        profile(B, hub_id=0, inbound=0, is_orphan=True, orphan_label=OrphanLabel.MENUS_ONLY),
+        profile(
+            C,
+            hub_id=1,
+            inbound=0,
+            is_orphan=True,
+            orphan_label=OrphanLabel.NOT_LINKED,
+            is_dead_end=True,
+        ),
+        profile(D, duplicate_group=0, is_canonical=False),
+    )
     return Output(
         run=run_info(tenant, run_id, complete=True, pages=4),
         recommendations=(
-            new_link(tenant, run_id, A, B, 1),
-            new_link(tenant, run_id, A, C, 2, gap=True),
+            slot,
+            new_link(tenant, run_id, A, C, 2, best=3, gap=True),
             verdict(tenant, run_id, A, D, 0, ActionType.REMOVE),
-            new_link(tenant, run_id, B, A, 1),
+            new_link(tenant, run_id, B, A, 1, best=2),
             verdict(tenant, run_id, C, A, 2, ActionType.FIX),
         ),
-        pages=(
-            profile(A, hub_id=0, is_hub_pillar=True, duplicate_group=0, is_canonical=True),
-            profile(B, hub_id=0, is_orphan=True, orphan_label=OrphanLabel.MENUS_ONLY),
-            profile(
-                C, hub_id=1, is_orphan=True, orphan_label=OrphanLabel.NOT_LINKED, is_dead_end=True
-            ),
-            profile(D, duplicate_group=0, is_canonical=False),
-        ),
+        pages=pages,
         hubs=(
             HubSummary(
                 hub_id=0,
@@ -276,6 +304,30 @@ def output_a(tenant: str, run_id: str) -> Output:
                 best_sources=(B,),
             ),
         ),
+        orphans=(
+            OrphanRescue(
+                profile=pages[1],
+                guaranteed=1,
+                suggested_in=1,
+                sources=(
+                    RescueSource(
+                        source_url=A,
+                        score=79.0,
+                        tier=1,
+                        anchor="trail shoes",
+                        source_page_rank_percentile=0.8,
+                        recommendation_id=slot.id,
+                    ),
+                ),
+            ),
+            OrphanRescue(
+                profile=pages[2],
+                guaranteed=1,
+                suggested_in=0,
+                sources=(RescueSource(source_url=B, score=41.5, tier=2),),
+                unmet_reason=OrphanSlotReason.NO_ANCHOR,
+            ),
+        ),
     )
 
 
@@ -283,8 +335,11 @@ def output_b(tenant: str, run_id: str) -> Output:
     """The same urls, other content."""
     return Output(
         run=run_info(tenant, run_id, complete=True, pages=2),
-        recommendations=(new_link(tenant, run_id, A, D, 1), new_link(tenant, run_id, D, A, 1)),
-        pages=(profile(A, hub_id=5), profile(D, hub_id=5)),
+        recommendations=(
+            new_link(tenant, run_id, A, D, 1, best=2, suggested=True),
+            new_link(tenant, run_id, D, A, 1, best=1, suggested=True, orphan_slot=True),
+        ),
+        pages=(profile(A, hub_id=5), profile(D, hub_id=5, inbound=0, is_orphan=True)),
         hubs=(
             HubSummary(hub_id=5, size=2, orphan_pages=0, dead_end_pages=0, recommendations_in=2),
         ),
@@ -300,6 +355,14 @@ def output_b(tenant: str, run_id: str) -> Output:
             ),
         ),
         target_fixes=(),
+        orphans=(
+            OrphanRescue(
+                profile=profile(D, hub_id=5, inbound=0, is_orphan=True),
+                guaranteed=1,
+                suggested_in=1,
+                sources=(RescueSource(source_url=A, score=79.0, tier=1, anchor="trail shoes"),),
+            ),
+        ),
     )
 
 
@@ -316,6 +379,7 @@ async def write(db: AsyncDatabase[Document], output: Output) -> None:
         (DUPLICATES, output.duplicates),
         (UNANCHORED, output.unanchored),
         (TARGET_FIXES, output.target_fixes),
+        (ORPHANS, output.orphans),
     )
     for collection, models in collections:
         if models:
@@ -364,7 +428,12 @@ async def served(db: AsyncDatabase[Document], mongo: MongoRepo, tenant: str) -> 
         )
     )
     await db[RECOMMENDATIONS].insert_one(
-        to_document(new_link(tenant, rerun, C, D, 1), tenant_id=tenant, run_id=rerun, ordinal=0)
+        to_document(
+            new_link(tenant, rerun, C, D, 1, best=1, suggested=True),
+            tenant_id=tenant,
+            run_id=rerun,
+            ordinal=0,
+        )
     )
     excluded = tuple(
         ExcludedPage(url=url, reason=reason, label="excluded", words=50, link_words=45, links=9)
@@ -449,6 +518,54 @@ async def test_recommendation_filters_are_exact_on_normalised_urls(
     assert await items({"tier": 2}) == (served_recommendations[1],)
     assert await items({"source": A, "action_type": "REMOVE"}) == (served_recommendations[2],)
     assert await items({"source": "https://example.com/guides/c", "tier": 1}) == ()
+    assert await items({"suggested": "true"}) == (served_recommendations[0],)
+    assert await items({"suggested": "false", "source": A}) == served_recommendations[1:3]
+    assert await items({"orphan_slot": "true"}) == (served_recommendations[0],)
+    assert await items({"orphan_slot": "false", "action_type": "ADD_LINK"}) == (
+        served_recommendations[3],
+    )
+    assert await items({"suggested": "false", "action_type": "ADD_LINK"}) == (
+        served_recommendations[3],
+    )
+
+
+async def test_the_suggested_and_orphan_slot_filters_document_what_false_matches(
+    api: httpx.AsyncClient,
+) -> None:
+    response = await api.get("/openapi.json")
+
+    assert response.status_code == 200
+    operation = response.json()["paths"]["/v1/tenants/{tenant}/recommendations"]["get"]
+    described = {
+        parameter["name"]: parameter.get("description", "") for parameter in operation["parameters"]
+    }
+    assert "content gaps" in described["suggested"]
+    assert "action_type=ADD_LINK" in described["suggested"]
+    assert "false: every other record." in described["orphan_slot"]
+
+
+async def test_best_first_order_walks_new_link_actions_across_pages(
+    api: httpx.AsyncClient, served: Served
+) -> None:
+    recommendations = served.output.recommendations
+    best_first = (recommendations[0], recommendations[3], recommendations[1])
+
+    async def listing(params: Params) -> Listing[Recommendation]:
+        response = await get(api, served, "/recommendations", params)
+        assert response.status_code == 200
+        return Listing[Recommendation].model_validate(response.json())
+
+    first = await listing({"order": "best", "limit": 2})
+    rest = await listing({"order": "best", "limit": 2, "after": str(first.next_cursor)})
+    everything = await listing({"order": "best"})
+
+    assert (first.items, first.next_cursor, first.total) == (best_first[:2], "2", 3)
+    assert (rest.items, rest.next_cursor, rest.total) == (best_first[2:], None, 3)
+    assert everything.items == best_first
+    assert await listing({"order": "best", "limit": 2}) == first
+    assert (await listing({"order": "best", "suggested": "false"})).items == best_first[1:]
+    assert (await listing({"order": "best", "target": A})).items == (recommendations[3],)
+    assert (await listing({"order": "page"})).items == recommendations
 
 
 @pytest.mark.parametrize(
@@ -463,6 +580,10 @@ async def test_recommendation_filters_are_exact_on_normalised_urls(
         {"after": "-1"},
         {"after": "next"},
         {"after": "01"},
+        {"order": "worst"},
+        {"order": "best", "after": "next"},
+        {"suggested": "sometimes"},
+        {"orphan_slot": "2"},
     ],
 )
 async def test_invalid_listing_parameters_get_422(
@@ -515,9 +636,31 @@ async def test_pages_and_orphans_are_filtered(api: httpx.AsyncClient, served: Se
     assert await urls("/pages", {"orphan_label": "NOT_LINKED"}) == [C]
     assert await urls("/pages", {"dead_end": "true"}) == [C]
     assert await urls("/pages", {"duplicate": "false"}) == [B, C]
-    assert await urls("/orphans") == [B, C]
-    assert await urls("/orphans", {"orphan_label": "MENUS_ONLY"}) == [B]
     assert (await get(api, served, "/pages", {"hub": -1})).status_code == 422
+
+
+async def test_orphans_serve_each_guaranteed_page_with_its_sources(
+    api: httpx.AsyncClient, served: Served
+) -> None:
+    rescues = served.output.orphans
+
+    async def listing(params: Params | None = None) -> Listing[OrphanRescue]:
+        response = await get(api, served, "/orphans", params)
+        assert response.status_code == 200
+        return Listing[OrphanRescue].model_validate(response.json())
+
+    first = await listing({"limit": 1})
+    rest = await listing({"limit": 1, "after": str(first.next_cursor)})
+
+    assert (await listing()).items == rescues
+    assert (first.items, first.next_cursor, first.total) == (rescues[:1], "0", 2)
+    assert (rest.items, rest.next_cursor) == (rescues[1:], None)
+    assert (await listing({"orphan_label": "MENUS_ONLY"})).items == rescues[:1]
+    assert (await listing({"unmet": "true"})).items == rescues[1:]
+    assert (await listing({"unmet": "false"})).items == rescues[:1]
+    assert (await listing({"unmet": "false", "orphan_label": "NOT_LINKED"})).items == ()
+    assert (await get(api, served, "/orphans", {"unmet": "perhaps"})).status_code == 422
+    assert (await get(api, served, "/orphans", {"orphan_label": "NOWHERE"})).status_code == 422
 
 
 async def test_page_detail_is_served_by_url(api: httpx.AsyncClient, served: Served) -> None:

@@ -48,6 +48,12 @@ _TENANT_FIELD_NAMES = (
     "diversity_cap_pct",
     "max_recommendations_per_source",
     "max_content_gaps_per_source",
+    "words_per_link",
+    "guaranteed_inbound_links",
+    "guaranteed_inbound_below",
+    "max_suggested_inbound",
+    "pillar_floor_quantile",
+    "pillar_floor_min_links",
 )
 
 # Prefixes a pydantic-settings model might plausibly be configured with.

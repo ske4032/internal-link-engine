@@ -131,6 +131,13 @@ class Recommendation(BaseModel):
     # Priority band, 1 highest, from the tenant's tier shares.
     tier: int | None = Field(default=None, ge=1)
     rank_in_source: int | None = Field(default=None, ge=1)
+    # Place in the tenant's site-wide best-first order of new-link actions (1 best); None for
+    # audit verdicts.
+    best_rank: int | None = Field(default=None, ge=1)
+    # ADD_LINK within the source page's link budget; the page's other links are reserves.
+    suggested: bool = False
+    # ADD_LINK placed to meet a target page's guaranteed inbound links; always suggested.
+    orphan_slot: bool = False
     # Ordinal of the existing link in the source body; (source_url, position) identifies it.
     position: int | None = Field(default=None, ge=0)
     status: RecommendationStatus
@@ -167,6 +174,12 @@ class Recommendation(BaseModel):
             raise ValueError("proposed_anchors is ADD_LINK and REANCHOR only, and never empty")
         if self.fix_target is not None and action is not ActionType.FIX:
             raise ValueError("fix_target is set for FIX only")
+        if (self.best_rank is None) == (action in NEW_LINK_ACTIONS):
+            raise ValueError("best_rank is set exactly for new-link actions")
+        if (self.suggested or self.orphan_slot) and action is not ActionType.ADD_LINK:
+            raise ValueError("suggested and orphan_slot are ADD_LINK only")
+        if self.orphan_slot and not self.suggested:
+            raise ValueError("an orphan slot is always suggested")
         if self.bridge is not None and action is not ActionType.ADD_LINK:
             raise ValueError("bridge is set for ADD_LINK only")
         if list(self.issue_flags) != sorted(set(self.issue_flags)):

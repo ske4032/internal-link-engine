@@ -29,6 +29,7 @@ from linking_engine.models import (
     ExclusionReason,
     IssueFlag,
     OrphanLabel,
+    OrphanSlotReason,
     RecommendationReport,
     ScorerName,
     SiteSummary,
@@ -58,6 +59,10 @@ def report(tenant: str = TENANT) -> RecommendationReport:
         model_version="4",
         limit_per_source=10,
         content_gap_limit=3,
+        words_per_link=200,
+        guaranteed_inbound_links=2,
+        guaranteed_inbound_below=1,
+        max_suggested_inbound=5,
         summary=SiteSummary(
             pages=12,
             excluded_pages={ExclusionReason.SITEMAP: 1},
@@ -77,6 +82,18 @@ def report(tenant: str = TENANT) -> RecommendationReport:
             audit_flags={IssueFlag.GENERIC: 5},
             unanchored={UnanchoredReason.TARGET_PAGE_HAS_NO_KEYWORD: 7},
             target_fixes=2,
+            suggested_links=14,
+            reserve_links=6,
+            guaranteed_pages=3,
+            orphan_slots=2,
+            guarantees_unmet={OrphanSlotReason.NO_ANCHOR: 1},
+            orphans_reached=2,
+            orphans_to_pillar=1,
+            inbound_gini=0.42,
+            pages_at_cap=3,
+            links_moved_by_cap=4,
+            links_dropped_by_cap=1,
+            top10_inbound_share=0.35,
         ),
         pairs_not_assessed=1,
         seconds=2.5,
@@ -102,6 +119,10 @@ def test_a_run_logs_its_counts_report_and_description(local_mlflow: str) -> None
     assert params == {
         "limit_per_source": "10",
         "content_gap_limit": "3",
+        "words_per_link": "200",
+        "guaranteed_inbound_links": "2",
+        "guaranteed_inbound_below": "1",
+        "max_suggested_inbound": "5",
         "scorer": "learned",
         "model_version": "4",
     }
@@ -119,12 +140,31 @@ def test_a_run_logs_its_counts_report_and_description(local_mlflow: str) -> None
     )
     assert metrics["unanchored_target_page_has_no_keyword"] == 7.0
     assert (metrics["flag_generic"], metrics["excluded_sitemap"]) == (5.0, 1.0)
+    assert (metrics["suggested_links"], metrics["reserve_links"], metrics["orphan_slots"]) == (
+        14.0,
+        6.0,
+        2.0,
+    )
+    assert (metrics["guaranteed_pages"], metrics["orphans_reached"]) == (3.0, 2.0)
+    assert (metrics["orphans_to_pillar"], metrics["inbound_gini"]) == (1.0, 0.42)
+    assert (metrics["guarantees_unmet"], metrics["unmet_no_anchor"]) == (1.0, 1.0)
+    assert (metrics["unmet_no_relevant_source"], metrics["unmet_sources_full"]) == (0.0, 0.0)
+    assert (metrics["pages_at_cap"], metrics["top10_inbound_share"]) == (3.0, 0.35)
+    assert (metrics["links_moved_by_cap"], metrics["links_dropped_by_cap"]) == (4.0, 1.0)
     assert load_text(f"runs:/{run_id}/summary.md") == SUMMARY
     assert load_dict(f"runs:/{run_id}/metrics.json") == metrics
     assert load_dict(f"runs:/{run_id}/report.json")["summary"]["pages"] == 12
     experiment = MlflowClient(local_mlflow).get_experiment_by_name(analytics_experiment(TENANT))
     assert experiment is not None
     assert run.info.experiment_id == experiment.experiment_id
+
+
+def test_a_run_without_suggested_links_logs_no_gini_or_top_ten_share() -> None:
+    unset = {"inbound_gini": None, "top10_inbound_share": None}
+    quiet = report().model_copy(update={"summary": report().summary.model_copy(update=unset)})
+
+    assert not set(unset) & set(recommendation_metrics(quiet))
+    assert set(unset) <= set(recommendation_metrics(report()))
 
 
 def test_no_quality_run_gives_no_snapshot_and_creates_no_experiment(local_mlflow: str) -> None:

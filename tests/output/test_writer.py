@@ -53,6 +53,10 @@ def run_info(tenant: str, run_id: str) -> RunInfo:
         package_version="0.1.0",
         limit_per_source=10,
         content_gap_limit=3,
+        words_per_link=200,
+        guaranteed_inbound_links=2,
+        guaranteed_inbound_below=1,
+        max_suggested_inbound=5,
     )
 
 

@@ -18,6 +18,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import structlog
 
+from linking_engine.discovery.candidates import page_pillars
 from linking_engine.discovery.features import FEATURE_COLUMNS, KEY_COLUMNS, code_digest
 from linking_engine.discovery.scoring import default_weights, score_frame
 from linking_engine.errors import DatabaseError
@@ -225,7 +226,10 @@ async def _product_measures(
             return (), UNREADABLE_ANCHOR_CHOICES
         if not features.pairs:
             return (), NO_PRODUCTION_PAIRS
-        measured = await asyncio.to_thread(_measure, matrix, weights, orphans, trained, plain)
+        pillars = page_pillars(await graph.hub_members(tenant_id), tenant_id)
+        measured = await asyncio.to_thread(
+            _measure, matrix, weights, orphans, pillars, trained, plain
+        )
     except (DatabaseError, OSError, pa.ArrowException) as error:
         log.warning(
             "ranker.product_skipped",
@@ -444,6 +448,7 @@ def _measure(
     matrix: Path,
     weights: ScorerWeights,
     orphans: Set[str],
+    pillars: Mapping[str, str],
     trained: Trained,
     plain: Trained,
 ) -> tuple[ProductMeasures, ...]:
@@ -458,7 +463,7 @@ def _measure(
             predict(model, model.columns, _batches(matrix, model.columns))
         )
     return tuple(
-        product_measures(frame, scorer.value, scorer, orphans)
+        product_measures(frame, scorer.value, scorer, orphans, pillars=pillars)
         for scorer in (ScorerName.LEARNED, ScorerName.PLAIN, ScorerName.BASELINE)
     )
 

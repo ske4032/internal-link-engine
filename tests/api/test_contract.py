@@ -1,4 +1,4 @@
-"""The output API against its own OpenAPI schema (#89): every route fuzzed with valid and
+"""The output API against its own OpenAPI schema (#89, #90): every route fuzzed with valid and
 malformed input, a valid key and the fixture tenant's stored output, each response checked for
 its documented status, media type and schema, and none a server error. Needs Docker."""
 
@@ -67,13 +67,17 @@ def test_the_contract_holds(served: tuple[str, str, str], mongo_uri: str) -> Non
         assert {operation.method.upper() for operation in operations} == {"GET"}
 
         # Requests that reach stored data, which random values rarely do.
-        examples: dict[str, tuple[dict[str, str], Params]] = {
-            f"{PREFIX}/recommendations/{{recommendation_id}}": (
-                {"recommendation_id": recommendation},
-                {},
-            ),
-            f"{PREFIX}/page": ({}, {"url": URLS[0]}),
-            f"{PREFIX}/recommendations": ({}, {"source": URLS[0], "limit": 2}),
+        examples: dict[str, list[tuple[dict[str, str], Params]]] = {
+            f"{PREFIX}/recommendations/{{recommendation_id}}": [
+                ({"recommendation_id": recommendation}, {})
+            ],
+            f"{PREFIX}/page": [({}, {"url": URLS[0]})],
+            f"{PREFIX}/recommendations": [
+                ({}, {"source": URLS[0], "limit": 2}),
+                ({}, {"order": "best", "suggested": "true", "limit": 2}),
+                ({}, {"order": "best", "orphan_slot": "true"}),
+            ],
+            f"{PREFIX}/orphans": [({}, {"unmet": "true", "limit": 1})],
         }
         statuses: dict[str, Counter[int]] = defaultdict(Counter)
         for operation in operations:
@@ -100,14 +104,13 @@ def test_the_contract_holds(served: tuple[str, str, str], mongo_uri: str) -> Non
 
             fuzz()
 
-            known = examples.get(operation.path)
-            if known is not None:
-                path_parameters, query = known
+            for path_parameters, query in examples.get(operation.path, []):
                 case = operation.Case(
                     path_parameters={**fixed, **path_parameters}, query=query, headers=headers
                 )
                 response = case.call_and_validate(checks=CHECKS)
-                assert response.status_code == 200, (operation.path, response.text)
+                assert response.status_code == 200, (operation.path, query, response.text)
+                assert response.json().get("total", 1) > 0, (operation.path, query)
                 statuses[operation.path][response.status_code] += 1
 
         # Each route served the fixture tenant at least once, so the checks saw real bodies.

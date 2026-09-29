@@ -29,12 +29,22 @@ BRIDGES: Final = "output_bridges"
 DUPLICATES: Final = "output_duplicates"
 UNANCHORED: Final = "output_unanchored"
 TARGET_FIXES: Final = "output_target_fixes"
+ORPHANS: Final = "output_orphans"
 RUNS: Final = "output_runs"
 API_KEYS: Final = "api_keys"
 # Written by prepare-corpus, not by a run; served as it is.
 EXCLUDED_PAGES: Final = "excluded_pages"
 
-RUN_SCOPED: Final = (RECOMMENDATIONS, PAGES, HUBS, BRIDGES, DUPLICATES, UNANCHORED, TARGET_FIXES)
+RUN_SCOPED: Final = (
+    RECOMMENDATIONS,
+    PAGES,
+    HUBS,
+    BRIDGES,
+    DUPLICATES,
+    UNANCHORED,
+    TARGET_FIXES,
+    ORPHANS,
+)
 STAMPS: Final = frozenset({"_id", "tenantId", "runId", "ordinal"})
 
 
@@ -53,6 +63,7 @@ INDEXES: Final[dict[str, tuple[IndexModel, ...]]] = {
         IndexModel(_run("source_url", "ordinal"), name="tenant_run_source"),
         IndexModel(_run("target_url", "ordinal"), name="tenant_run_target"),
         IndexModel(_run("action_type", "ordinal"), name="tenant_run_action"),
+        IndexModel(_run("best_rank"), name="tenant_run_best"),
     ),
     PAGES: (
         IndexModel(_run("ordinal"), unique=True, name="tenant_run_ordinal"),

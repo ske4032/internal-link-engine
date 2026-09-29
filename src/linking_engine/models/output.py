@@ -15,6 +15,7 @@ from linking_engine.models.enums import (
     IssueFlag,
     KeywordRung,
     OrphanLabel,
+    OrphanSlotReason,
     PageType,
     ScorerName,
     UnanchoredReason,
@@ -66,6 +67,8 @@ class PageProfile(BaseModel):
     recommendations_out: int = Field(default=0, ge=0)
     recommendations_in: int = Field(default=0, ge=0)
     audit_verdicts_out: int = Field(default=0, ge=0)
+    # Suggested new links the page takes: its words per link, less its existing body links.
+    link_budget: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
@@ -162,6 +165,42 @@ class UnanchoredOut(BaseModel):
     recommended: bool = False
 
 
+class RescueSource(BaseModel):
+    """A page that could link to an orphan: its ranked pair, anchor and strength."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source_url: UrlKey
+    score: float = Field(ge=0, le=100)
+    tier: int = Field(ge=1)
+    # The chosen anchor phrase; None when the source's copy has none for the page.
+    anchor: str | None = Field(default=None, min_length=1)
+    source_page_rank_percentile: float | None = Field(default=None, ge=0, lt=1)
+    # Set when the pair is one of the tenant's suggested links.
+    recommendation_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{16}$")
+
+
+class OrphanRescue(BaseModel):
+    """A page guaranteed inbound links: its best sources and whether the guarantee was met."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    profile: PageProfile
+    guaranteed: int = Field(ge=0)
+    # Suggested links into the page, orphan slots included.
+    suggested_in: int = Field(ge=0)
+    # Up to five sources: anchored before unanchored, then by score, then by source strength.
+    sources: tuple[RescueSource, ...] = Field(max_length=5)
+    # Why fewer suggested links came in than guaranteed; None when the guarantee was met.
+    unmet_reason: OrphanSlotReason | None = None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Self:
+        if (self.unmet_reason is None) != (self.suggested_in >= self.guaranteed):
+            raise ValueError("unmet_reason is set exactly when fewer links came in than guaranteed")
+        return self
+
+
 class TargetFix(BaseModel):
     """A target page that source pages would link to, if it had a target keyword."""
 
@@ -202,6 +241,27 @@ class SiteSummary(BaseModel):
     audit_flags: dict[IssueFlag, int] = Field(default_factory=dict)
     unanchored: dict[UnanchoredReason, int] = Field(default_factory=dict)
     target_fixes: int = Field(ge=0)
+    # ADD_LINKs within their page's budget, and the rest kept as reserves.
+    suggested_links: int = Field(default=0, ge=0)
+    reserve_links: int = Field(default=0, ge=0)
+    # Pages guaranteed inbound links, orphan slots placed, and the pages left short by reason.
+    guaranteed_pages: int = Field(default=0, ge=0)
+    orphan_slots: int = Field(default=0, ge=0)
+    guarantees_unmet: dict[OrphanSlotReason, int] = Field(default_factory=dict)
+    # Orphan pages with at least one suggested inbound link.
+    orphans_reached: int = Field(default=0, ge=0)
+    # Orphan pages in a hub with a suggested link up to the hub's main page.
+    orphans_to_pillar: int = Field(default=0, ge=0)
+    # Gini coefficient of suggested inbound links over the pages that can take them; None
+    # without suggested links.
+    inbound_gini: float | None = Field(default=None, ge=0, le=1)
+    # The per-page inbound cap: pages that reached it, and suggestions it moved to the source's
+    # next reserve or left unfilled.
+    pages_at_cap: int = Field(default=0, ge=0)
+    links_moved_by_cap: int = Field(default=0, ge=0)
+    links_dropped_by_cap: int = Field(default=0, ge=0)
+    # Share of suggested links going into the ten pages that receive the most; None without any.
+    top10_inbound_share: float | None = Field(default=None, ge=0, le=1)
 
 
 class QualitySnapshot(BaseModel):
@@ -236,6 +296,10 @@ class RunInfo(BaseModel):
     limit_per_source: int = Field(ge=1)
     # Content gaps listed per source page, beside its new links; 0 lists none.
     content_gap_limit: int = Field(ge=0)
+    words_per_link: int = Field(ge=1)
+    guaranteed_inbound_links: int = Field(ge=0)
+    guaranteed_inbound_below: int = Field(ge=0)
+    max_suggested_inbound: int = Field(ge=0)
     quality: QualitySnapshot | None = None
     summary: SiteSummary | None = None
 
@@ -258,6 +322,10 @@ class RecommendationReport(BaseModel):
     model_version: str | None = None
     limit_per_source: int = Field(ge=1)
     content_gap_limit: int = Field(ge=0)
+    words_per_link: int = Field(ge=1)
+    guaranteed_inbound_links: int = Field(ge=0)
+    guaranteed_inbound_below: int = Field(ge=0)
+    max_suggested_inbound: int = Field(ge=0)
     summary: SiteSummary
     # Ranked pairs walked past because they had no anchor choice and no unanchored reason.
     pairs_not_assessed: int = Field(default=0, ge=0)

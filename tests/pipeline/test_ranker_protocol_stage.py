@@ -221,6 +221,9 @@ async def test_product_measures_skipped_without_anchor_choices(
         assert entry.k == 10
         assert entry.top_relevance is not None, scorer
         assert 0 < entry.same_hub_share <= 1, scorer
+        # Both orphans sit in a topic hub whose first page is its pillar.
+        assert entry.orphans_to_pillar is not None, scorer
+        assert entry.inbound_gini is not None, scorer
 
 
 @pytest.mark.integration

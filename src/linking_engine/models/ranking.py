@@ -250,6 +250,12 @@ class ProductMeasures(BaseModel):
     orphan_page_share: float = Field(ge=0, le=1)
     # Share of the orphan target pages in some source page's first k; None without any.
     orphans_reached: float | None = Field(ge=0, le=1)
+    # Share of the orphan source pages in a hub whose first k hold their hub's pillar; None
+    # without any.
+    orphans_to_pillar: float | None = Field(default=None, ge=0, le=1)
+    # Gini coefficient of the first-k pairs into each candidate target page: 0 when every
+    # target gets as many; None without pairs.
+    inbound_gini: float | None = Field(default=None, ge=0, le=1)
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:

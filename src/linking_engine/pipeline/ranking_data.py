@@ -41,7 +41,12 @@ from linking_engine.gsc import fit_ctr_curve
 from linking_engine.ingest.markdown_clean import body_hash
 from linking_engine.ml.quality import hide_links
 from linking_engine.ml.ranking import LABEL_COLUMN, PLACEMENT_COLUMNS, placement_shares
-from linking_engine.models import AnchorTypeProfile, ExtractionSettings, RoundSummary
+from linking_engine.models import (
+    AnchorTypeProfile,
+    ExtractionSettings,
+    RoundSummary,
+    TenantConfig,
+)
 from linking_engine.pipeline.anchor_selection import compute_anchor_choices
 from linking_engine.pipeline.anchors import AnchorView, cache_folder, write_atomically
 from linking_engine.pipeline.quality import held_out_view
@@ -157,6 +162,12 @@ async def held_out_rounds(
         [await mongo.get_anchor_type_profile(tenant_id) or AnchorTypeProfile()],
         sorted(copies),
         [await graph.candidate_targets(tenant_id)],
+        # Retrieval's hub-main-page channel reads its floor settings from the tenant's config.
+        [
+            TenantConfig(tenant_id=tenant_id).model_dump(
+                include={"pillar_floor_quantile", "pillar_floor_min_links"}
+            )
+        ],
         await mongo.page_titles(tenant_id),
         [await _link_text_digest(graph, tenant_id), await _record_digest(mongo, tenant_id)],
     ]
