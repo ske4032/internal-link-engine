@@ -37,8 +37,10 @@ from linking_engine.models.candidates import (
     VectorIndex,
 )
 from linking_engine.models.corpus import (
+    EXCLUSION_LABELS,
     CleanedPage,
     CrawlPage,
+    ExcludedPage,
     ExtractedLink,
     GraphLoadReport,
     Heading,
@@ -72,6 +74,7 @@ from linking_engine.models.enums import (
     BridgeReason,
     ClusterAgreement,
     ContentGapFinding,
+    ExclusionReason,
     IssueFlag,
     KeywordRung,
     KeywordSource,
@@ -149,6 +152,7 @@ from linking_engine.models.signals import (
 from linking_engine.models.tenant import AnchorRules, AnchorTypeProfile, LanguageRules, TenantConfig
 
 __all__ = [
+    "EXCLUSION_LABELS",
     "ActionType",
     "AnchorCandidate",
     "AnchorChoice",
@@ -190,6 +194,8 @@ __all__ = [
     "EmbeddingModelCount",
     "EmbeddingSelection",
     "EmbeddingTarget",
+    "ExcludedPage",
+    "ExclusionReason",
     "ExtractedLink",
     "ExtractionSettings",
     "FeatureAuc",

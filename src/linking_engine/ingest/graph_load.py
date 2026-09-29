@@ -18,7 +18,10 @@ LOAD_BATCH: Final = 500
 async def load_tenant_graph(
     mongo: MongoRepo, graph: GraphRepo, tenant_id: str, *, batch_size: int = LOAD_BATCH
 ) -> GraphLoadReport:
-    """Idempotent: re-running converges, including pages that lost links."""
+    """Idempotent: re-running converges, including pages that lost links. Pages kept out of the
+    pipeline are removed first."""
+    excluded = [page.url for page in await mongo.excluded_pages(tenant_id)]
+    excluded_removed = await graph.delete_pages(tenant_id, excluded)
     crawled: list[str] = []
     pages = 0
     async for summaries in mongo.iter_page_summaries(tenant_id, batch_size=batch_size):
@@ -81,5 +84,6 @@ async def load_tenant_graph(
         external_links_skipped=external,
         self_links_skipped=self_links,
         stale_links_deleted=deleted,
+        excluded_pages_removed=excluded_removed,
         finished_at=datetime.now(UTC),
     )

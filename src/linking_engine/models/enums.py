@@ -63,6 +63,14 @@ class LifecycleStage(StrEnum):
     MATURE = "MATURE"
 
 
+class ExclusionReason(StrEnum):
+    """Why prepare-corpus keeps a crawled page out of the pipeline: none of it is evaluated."""
+
+    SITEMAP = "SITEMAP"
+    TENANT_EXCLUDED = "TENANT_EXCLUDED"
+    INSUFFICIENT_CONTENT = "INSUFFICIENT_CONTENT"
+
+
 class OrphanLabel(StrEnum):
     """What still links to a crawled page that no body link reaches.
 

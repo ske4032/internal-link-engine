@@ -32,6 +32,7 @@ from linking_engine.models import (
     AnchorRules,
     AnchorTypeProfile,
     CrawlPage,
+    ExcludedPage,
     ExtractionSettings,
     GscMetrics,
     GscQuery,
@@ -44,7 +45,7 @@ from linking_engine.models import (
     ScorerWeights,
     StrategicKeyword,
 )
-from linking_engine.urls import UrlRules, normalise_url
+from linking_engine.urls import UrlRules, normalise_path, normalise_url
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
@@ -140,6 +141,9 @@ INDEXES: Final[dict[str, tuple[IndexModel, ...]]] = {
             [("tenantId", ASCENDING), ("actionType", ASCENDING), ("accepted", ASCENDING)],
             name="tenant_action_accepted",
         ),
+    ),
+    "excluded_pages": (
+        IndexModel([("tenantId", ASCENDING), ("url", ASCENDING)], unique=True, name="tenant_url"),
     ),
     "tenant_config": (IndexModel([("tenantId", ASCENDING)], unique=True, name="tenant"),),
     "ctr_curves": (IndexModel([("tenantId", ASCENDING)], unique=True, name="tenant"),),
@@ -280,6 +284,106 @@ class MongoRepo:
             write=True,
             what="write url rules",
         )
+
+    async def get_excluded_paths(self, tenant_id: str) -> frozenset[str]:
+        """Paths the tenant keeps out of the pipeline, besides its sitemaps; normalised."""
+        _require_tenant(tenant_id)
+        document = await _retrying(
+            partial(
+                self._db["tenant_config"].find_one,
+                {"tenantId": tenant_id},
+                {"_id": 0, "excludedPaths": 1},
+            ),
+            write=False,
+            what="read excluded paths",
+        )
+        stored = (document or {}).get("excludedPaths") or []
+        if not isinstance(stored, list) or not all(isinstance(item, str) for item in stored):
+            raise DatabaseReadError("mongodb", "excluded paths are not a list of strings")
+        return frozenset(normalise_path(item) for item in stored)
+
+    async def set_excluded_paths(self, tenant_id: str, paths: Iterable[str]) -> frozenset[str]:
+        """Replace the tenant's excluded paths; the root is refused, since it would exclude the
+        whole site. Returns the stored, normalised set."""
+        _require_tenant(tenant_id)
+        normalised = frozenset(normalise_path(path) for path in paths if path.strip())
+        if "/" in normalised:
+            raise ValueError("the root path cannot be excluded: it would exclude every page")
+        await _retrying(
+            partial(
+                self._db["tenant_config"].update_one,
+                {"tenantId": tenant_id},
+                {
+                    "$set": {
+                        "excludedPaths": sorted(normalised),
+                        "excludedPathsUpdatedAt": datetime.now(UTC),
+                    }
+                },
+                upsert=True,
+            ),
+            write=True,
+            what="write excluded paths",
+        )
+        return normalised
+
+    async def replace_excluded_pages(self, tenant_id: str, pages: Sequence[ExcludedPage]) -> int:
+        """Make ``pages`` the tenant's excluded pages, with their reasons and labels, as the
+        latest preparation found them."""
+        _require_tenant(tenant_id)
+        now = datetime.now(UTC)
+        await _retrying(
+            partial(self._db["excluded_pages"].delete_many, {"tenantId": tenant_id}),
+            write=True,
+            what="clear excluded pages",
+        )
+        if not pages:
+            return 0
+        result = await _retrying(
+            partial(
+                self._db["excluded_pages"].insert_many,
+                [
+                    {**_to_document(page), "tenantId": tenant_id, "excludedAt": now}
+                    for page in pages
+                ],
+            ),
+            write=True,
+            what="write excluded pages",
+        )
+        return len(result.inserted_ids)
+
+    async def excluded_pages(self, tenant_id: str) -> tuple[ExcludedPage, ...]:
+        """The tenant's excluded pages, by url."""
+        _require_tenant(tenant_id)
+        collection = self._db["excluded_pages"]
+        projection = dict.fromkeys(_keys(ExcludedPage), 1)
+
+        async def read() -> list[Document]:
+            cursor = collection.find({"tenantId": tenant_id}, projection).sort("url", ASCENDING)
+            return await cursor.to_list()
+
+        documents = await _retrying(read, write=False, what="read excluded pages")
+        return tuple(_from_document(ExcludedPage, document) for document in documents)
+
+    async def delete_pages(self, tenant_id: str, urls: Sequence[str]) -> tuple[int, int]:
+        """Delete these pages of the tenant and the links stored from them. Returns (pages,
+        links) deleted."""
+        _require_tenant(tenant_id)
+        if not urls:
+            return 0, 0
+        keys = list(urls)
+        pages = await _retrying(
+            partial(self._db["pages"].delete_many, {"tenantId": tenant_id, "url": {"$in": keys}}),
+            write=True,
+            what="delete excluded pages",
+        )
+        links = await _retrying(
+            partial(
+                self._db["links"].delete_many, {"tenantId": tenant_id, "sourceUrl": {"$in": keys}}
+            ),
+            write=True,
+            what="delete excluded pages' links",
+        )
+        return pages.deleted_count, links.deleted_count
 
     async def get_anchor_rules(self, tenant_id: str) -> AnchorRules:
         """The tenant's generic-anchor overrides; none stored means the built-in dictionary."""

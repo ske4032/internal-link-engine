@@ -7,13 +7,9 @@ was derived, or why there is none.
 
 from __future__ import annotations
 
-import posixpath
-import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from itertools import pairwise
 from typing import TYPE_CHECKING, Final
-from urllib.parse import SplitResult, parse_qsl, urlsplit
 
 import numpy as np
 
@@ -27,7 +23,7 @@ from linking_engine.models import (
     LinkAuditResult,
 )
 from linking_engine.models.audit import TECHNICAL_FLAGS
-from linking_engine.urls import OFFSET_PARAMS, PAGE_NUMBER_PARAMS
+from linking_engine.urls import is_pagination, is_sitemap
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
@@ -51,13 +47,6 @@ FENCE_IQRS: Final = 3.0
 # link count would otherwise make every page with a link more index-like.
 MIN_IQR: Final = 1.0
 HUB_NOISE: Final = -1
-# Pagination parameters the url keys do not keep as page numbers or offsets.
-EXTRA_PAGINATION_PARAMS: Final = frozenset({"p", "currentpage", "pageindex", "page_index"})
-# Query parameters that make a url a page of a paginated listing, whatever their value.
-PAGINATION_PARAMS: Final = PAGE_NUMBER_PARAMS | OFFSET_PARAMS | EXTRA_PAGINATION_PARAMS
-# A path segment that numbers a page: page-2, or /page/2 and /p/2 as two segments.
-_PAGE_SEGMENT: Final = re.compile(r"page-\d+")
-_PAGE_PREFIXES: Final = frozenset({"page", "p"})
 
 CONTEXT_SPLIT: Final = "context_relevance_split"
 FIT_SPLIT: Final = "anchor_target_fit_split"
@@ -85,8 +74,6 @@ _ANCHOR_DEFECTS: Final = frozenset({IssueFlag.GENERIC, IssueFlag.OVER_OPTIMISED}
 _LISTING_KEPT: Final = frozenset(
     {IssueFlag.GENERIC, IssueFlag.MISALIGNED, IssueFlag.OFF_TOPIC, IssueFlag.WASTED_EQUITY}
 )
-_NOT_ALNUM: Final = re.compile(r"[^0-9a-z]+")
-_SCHEME: Final = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,47 +174,6 @@ class _Tenant:
     blocks: Mapping[tuple[str, str], tuple[int, int]]
     # Listing sources -> why each is one.
     listings: Mapping[str, str]
-
-
-def _url_parts(url: str) -> SplitResult | None:
-    """The url's parts. A stored key has no scheme ("host/path"), so it is split as
-    network-path reference, which keeps its host out of the path; a bare path stays a path.
-    None for a url that cannot be split."""
-    text = url.strip()
-    try:
-        return urlsplit(text if _SCHEME.match(text) or text.startswith("/") else f"//{text}")
-    except ValueError:
-        return None
-
-
-def is_sitemap(url: str) -> bool:
-    """A path segment naming a sitemap, case-insensitive: /sitemap, /sitemap.html,
-    /html-sitemap, /site-map; the host never counts."""
-    parts = _url_parts(url)
-    if parts is None:
-        return False
-    for segment in parts.path.lower().split("/"):
-        words = [word for word in _NOT_ALNUM.split(posixpath.splitext(segment)[0]) if word]
-        if "sitemap" in words or ("site", "map") in pairwise(words):
-            return True
-    return False
-
-
-def is_pagination(url: str) -> bool:
-    """A page of a paginated listing: a PAGINATION_PARAMS query parameter with any value, or a
-    /page/<n>, /page-<n> or /p/<n> path segment; the host never counts."""
-    parts = _url_parts(url)
-    if parts is None:
-        return False
-    if any(
-        name.strip().lower() in PAGINATION_PARAMS
-        for name, _ in parse_qsl(parts.query, keep_blank_values=True)
-    ):
-        return True
-    segments = [segment for segment in parts.path.lower().split("/") if segment]
-    return any(_PAGE_SEGMENT.fullmatch(segment) for segment in segments) or any(
-        first in _PAGE_PREFIXES and second.isdigit() for first, second in pairwise(segments)
-    )
 
 
 def audit_scope(edges: Sequence[AuditEdge]) -> AuditScope:

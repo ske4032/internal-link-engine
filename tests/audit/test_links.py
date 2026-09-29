@@ -53,12 +53,11 @@ from linking_engine.audit.links import (
     audit_scope,
     decide,
     equity_efficiency,
-    is_pagination,
-    is_sitemap,
     keyword_alignment,
     ladder_pairs,
 )
 from linking_engine.models import ActionType, AuditEdge, IssueFlag, LinkAuditReport
+from linking_engine.urls import is_pagination, is_sitemap
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence

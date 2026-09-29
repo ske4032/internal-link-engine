@@ -20,8 +20,11 @@ from linking_engine.ingest.markdown_clean import (
 )
 from linking_engine.ingest.template_links import count_template_inlinks
 from linking_engine.models import (
+    EXCLUSION_LABELS,
     CleanedPage,
     CrawlPage,
+    ExcludedPage,
+    ExclusionReason,
     Heading,
     LanguageRules,
     LinkRecord,
@@ -29,10 +32,10 @@ from linking_engine.models import (
     PrepareReport,
     TemplateInlinks,
 )
-from linking_engine.urls import normalise_url, url_rules
+from linking_engine.urls import is_sitemap, normalise_url, under_paths, url_rules
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Collection, Mapping, Sequence
 
     from linking_engine.ingest.mongo_repo import CrawlSource, MongoRepo
 
@@ -41,6 +44,10 @@ log = structlog.get_logger(__name__)
 # Both shares were measured on the first real crawl; see find_boilerplate.
 BOILERPLATE_SHARE: Final = 0.2
 NAV_SHARE: Final = 0.02
+# A page whose body words are at least this share link text, over at least this many links, is a
+# list of links rather than copy: kept out of the pipeline and labelled for review.
+LINK_ONLY_SHARE: Final = 0.8
+LINK_ONLY_MIN_LINKS: Final = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +63,8 @@ class PreparedCorpus:
     skipped: dict[str, int]
     merged: tuple[str, ...]
     inlinks: dict[str, TemplateInlinks]
+    # Crawled pages kept out of the pipeline: no record, and none of their links.
+    excluded: tuple[ExcludedPage, ...] = ()
 
 
 def keep_rank(doc: CrawlPage) -> tuple[bool, bool, int, str]:
@@ -110,6 +119,30 @@ def _followed_links(pages: Mapping[str, CleanedPage]) -> dict[str, set[str]]:
     return edges
 
 
+def exclusion(key: str, page: CleanedPage, excluded_paths: Collection[str]) -> ExcludedPage | None:
+    """Why a crawled page stays out of the pipeline, or None: a sitemap by its path, a path the
+    tenant excludes, or a body that is mostly link text."""
+    words = len(page.body_text.split())
+    link_words = sum(len(link.anchor_text.split()) for link in page.links)
+    links = len(page.links)
+    if is_sitemap(key):
+        reason = ExclusionReason.SITEMAP
+    elif under_paths(key, excluded_paths):
+        reason = ExclusionReason.TENANT_EXCLUDED
+    elif words and links >= LINK_ONLY_MIN_LINKS and link_words >= LINK_ONLY_SHARE * words:
+        reason = ExclusionReason.INSUFFICIENT_CONTENT
+    else:
+        return None
+    return ExcludedPage(
+        url=key,
+        reason=reason,
+        label=EXCLUSION_LABELS[reason],
+        words=words,
+        link_words=link_words,
+        links=links,
+    )
+
+
 def prepare_corpus(
     docs: Sequence[CrawlPage],
     *,
@@ -117,8 +150,11 @@ def prepare_corpus(
     boilerplate_share: float = BOILERPLATE_SHARE,
     nav_share: float = NAV_SHARE,
     language_rules: LanguageRules = LanguageRules(),
+    excluded_paths: Collection[str] = frozenset(),
 ) -> PreparedCorpus:
-    """Pure: runs under whatever url rules are active, so call it inside the tenant's."""
+    """Pure: runs under whatever url rules are active, so call it inside the tenant's.
+    Excluded pages get no record and their links none; a link into one stays, like a link into
+    any page that was not crawled."""
     skipped: Counter[str] = Counter()
     usable: list[CrawlPage] = []
     for doc in docs:
@@ -147,6 +183,12 @@ def prepare_corpus(
             chosen[key] = (doc, page)
         else:
             merged.append(str(doc.url))
+    excluded = {
+        key: kept_out
+        for key, (_, page) in chosen.items()
+        if (kept_out := exclusion(key, page, excluded_paths)) is not None
+    }
+    chosen = {key: pair for key, pair in chosen.items() if key not in excluded}
 
     inlinks = {
         item.url: item
@@ -205,6 +247,7 @@ def prepare_corpus(
         skipped=dict(skipped),
         merged=tuple(merged),
         inlinks=inlinks,
+        excluded=tuple(excluded[key] for key in sorted(excluded)),
     )
 
 
@@ -224,6 +267,7 @@ async def prepare_tenant(
         raise ValueError("tenant_id must be a non-empty string")
     rules = await mongo.get_url_rules(tenant_id)
     language_rules = await mongo.get_language_rules(tenant_id)
+    excluded_paths = await mongo.get_excluded_paths(tenant_id)
     docs = [doc async for batch in source.iter_pages() for doc in batch]
     written = (0, 0, 0)
     with url_rules(rules):
@@ -233,10 +277,13 @@ async def prepare_tenant(
             boilerplate_share=boilerplate_share,
             nav_share=nav_share,
             language_rules=language_rules,
+            excluded_paths=excluded_paths,
         )
         if write:
             await mongo.ensure_indexes()
             written = await mongo.write_pages(tenant_id, list(corpus.records), list(corpus.links))
+            await mongo.delete_pages(tenant_id, [page.url for page in corpus.excluded])
+            await mongo.replace_excluded_pages(tenant_id, corpus.excluded)
     counts = corpus.inlinks.values()
     report = PrepareReport(
         tenant_id=tenant_id,
@@ -255,7 +302,14 @@ async def prepare_tenant(
         links_written=written[1],
         stale_links_deleted=written[2],
         pages_with_depth=sum(1 for record in corpus.records if record.crawl_depth is not None),
+        excluded=dict(Counter(page.reason for page in corpus.excluded)),
         finished_at=datetime.now(UTC),
     )
-    log.info("ingest.prepare", **report.model_dump(exclude={"skipped", "finished_at"}))
+    log.info("ingest.prepare", **report.model_dump(exclude={"skipped", "excluded", "finished_at"}))
+    if corpus.excluded:
+        log.info(
+            "ingest.pages_excluded",
+            tenant_id=tenant_id,
+            by_reason={reason.value: n for reason, n in report.excluded.items()},
+        )
     return corpus, report
