@@ -31,6 +31,7 @@ EXPECTED_DEFAULTS = {
     "client_tier": "STARTER",
     "diversity_cap_pct": 0.15,
     "max_recommendations_per_source": 10,
+    "max_content_gaps_per_source": 3,
 }
 
 EXPECTED_ANCHOR_PROFILE = {"exact": 0.15, "partial": 0.20, "natural": 0.50, "branded": 0.15}

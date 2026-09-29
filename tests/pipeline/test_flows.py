@@ -30,6 +30,7 @@ from test_feature_stage import seed as seed_features
 from test_keyword_stage import EXPECTED as EXPECTED_KEYWORD_EDGES
 from test_keyword_stage import edges as keyword_edges
 from test_keyword_stage import seed as seed_keywords
+from test_recommendations import A, S, T, U, seed_tenant
 from voyage_fakes import FakeVoyage, client, page_index
 from voyageai.error import InvalidRequestError, ServiceUnavailableError
 
@@ -44,7 +45,7 @@ from linking_engine.errors import (
     EmbeddingUnavailableError,
 )
 from linking_engine.models import DuplicateGroup, HeldOutSettings, Link, LinkRecord, Page
-from linking_engine.pipeline import flows
+from linking_engine.pipeline import flows, recommendations
 from linking_engine.pipeline.duplicates import summarise_duplicates
 
 if TYPE_CHECKING:
@@ -1110,3 +1111,37 @@ async def test_link_audit_flow_audits_the_tenant_and_logs_one_mlflow_run_without
     assert run.data.metrics["links"] == len(AUDIT_LINKS)
     summary = load_text(f"runs:/{run_id}/summary.md")
     assert not [page.path for page in AUDIT_PAGES if page.path in summary]
+
+
+@pytest.mark.integration
+async def test_recommendations_flow_publishes_the_output_and_logs_one_run_without_urls(
+    graph: GraphRepo,
+    mongo: MongoRepo,
+    tenant: str,
+    flow_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
+    cache = tmp_path / "cache"
+    await seed_tenant(graph, mongo, tenant, cache / tenant)
+
+    async def features(_graph: object, _mongo: object, name: str, **_: object) -> tuple[None, Path]:
+        return None, cache / name / "matrix.parquet"
+
+    monkeypatch.setattr(recommendations, "assemble_features", features)
+
+    report, run_id = await flows.recommendations_flow(tenant, cache_dir=cache)
+
+    served = await mongo._db["output_runs"].find_one({"tenantId": tenant, "status": "complete"})
+    assert served is not None
+    assert served["runId"] == report.run_id
+    assert served["quality"] is None
+    run = MlflowClient(uri).get_run(run_id)
+    assert (run.data.tags["tenant_id"], run.data.tags["stage"]) == (tenant, "recommendations")
+    assert run.data.tags["output_run_id"] == report.run_id
+    assert run.data.metrics["action_add_link"] == 2
+    words = {word.strip(".,;:()") for word in load_text(f"runs:/{run_id}/summary.md").split()}
+    logged = {*run.data.tags.values(), *run.data.params.values(), *run.data.metrics, *words}
+    assert not logged & {A, S, T, U}

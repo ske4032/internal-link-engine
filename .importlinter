@@ -88,3 +88,25 @@ forbidden_modules =
     prefect
     mlflow
     igraph
+
+
+# ── served output stays light ───────────────────────────────────────────────
+# The output store is shared by the recommendations stage and the API, so it may import
+# neither of them, nor the graph driver or the training tree.
+
+[importlinter:contract:output-stays-light]
+name = Output store imports neither its writers nor heavy dependencies
+type = forbidden
+source_modules =
+    linking_engine.output
+forbidden_modules =
+    linking_engine.api
+    linking_engine.pipeline
+    linking_engine.ml
+    neo4j
+    lightgbm
+    hdbscan
+    mlflow
+    sklearn
+    igraph
+    leidenalg

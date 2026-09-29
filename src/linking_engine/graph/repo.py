@@ -48,6 +48,7 @@ from linking_engine.models import (
     TargetSelection,
     TenantGraphCounts,
 )
+from linking_engine.models.page import HubNode, InboundAnchorText, PageFacts
 from linking_engine.urls import normalise_url
 
 if TYPE_CHECKING:
@@ -406,6 +407,50 @@ RETURN p.url AS url,
        p.hubId AS hub_id,
        coalesce(p.isHubPillar, false) AS is_hub_pillar
 ORDER BY url
+"""
+_PAGE_FACTS: Final = """
+MATCH (p:Page {tenantId: $tenant})
+WHERE NOT coalesce(p.isPlaceholder, false)
+RETURN p.url AS url,
+       p.language AS language,
+       p.pageType AS page_type,
+       coalesce(p.wordCount, 0) AS word_count,
+       COUNT {
+         MATCH (s:Page {tenantId: $tenant})-[:LINKS_TO]->(p)
+         WHERE s <> p AND NOT coalesce(s.isPlaceholder, false)
+         RETURN DISTINCT s
+       } AS inbound,
+       COUNT {
+         MATCH (p)-[:LINKS_TO]->(t:Page {tenantId: $tenant})
+         WHERE t <> p AND NOT coalesce(t.isPlaceholder, false)
+         RETURN DISTINCT t
+       } AS outbound,
+       p.crawlDepth AS crawl_depth,
+       p.pageRankPercentile AS page_rank_percentile,
+       p.hubId AS hub_id,
+       coalesce(p.isHubPillar, false) AS is_hub_pillar,
+       coalesce(p.isOrphan, false) AS is_orphan,
+       p.orphanLabel AS orphan_label,
+       coalesce(p.isDeadEnd, false) AS is_dead_end,
+       p.duplicateGroup AS duplicate_group,
+       p.isCanonical AS is_canonical
+ORDER BY url
+"""
+_HUB_NODES: Final = """
+MATCH (h:Hub {tenantId: $tenant})
+RETURN h.hubId AS hub_id, coalesce(h.size, 0) AS size, h.pillarUrl AS pillar_url,
+       coalesce(h.active, false) AS active
+ORDER BY hub_id
+"""
+# Links flagged generic by embed-links are left out; the caller applies the tenant's own list.
+_INBOUND_ANCHOR_TEXTS: Final = """
+MATCH (s:Page {tenantId: $tenant})-[r:LINKS_TO]->(t:Page {tenantId: $tenant})
+WHERE s <> t AND NOT coalesce(s.isPlaceholder, false) AND NOT coalesce(t.isPlaceholder, false)
+  AND NOT coalesce(r.anchorGeneric, false)
+WITH t.url AS target_url, s.language AS source_language, r.anchorText AS anchor_text,
+     count(r) AS links
+RETURN target_url, source_language, anchor_text, links
+ORDER BY target_url, source_language, anchor_text
 """
 _PAGE_LANGUAGES: Final = """
 MATCH (p:Page {tenantId: $tenant})
@@ -1429,6 +1474,37 @@ class GraphRepo:
             return [PageStructure.model_validate(row) for row in rows]
         except ValidationError as error:
             raise DatabaseReadError("neo4j", f"page structure of {tenant_id!r}: {error}") from error
+
+    async def page_facts(self, tenant_id: str) -> list[PageFacts]:
+        """Every crawled page's language, type, size, body link counts, depth, rank, hub,
+        orphan, dead-end and duplicate state, ordered by url."""
+        _require_tenant(tenant_id)
+        rows = await self._read(_PAGE_FACTS, tenant=tenant_id)
+        try:
+            return [PageFacts.model_validate(row) for row in rows]
+        except ValidationError as error:
+            raise DatabaseReadError("neo4j", f"page facts of {tenant_id!r}: {error}") from error
+
+    async def hub_nodes(self, tenant_id: str) -> list[HubNode]:
+        """Every Hub node of the tenant, retired ones included, ordered by hub id."""
+        _require_tenant(tenant_id)
+        rows = await self._read(_HUB_NODES, tenant=tenant_id)
+        try:
+            return [HubNode.model_validate(row) for row in rows]
+        except ValidationError as error:
+            raise DatabaseReadError("neo4j", f"hubs of {tenant_id!r}: {error}") from error
+
+    async def inbound_anchor_texts(self, tenant_id: str) -> list[InboundAnchorText]:
+        """The anchor texts of the body links between crawled pages, not flagged generic, per
+        target page and source language, with their link counts; ordered by target url."""
+        _require_tenant(tenant_id)
+        rows = await self._read(_INBOUND_ANCHOR_TEXTS, tenant=tenant_id)
+        try:
+            return [InboundAnchorText.model_validate(row) for row in rows]
+        except ValidationError as error:
+            raise DatabaseReadError(
+                "neo4j", f"inbound anchors of {tenant_id!r}: {error}"
+            ) from error
 
     async def link_relevance(self, tenant_id: str) -> list[LinkRelevance]:
         """The stored scores of every body link between crawled pages whose target has a

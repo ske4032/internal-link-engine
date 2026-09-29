@@ -2,7 +2,7 @@
 
 `pytest` has to collect something or some CI configs treat the run as a failure. A test
 that asserts `True` would satisfy that and catch nothing. The thing that actually breaks
-is the package layout: import-linter's five contracts name modules by dotted path, mypy
+is the package layout: import-linter's six contracts name modules by dotted path, mypy
 and deptry walk the same tree, and a missing `__init__.py` turns a package into an
 implicit namespace package that lint-imports cannot see.
 """
@@ -19,7 +19,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# The layers of the `layers` contract, plus the two modules outside it.
+# The layers of the `layers` contract, plus the three modules outside it.
 SUBPACKAGES = (
     "api",
     "pipeline",
@@ -31,6 +31,7 @@ SUBPACKAGES = (
     "models",
     "ingest",
     "ml",
+    "output",
 )
 
 # The split enforced by the `algorithms-are-pure` contract, not by convention.
@@ -42,6 +43,7 @@ EXPECTED_CONTRACTS = {
     "algorithms-are-pure",
     "api-excludes-ml",
     "models-are-leaves",
+    "output-stays-light",
 }
 
 
@@ -84,12 +86,12 @@ def test_graph_is_split_into_repo_and_algorithms(name: str) -> None:
     )
 
 
-def test_importlinter_declares_the_five_contracts() -> None:
+def test_importlinter_declares_the_six_contracts() -> None:
     parser = _read_importlinter()
     assert parser["importlinter"]["root_package"] == "linking_engine"
     names = {section.split(":")[-1] for section in _contract_sections(parser)}
     assert names == EXPECTED_CONTRACTS, (
-        f"lint-imports must report 5 contracts kept; declared: {sorted(names)}"
+        f"lint-imports must report 6 contracts kept; declared: {sorted(names)}"
     )
 
 

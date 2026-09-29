@@ -80,8 +80,8 @@ async def test_indexes_apply_twice_and_all_exist(mongo: MongoRepo, mongo_uri: st
             spec = model.document
             assert spec["name"] in info, (name, spec["name"])
             assert info[spec["name"]]["key"] == list(spec["key"].items())
-    ttl = (await db["recommendations"].index_information())["created_ttl"]
-    assert ttl["expireAfterSeconds"] == 30 * 24 * 3600
+    # The served output owns recommendations now (output.collections.INDEXES).
+    assert "created_ttl" not in await db["recommendations"].index_information()
     await client.close()
 
 

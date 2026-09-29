@@ -95,6 +95,7 @@ dev = [
   "prefect-client>=3.8",    # minimal, pure Apache 2.0 — for worker images
   "networkx>=3.7",          # independent PageRank/betweenness reference; src/ must not import it
   "scipy>=1.18",
+  "schemathesis>=4.28",     # property-based OpenAPI contract tests of the output API
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -211,7 +212,6 @@ DEP002 = [
   "opentelemetry-instrumentation-fastapi",
   "opentelemetry-instrumentation-httpx",
   # api/
-  "fastapi",
   "uvicorn",             # runtime only: launched as an ASGI server process
   # ingest/
   # graph/repo.py

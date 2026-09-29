@@ -118,3 +118,5 @@ class TenantConfig(BaseSettings):
     client_tier: str = "STARTER"
     diversity_cap_pct: float = Field(default=0.15, ge=0, le=1)
     max_recommendations_per_source: int = Field(default=10, ge=1)
+    # Content gaps listed per source page beside its new links; 0 lists none.
+    max_content_gaps_per_source: int = Field(default=3, ge=0)

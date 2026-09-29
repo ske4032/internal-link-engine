@@ -1,7 +1,7 @@
 """Audit a tenant's existing body links (Stage 1). Every anchor is measured with the anchor
 stage's tools, the ladder searches the source copy of the flagged links for a better phrase, and
-the scoring in ``audit.links`` decides. Each run is kept in ``link_audit`` as history and its
-scores and verdicts are written back onto the LINKS_TO edges.
+the scoring in ``audit.links`` decides. Each run replaces the previous one in ``link_audit``
+once complete, and its scores and verdicts are written back onto the LINKS_TO edges.
 """
 
 from __future__ import annotations
@@ -180,10 +180,11 @@ async def audit_links(
     stored = await mongo.insert_link_audit(tenant_id, run_id, results)
     if stored != len(results):
         raise DatabaseWriteError("mongodb", f"{stored} of {len(results)} audit rows stored")
-    # Last: only a marked run is ever read as the tenant's latest.
+    # Only a marked run is ever read as the tenant's latest; the older runs go once it is.
     await mongo.complete_link_audit(
         tenant_id, run_id, audited_at=audited_at, documents=stored, edges=written
     )
+    pruned, pruned_runs = await mongo.prune_link_audit(tenant_id, run_id)
     report = audit_report(
         tenant_id,
         run_id,
@@ -211,6 +212,8 @@ async def audit_links(
         paginated_pages=report.paginated_pages,
         paginated_links=report.paginated_links,
         stale_audits_cleared=cleared,
+        pruned_documents=pruned,
+        pruned_runs=pruned_runs,
         ladder_pairs=report.ladder_pairs,
         proposals=report.proposals,
         embeddings=report.embeddings,

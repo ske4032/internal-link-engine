@@ -71,6 +71,25 @@ def _percentile(values: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
     return scaled
 
 
+def rank_tiers(
+    values: npt.NDArray[np.float64],
+    source_urls: pandas.Series[str],
+    target_urls: pandas.Series[str],
+    tier_shares: tuple[float, float],
+) -> npt.NDArray[np.int8]:
+    """Tier 1, 2 or 3 of every pair by the rank of its value, highest first and ties by url:
+    ``tier_shares`` of the pairs to tier 1, then tier 2, the rest tier 3."""
+    pairs = len(values)
+    sources = pandas.factorize(source_urls, sort=True)[0]
+    targets = pandas.factorize(target_urls, sort=True)[0]
+    order = np.lexsort((targets, sources, -values))
+    rank = np.empty(pairs, dtype=np.int64)
+    rank[order] = np.arange(pairs)
+    first = math.floor(tier_shares[0] * pairs + 0.5)
+    second = math.floor(sum(tier_shares) * pairs + 0.5)
+    return np.where(rank < first, 1, np.where(rank < second, 2, 3)).astype(np.int8)
+
+
 def normalise(frame: pandas.DataFrame, weights: ScorerWeights) -> pandas.DataFrame:
     """Every weighted column in [0, 1], higher always better; NaN stays NaN."""
     columns = tuple(feature.column for feature in weights.features)
@@ -113,14 +132,12 @@ def score_frame(frame: pandas.DataFrame, weights: ScorerWeights) -> pandas.DataF
         score[scored] = 50.0 if high == low else (raw[scored] - low) / (high - low) * 100
 
     # Best raw score first, pairs without one last, then by url.
-    sources = pandas.factorize(frame["source_url"], sort=True)[0]
-    targets = pandas.factorize(frame["target_url"], sort=True)[0]
-    order = np.lexsort((targets, sources, -np.where(scored, raw, -np.inf)))
-    rank = np.empty(pairs, dtype=np.int64)
-    rank[order] = np.arange(pairs)
-    first = math.floor(weights.tier_shares[0] * pairs + 0.5)
-    second = math.floor(sum(weights.tier_shares) * pairs + 0.5)
-    tier = np.where(rank < first, 1, np.where(rank < second, 2, 3)).astype(np.int8)
+    tier = rank_tiers(
+        np.where(scored, raw, -np.inf),
+        frame["source_url"],
+        frame["target_url"],
+        weights.tier_shares,
+    )
     tier[~scored] = 3
 
     data: dict[str, object] = {
