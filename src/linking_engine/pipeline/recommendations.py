@@ -222,8 +222,7 @@ class Inputs:
     @property
     def guarantee(self) -> int:
         """Suggested inbound links guaranteed to a page, never more than the cap."""
-        links, cap = self.guaranteed_inbound_links, self.max_suggested_inbound
-        return links if cap == 0 else min(links, cap)
+        return effective_guarantee(self.guaranteed_inbound_links, self.max_suggested_inbound)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1542,8 +1541,21 @@ def _orphans(
     )
 
 
+def effective_guarantee(links: int, cap: int) -> int:
+    """The inbound links a guaranteed page is promised: the setting, held to the cap unless the
+    cap is off (0)."""
+    return links if cap == 0 else min(links, cap)
+
+
 def summarise_recommendations(report: RecommendationReport) -> str:
     """A short prose record of one run, for the MLflow run description; no urls."""
+    guaranteed = effective_guarantee(report.guaranteed_inbound_links, report.max_suggested_inbound)
+    promised = (
+        str(guaranteed)
+        if guaranteed == report.guaranteed_inbound_links
+        else f"{guaranteed} (set {report.guaranteed_inbound_links}, held to the cap of "
+        f"{report.max_suggested_inbound})"
+    )
     summary = report.summary
     actions = (
         ", ".join(f"{kind.value} {n}" for kind, n in sorted(summary.recommendations.items()))
@@ -1585,8 +1597,8 @@ def summarise_recommendations(report: RecommendationReport) -> str:
             f"{summary.suggested_links} links suggested within the page budgets (one per "
             f"{report.words_per_link} words, less the existing links), {summary.reserve_links} "
             f"reserves. {summary.guaranteed_pages} pages with fewer than "
-            f"{report.guaranteed_inbound_below} inbound links guaranteed "
-            f"{report.guaranteed_inbound_links}: {summary.orphan_slots} orphan slots placed, "
+            f"{report.guaranteed_inbound_below} inbound links guaranteed {promised}: "
+            f"{summary.orphan_slots} orphan slots placed, "
             f"unmet {unmet}. {summary.orphans_reached} orphans reached, "
             f"{summary.orphans_to_pillar} with a link up to their hub's main page; inbound Gini "
             f"{gini}.",
