@@ -91,6 +91,17 @@ from linking_engine.models.enums import (
 )
 from linking_engine.models.features import FeatureReport, PageStructure, PairFeatures
 from linking_engine.models.keywords import KeywordReport, KeywordTarget, ResolvedKeyword
+from linking_engine.models.labels import (
+    GRADES,
+    LABEL_WORDS,
+    UNLABELLED_GRADE,
+    ExportedPair,
+    LabelEvent,
+    LabelExport,
+    LabelImportReport,
+    LabelProblem,
+    LabelSettings,
+)
 from linking_engine.models.output import (
     AnchorMix,
     ApiKeyInfo,
@@ -186,7 +197,10 @@ __all__ = [
     "ANY_LANGUAGE",
     "AUDIT_ACTIONS",
     "EXCLUSION_LABELS",
+    "GRADES",
+    "LABEL_WORDS",
     "NEW_LINK_ACTIONS",
+    "UNLABELLED_GRADE",
     "ActionType",
     "AnchorCandidate",
     "AnchorChoice",
@@ -236,6 +250,7 @@ __all__ = [
     "EmbeddingTarget",
     "ExcludedPage",
     "ExclusionReason",
+    "ExportedPair",
     "ExtractedLink",
     "ExtractionSettings",
     "FeatureAuc",
@@ -262,6 +277,11 @@ __all__ = [
     "KeywordRung",
     "KeywordSource",
     "KeywordTarget",
+    "LabelEvent",
+    "LabelExport",
+    "LabelImportReport",
+    "LabelProblem",
+    "LabelSettings",
     "LanguageRules",
     "LifecycleStage",
     "Link",

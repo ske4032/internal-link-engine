@@ -62,6 +62,9 @@ from linking_engine.models import (
     HeldOutSettings,
     HubReport,
     KeywordReport,
+    LabelExport,
+    LabelImportReport,
+    LabelSettings,
     LinkAuditReport,
     LinkEmbedReport,
     LinkRelevanceReport,
@@ -93,6 +96,7 @@ from linking_engine.pipeline.embed import FLUSH_SIZE, embed_tenant
 from linking_engine.pipeline.embed_links import embed_links
 from linking_engine.pipeline.features import CACHE_DIR, assemble_features
 from linking_engine.pipeline.keywords import resolve_tenant_keywords, summarise_keywords
+from linking_engine.pipeline.labels import export_labels, import_labels
 from linking_engine.pipeline.link_audit import audit_links, summarise_link_audit
 from linking_engine.pipeline.link_relevance import score_links, summarise_link_relevance
 from linking_engine.pipeline.quality import evaluate_quality, summarise_quality
@@ -1207,5 +1211,60 @@ async def tenant_pipeline_flow(
         len(report.stages),
         report.seconds,
         ", ".join(f"{r.stage} {r.seconds:.1f}s" for r in report.stages if r.seconds is not None),
+    )
+    return report
+
+
+# Writes the export's pairs and marker to Mongo, then the label file. No retry: a retried
+# export would draw a new sample and write a second file.
+@task(name="export-labels", cache_policy=NONE)
+async def export_labels_task(
+    tenant_id: str, out_dir: Path, settings: LabelSettings, cache_dir: Path
+) -> tuple[LabelExport, Path]:
+    async with await mongo() as repo:
+        await repo.ensure_indexes()
+        return await export_labels(
+            repo, tenant_id, cache_dir=cache_dir, out_dir=out_dir, settings=settings
+        )
+
+
+@flow(name="export-labels")
+async def export_labels_flow(
+    tenant_id: str, out_dir: Path, settings: LabelSettings, cache_dir: Path = CACHE_DIR
+) -> tuple[LabelExport, Path]:
+    """The tenant's ranked, anchored candidate pairs sampled by source page for hand labelling:
+    stored with their snapshot, and written blind to a label file in ``out_dir``."""
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
+        logger.info("exporting candidate pairs of tenant %s for labelling", tenant_id)
+        export, path = await export_labels_task(tenant_id, out_dir, settings, cache_dir)
+    logger.info(
+        "%d pairs from %d source pages exported to %s", export.pairs, export.pages, path.name
+    )
+    return export, path
+
+
+# A file with any problem writes nothing; an import is read only once marked complete, so a
+# failed one leaves nothing that is read. No retry: rerun the import.
+@task(name="import-labels", cache_policy=NONE)
+async def import_labels_task(tenant_id: str, path: Path, check: bool) -> LabelImportReport:
+    async with await mongo() as repo:
+        await repo.ensure_indexes()
+        return await import_labels(repo, tenant_id, path, check=check)
+
+
+@flow(name="import-labels")
+async def import_labels_flow(tenant_id: str, path: Path, check: bool = False) -> LabelImportReport:
+    """A labelled file checked against its export and, unless ``check``, its labels imported
+    into anchor_feedback."""
+    logger = get_run_logger()
+    with bound_contextvars(run_id=str(flow_run.id)):
+        logger.info("%s labels of tenant %s", "checking" if check else "importing", tenant_id)
+        report = await import_labels_task(tenant_id, path, check)
+    logger.info(
+        "%d of %d rows labelled%s",
+        report.labelled,
+        report.rows,
+        "; checked only" if check else f"; import {report.import_id}",
     )
     return report

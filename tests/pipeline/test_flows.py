@@ -34,6 +34,9 @@ from test_feature_stage import seed as seed_features
 from test_keyword_stage import EXPECTED as EXPECTED_KEYWORD_EDGES
 from test_keyword_stage import edges as keyword_edges
 from test_keyword_stage import seed as seed_keywords
+from test_labels import SETTINGS as LABEL_SETTINGS
+from test_labels import fill as fill_labels
+from test_labels import seed_cache as seed_label_cache
 from test_recommendations import A, S, T, U, seed_tenant
 from voyage_fakes import FakeVoyage, client, page_index
 from voyageai.error import InvalidRequestError, ServiceUnavailableError
@@ -1335,3 +1338,25 @@ async def test_stage_subflows_share_the_pipelines_root_run_id(
     )
     assert report.pipeline_run_id == pipeline
     assert pipeline_run(pipeline_mlflow, tenant).data.tags["pipeline_run_id"] == pipeline
+
+
+@pytest.mark.integration
+async def test_label_flows_export_a_file_and_import_its_labels(
+    mongo: MongoRepo, tenant: str, flow_env: None, tmp_path: Path
+) -> None:
+    cache = tmp_path / "cache"
+    seed_label_cache(cache, tenant)
+
+    export, path = await flows.export_labels_flow(
+        tenant, tmp_path / "out", LABEL_SETTINGS, cache_dir=cache
+    )
+    rows = fill_labels(path, {0: {"label": "dismiss"}})
+    checked = await flows.import_labels_flow(tenant, path, check=True)
+    report = await flows.import_labels_flow(tenant, path)
+
+    assert (export.pairs, path.parent) == (6, tmp_path / "out")
+    assert (checked.import_id, checked.labelled, report.labelled) == (None, 1, 1)
+    labels = await mongo.hand_labels(tenant)
+    assert [(label.pair_id, label.import_id) for label in labels] == [
+        (rows[0]["pair_id"], report.import_id)
+    ]
